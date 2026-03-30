@@ -1,7 +1,6 @@
 """Tests for the Textual TUI."""
 
 import pytest
-from textual.widgets import Button
 
 from defib.tui.app import DefibApp
 
@@ -39,8 +38,7 @@ class TestTUIApp:
         app = DefibApp()
         async with app.run_test(size=(120, 40)) as pilot:
             # Click start without filling anything — should not crash
-            button = app.screen.query_one("#start-btn", Button)
-            await pilot.click(button)
+            await pilot.click("#start-btn")
             await pilot.pause()
 
     @pytest.mark.asyncio

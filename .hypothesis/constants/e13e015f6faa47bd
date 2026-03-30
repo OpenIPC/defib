@@ -1,0 +1,4 @@
+# file: /home/john-1/git/defib/src/defib/capture/format.py
+# hypothesis_version: 6.151.10
+
+[b'\x00', b'DCAP', 115200, '<4sHI32sHI', '<QBH', 'replace', 'utf-8']

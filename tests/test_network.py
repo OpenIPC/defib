@@ -195,15 +195,21 @@ class TestDiscovery:
 
 
 class TestNetworkCLI:
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
+        import re
+        return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
     def test_network_help(self):
         from typer.testing import CliRunner
         from defib.cli.app import app as cli_app
         runner = CliRunner()
         result = runner.invoke(cli_app, ["network", "--help"])
         assert result.exit_code == 0
-        assert "--file" in result.stdout
-        assert "--nic" in result.stdout
-        assert "--tftp-port" in result.stdout
+        output = self._strip_ansi(result.stdout)
+        assert "--file" in output
+        assert "--nic" in output
+        assert "--tftp-port" in output
 
     def test_list_interfaces_cmd(self):
         import json

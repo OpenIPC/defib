@@ -1,0 +1,4 @@
+# file: /home/john-1/git/defib/src/defib/tui/screens/main.py
+# hypothesis_version: 6.151.10
+
+['#break-check', '#chip-select', '#file-input', '#port-select', '/path/to/u-boot.bin', 'Chip Model:', 'Firmware File:', 'No ports found', 'Select a chip model', 'Select a serial port', 'Select chip...', 'Select port...', 'Serial Port:', 'Start Recovery', 'Validation Error', 'break-check', 'button-row', 'chip-select', 'error', 'file-input', 'form-container', 'port-select', 'primary', 'start-btn', 'title-label']

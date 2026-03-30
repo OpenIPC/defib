@@ -1,0 +1,4 @@
+# file: /home/john-1/git/defib/src/defib/cli/app.py
+# hypothesis_version: 6.151.10
+
+[0.01, 0.1, 25.0, 60.0, 1024, '--break', '--chip', '--debug', '--duration', '--file', '--output', '--port', '--timeout', '-b', '-c', '-d', '-f', '-o', '-p', '...', '/dev/ttyUSB0', 'Chip model name', 'Data (hex)', 'Description', 'Device', 'Dir', 'Enable debug logging', 'Hardware ID', 'Len', 'No SoC detected', 'Output .dcap file', 'Records (first 50)', 'Serial Ports', 'Serial port', 'Time (ms)', '[cyan]TX→[/cyan]', '[yellow]←RX[/yellow]', 'baudrate', 'board_id', 'bold', 'bytes_sent', 'bytes_total', 'chip', 'chip_id', 'chips', 'count', 'cyan', 'defib', 'description', 'detected', 'device', 'dim', 'done', 'duration_us', 'elapsed_ms', 'error', 'event', 'file', 'green', 'human', 'hwid', 'info', 'json', 'level', 'list-chips', 'log', 'message', 'ports', 'progress', 'protocol', 'quiet', 'records', 'red', 'right', 'rx_bytes', 'stage', 'success', 'tx_bytes', 'warn', 'yellow']

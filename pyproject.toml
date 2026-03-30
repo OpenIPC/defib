@@ -58,6 +58,10 @@ line-length = 100
 python_version = "3.11"
 strict = true
 
+[[tool.mypy.overrides]]
+module = "defib.tui.*"
+disallow_subclassing_any = false
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

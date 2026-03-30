@@ -1,0 +1,4 @@
+# file: /home/john-1/git/defib/src/defib/network/tftp_server.py
+# hypothesis_version: 6.151.10
+
+[b'\x00', b'blksize\x00', 5.0, 300.0, 512, 65464, '!H', '!HH', '0.0.0.0', 'Malformed RRQ', 'ascii', 'blksize', 'firmware.bin', 'octet', 'replace']

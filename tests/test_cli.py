@@ -1,10 +1,17 @@
 """Tests for the CLI interface."""
 
+import re
+
 from typer.testing import CliRunner
 
 from defib.cli.app import app
 
 runner = CliRunner()
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from text."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
 class TestListChips:
@@ -29,9 +36,10 @@ class TestBurnHelp:
     def test_burn_help(self):
         result = runner.invoke(app, ["burn", "--help"])
         assert result.exit_code == 0
-        assert "--chip" in result.stdout
-        assert "--file" in result.stdout
-        assert "--port" in result.stdout
+        output = _strip_ansi(result.stdout)
+        assert "--chip" in output
+        assert "--file" in output
+        assert "--port" in output
 
 
 class TestPortsCommand:
@@ -52,16 +60,18 @@ class TestDetectHelp:
     def test_detect_help(self):
         result = runner.invoke(app, ["detect", "--help"])
         assert result.exit_code == 0
-        assert "--port" in result.stdout
-        assert "--timeout" in result.stdout
+        output = _strip_ansi(result.stdout)
+        assert "--port" in output
+        assert "--timeout" in output
 
 
 class TestCaptureHelp:
     def test_capture_help(self):
         result = runner.invoke(app, ["capture", "--help"])
         assert result.exit_code == 0
-        assert "--port" in result.stdout
-        assert "--output" in result.stdout
+        output = _strip_ansi(result.stdout)
+        assert "--port" in output
+        assert "--output" in output
 
     def test_capture_missing_args(self):
         result = runner.invoke(app, ["capture"])

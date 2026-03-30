@@ -1,0 +1,4 @@
+# file: /home/john-1/git/defib/src/defib/profiles/loader.py
+# hypothesis_version: 6.151.10
+
+['*.json', '.json', 'data', 'defib.profiles']
