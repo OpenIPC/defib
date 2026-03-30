@@ -1,4 +1,0 @@
-# file: /home/john-1/git/defib/src/defib/network/ip_manager.py
-# hypothesis_version: 6.151.10
-
-['-alias', '.', '1', '255.255.255.0', 'Ethernet', 'Wi-Fi', 'add', 'addr', 'address', 'alias', 'darwin', 'del', 'delete', 'dev', 'en0', 'en1', 'enp0s3', 'eth0', 'if_nameindex', 'ifconfig', 'interface', 'ip', 'linux', 'lo', 'netmask', 'netsh', 'replace', 'win32']

@@ -1,4 +1,0 @@
-# file: /home/john-1/git/defib/src/defib/protocol/hisilicon_v500.py
-# hypothesis_version: 6.151.10
-
-[b'\x00\x00\x00\x00\x00\x00\x00\x00', b'U', b'\xbd\x00', b'\xda', b'\xed', b'\xfe\x00\xff\x01', 0.1, 4.0, 20.0, 255, 1023, 1024, 1028, 8192, 1090519040, '<I', '>I', 'B', 'HiSilicon V500', 'Recovery complete', 'gk7205v500', 'gk7205v510', 'gk7205v530', 'xm7205v500', 'xm7205v510', 'xm7205v530']

@@ -1,4 +1,0 @@
-# file: /home/john-1/git/defib/src/defib/profiles/schema.py
-# hypothesis_version: 6.151.10
-
-['ADDRESS', 'DDRSTEP0', 'FILELEN', 'Internal chip name', 'STEPLEN', 'populate_by_name']

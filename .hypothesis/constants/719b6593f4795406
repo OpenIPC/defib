@@ -1,4 +1,0 @@
-# file: /home/john-1/git/defib/src/defib/tui/screens/progress.py
-# hypothesis_version: 6.151.10
-
-[100, '#log-panel', '#main-progress', '%H:%M:%S', 'Back', 'DDR Init', 'Handshake', 'SPL/GSL', 'U-Boot', 'active', 'back-btn', 'bottom-bar', 'complete', 'ddr init', 'debug', 'default', 'dim', 'error', 'failed', 'green', 'green bold', 'handshake', 'info', 'info-row', 'log-container', 'log-panel', 'main-progress', 'pending', 'progress-container', 'red', 'red bold', 'spl/gsl', 'stages-row', 'status-container', 'u-boot', 'warn', 'yellow']

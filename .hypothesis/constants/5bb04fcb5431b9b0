@@ -1,4 +1,0 @@
-# file: /home/john-1/git/defib/src/defib/network/discovery.py
-# hypothesis_version: 6.151.10
-
-[b'DEFIB_DISCOVER\x00', 10.0, 4011, '(', ')', '-a', '-an', '0.0.0.0', '255.255.255.255', 'ARP table entry', 'arp', 'socket', 'win32']

@@ -1,4 +1,0 @@
-# file: /home/john-1/git/defib/src/defib/protocol/hisilicon_cv6xx.py
-# hypothesis_version: 6.151.10
-
-[b'U', b'uart ddr', b'uart flash', b'\xce', b'\xda', b'\xed', b'\xfe\x00\xff\x01', 0.01, 0.05, 0.1, 0.5, 1.5, 2.0, 4.0, 126, 170, 255, 256, 300, 308, 1023, 1024, 2048, 2052, 2084, 2088, 3072, 115200, 67239936, 1090519040, '<I', '>I', 'B', 'DDR training: %s', 'Failed to send GSL', 'HiSilicon CV6xx', 'Querying board ID...', 'Recovery complete', 'hi3516cv608', 'hi3516cv610', 'hi3516cv613', 'hi3516dv500', 'hi3519dv500']

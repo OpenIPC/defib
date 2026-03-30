@@ -1,4 +1,0 @@
-# file: /home/john-1/git/defib/src/defib/transport/serial_platform.py
-# hypothesis_version: 6.151.10
-
-[b'U', b'\xaa', 0.05, 0.1, 5.0, 4096, 115200, 'COM', 'darwin', 'win32']

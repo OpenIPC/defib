@@ -1,4 +1,0 @@
-# file: /home/john-1/git/defib/src/defib/protocol/hisilicon_standard.py
-# hypothesis_version: 6.151.10
-
-[b'\x00', b' ', b'\xaa', 0.03, 0.15, 1.0, 'Boot mode entered', 'DDR step complete', 'Failed to send SPL', 'HiSilicon Standard', 'No profile loaded', 'Recovery complete', 'SPL complete', 'Sending DDR step', 'Sending SPL', 'Sending U-Boot', 'U-Boot complete']
