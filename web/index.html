@@ -157,6 +157,7 @@ footer a { color: var(--accent); text-decoration: none; }
     </div>
 
     <div class="btn-row">
+      <button class="btn btn-secondary" id="dump-flash-btn" onclick="startFlashDump()">Dump Flash</button>
       <button class="btn btn-secondary" onclick="downloadLog()">Save Log</button>
       <button class="btn btn-secondary" onclick="disconnectConsole()">Disconnect</button>
       <button class="btn btn-secondary" onclick="resetUI()">New Recovery</button>
@@ -769,7 +770,7 @@ async function sendConsoleCmd() {
   input.value = '';
   if (!cmd && !consoleActive) return;
   try {
-    await serialWrite(new TextEncoder().encode(cmd + '\n'));
+    await serialWrite(new TextEncoder().encode(cmd + '\r'));
   } catch (e) {
     consoleLog(`[Send error: ${e.message}]\n`);
   }
@@ -796,6 +797,109 @@ function downloadLog() {
   a.download = filename;
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+// md.b line parser: "82000000: ff ff ff ... ff    ................"
+const MD_LINE_RE = /^([0-9a-fA-F]{8}):\s+((?:[0-9a-fA-F]{2}\s+){1,16})/;
+
+function parseMdLine(line) {
+  const m = line.trim().match(MD_LINE_RE);
+  if (!m) return null;
+  const addr = parseInt(m[1], 16);
+  const bytes = m[2].trim().split(/\s+/).map(b => parseInt(b, 16));
+  return { addr, data: new Uint8Array(bytes) };
+}
+
+async function sendUbootCmd(cmd, timeout = 5000, waitFor = '#') {
+  // Flush pending input
+  serialReadAvailable();
+  await serialWrite(new TextEncoder().encode(cmd + '\r'));
+  const buf = [];
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    try {
+      const rd = await serialRead(1024, 200);
+      for (const b of rd) buf.push(b);
+      const text = String.fromCharCode(...buf);
+      if (waitFor && text.includes(waitFor)) return text;
+    } catch (e) { /* timeout */ }
+  }
+  return String.fromCharCode(...buf);
+}
+
+async function startFlashDump() {
+  if (!consoleActive || !serialPort) return;
+  const btn = document.getElementById('dump-flash-btn');
+  btn.disabled = true;
+  btn.textContent = 'Probing...';
+
+  try {
+    // Probe flash
+    consoleLog('\n--- Flash Dump ---\n');
+    const probeResp = await sendUbootCmd('sf probe 0', 5000);
+    consoleLog(probeResp);
+
+    // Detect size
+    let flashSize = 0x1000000; // Default 16MB
+    const probeLower = probeResp.toLowerCase();
+    if (probeLower.includes('8mb'))  flashSize = 0x800000;
+    if (probeLower.includes('16mb')) flashSize = 0x1000000;
+    if (probeLower.includes('32mb')) flashSize = 0x2000000;
+    const sizeMB = flashSize / (1024 * 1024);
+    log(`Flash size: ${sizeMB}MB. Reading into RAM...`, 'info');
+
+    // Read flash into RAM
+    btn.textContent = 'Reading flash...';
+    const readResp = await sendUbootCmd(`sf read 0x82000000 0x0 0x${flashSize.toString(16)}`, 30000);
+    consoleLog(readResp);
+
+    // Dump via md.b in 64KB chunks
+    btn.textContent = 'Dumping 0%...';
+    const allData = new Uint8Array(flashSize);
+    let offset = 0;
+    const chunkSize = 0x10000;
+
+    while (offset < flashSize) {
+      const remaining = Math.min(chunkSize, flashSize - offset);
+      const addr = 0x82000000 + offset;
+      const resp = await sendUbootCmd(`md.b 0x${addr.toString(16)} 0x${remaining.toString(16)}`, 30000);
+
+      let chunkBytes = 0;
+      for (const line of resp.split('\n')) {
+        const parsed = parseMdLine(line);
+        if (parsed) {
+          const off = parsed.addr - 0x82000000;
+          if (off >= 0 && off + parsed.data.length <= flashSize) {
+            allData.set(parsed.data, off);
+            chunkBytes += parsed.data.length;
+          }
+        }
+      }
+
+      offset += remaining;
+      const pct = Math.round(offset * 100 / flashSize);
+      btn.textContent = `Dumping ${pct}%...`;
+      log(`Dump: ${(offset/(1024*1024)).toFixed(1)}/${sizeMB}MB (${pct}%)`, 'dim');
+    }
+
+    // Download the file
+    const chip = document.getElementById('chip-select').value || 'unknown';
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `flash_${chip}_${ts}.bin`;
+    const blob = new Blob([allData], { type: 'application/octet-stream' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+
+    log(`Flash dump saved: ${filename} (${flashSize} bytes)`, 'info');
+  } catch (e) {
+    log(`Flash dump failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Dump Flash';
+  }
 }
 
 async function disconnectConsole() {
