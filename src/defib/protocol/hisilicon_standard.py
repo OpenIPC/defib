@@ -183,10 +183,14 @@ class HiSiliconStandard(BootProtocol):
         firmware: bytes,
         profile: SoCProfile,
         on_progress: Callable[[ProgressEvent], None] | None = None,
+        spl_override: bytes | None = None,
     ) -> bool:
         """Send SPL (secondary program loader) to SRAM."""
         spl_size = profile.spl_max_size
-        spl_data = firmware[:spl_size]
+        if spl_override is not None:
+            spl_data = spl_override[:spl_size].ljust(spl_size, b"\x00")
+        else:
+            spl_data = firmware[:spl_size]
 
         _emit(on_progress, ProgressEvent(
             stage=Stage.SPL, bytes_sent=0, bytes_total=spl_size,
@@ -257,6 +261,7 @@ class HiSiliconStandard(BootProtocol):
         transport: Transport,
         firmware: bytes,
         on_progress: Callable[[ProgressEvent], None] | None = None,
+        spl_override: bytes | None = None,
     ) -> RecoveryResult:
         if self._profile is None:
             return RecoveryResult(success=False, error="No profile loaded")
@@ -271,7 +276,8 @@ class HiSiliconStandard(BootProtocol):
             )
         stages.append(Stage.DDR_INIT)
 
-        if not await self._send_spl(transport, firmware, profile, on_progress):
+        if not await self._send_spl(transport, firmware, profile, on_progress,
+                                    spl_override=spl_override):
             return RecoveryResult(
                 success=False, stages_completed=stages,
                 error="Failed to send SPL",
