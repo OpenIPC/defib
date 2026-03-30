@@ -13,6 +13,7 @@ import os
 import sys
 import urllib.request
 from pathlib import Path
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ def get_cached_path(chip: str) -> Path | None:
 
 def download_firmware(
     chip: str,
-    on_progress: callable | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> Path:
     """Download U-Boot firmware from OpenIPC, with caching.
 
