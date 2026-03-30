@@ -81,6 +81,50 @@ class ProgressScreen(Screen[None]):
         border: none;
     }
 
+    #dump-overlay {
+        height: 1fr;
+        align: center middle;
+        padding: 2 4;
+    }
+
+    #dump-box {
+        width: 60;
+        height: auto;
+        max-height: 20;
+        border: thick $accent;
+        padding: 1 2;
+        background: $panel;
+    }
+
+    #dump-title {
+        text-align: center;
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+        width: 100%;
+    }
+
+    #dump-status {
+        margin-bottom: 1;
+        color: $text;
+    }
+
+    #dump-action {
+        color: $text-muted;
+        text-style: italic;
+        margin-bottom: 1;
+    }
+
+    #dump-stats {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    #dump-btn {
+        margin-top: 1;
+        width: 100%;
+    }
+
     #bottom-bar {
         height: 3; padding: 0 2;
         layout: horizontal; align: right middle;
@@ -127,6 +171,15 @@ class ProgressScreen(Screen[None]):
 
         yield TextArea("", id="terminal", read_only=True, show_line_numbers=False)
 
+        with Vertical(id="dump-overlay"):
+            with Vertical(id="dump-box"):
+                yield Static("Flash Dump", id="dump-title")
+                yield Static("", id="dump-status")
+                yield ProgressBar(total=100, id="dump-progress")
+                yield Static("", id="dump-action")
+                yield Static("", id="dump-stats")
+                yield Button("Cancel", variant="error", id="dump-btn")
+
         with Horizontal(id="bottom-bar"):
             yield Button("Back", variant="default", id="back-btn")
 
@@ -134,6 +187,7 @@ class ProgressScreen(Screen[None]):
 
     def on_mount(self) -> None:
         self.query_one("#terminal", TextArea).display = False
+        self.query_one("#dump-overlay").display = False
         self._log("Starting recovery session...")
         self.run_worker(self._run_recovery(), exclusive=True)
 
@@ -147,8 +201,29 @@ class ProgressScreen(Screen[None]):
         from defib.transport.base import Transport
         transport: Transport = self._transport  # type: ignore[assignment]
 
-        # Let Ctrl-key combos pass through to Textual bindings
-        # (Ctrl-C, Ctrl-Q, Ctrl-S, Ctrl-D are handled as actions)
+        # Handle Ctrl-key combos directly (TextArea swallows them otherwise)
+        if event.key == "ctrl+c":
+            event.prevent_default()
+            event.stop()
+            await self.action_send_break()
+            return
+        if event.key == "ctrl+s":
+            event.prevent_default()
+            event.stop()
+            self._save_log()
+            return
+        if event.key == "ctrl+d":
+            event.prevent_default()
+            event.stop()
+            self._start_flash_dump()
+            return
+        if event.key == "ctrl+q":
+            event.prevent_default()
+            event.stop()
+            self._stop_console()
+            self.app.exit()
+            return
+        # Skip other ctrl combos
         if event.key.startswith("ctrl+"):
             return
 
@@ -193,6 +268,8 @@ class ProgressScreen(Screen[None]):
         if event.button.id == "back-btn":
             self._stop_console()
             self.app.pop_screen()
+        elif event.button.id == "dump-btn":
+            self._dump_btn_action()
 
     # --- Logging ---
 
@@ -345,20 +422,87 @@ class ProgressScreen(Screen[None]):
             asyncio.ensure_future(transport.close())
             self._transport = None
 
-    # --- Flash dump ---
+    # --- Flash dump (modal overlay) ---
+
+    _dump_worker_running = False
 
     def _start_flash_dump(self) -> None:
-        if not self._console_mode or self._transport is None:
-            self.notify("Connect to device first", severity="error")
+        if self._transport is None:
+            self.notify("Not connected to device", severity="warning")
             return
-        was_console = self._console_mode
+        if self._dump_worker_running:
+            return
+
+        # Stop console reader (they'd fight over serial)
         self._console_mode = False
+        if self._console_reader_task and not self._console_reader_task.done():
+            self._console_reader_task.cancel()
+            self._console_reader_task = None
+
+        # Show modal overlay, hide terminal
+        self.query_one("#terminal", TextArea).display = False
+        overlay = self.query_one("#dump-overlay")
+        overlay.display = True
+        self.query_one("#dump-status", Static).update(f"Chip: {self._chip}")
+        self.query_one("#dump-action", Static).update("Detecting flash...")
+        self.query_one("#dump-progress", ProgressBar).update(total=100, progress=0)
+        btn = self.query_one("#dump-btn", Button)
+        btn.label = "Cancel"
+        btn.variant = "error"
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"flash_{self._chip}_{timestamp}.bin"
-        self._log("Starting flash dump...", style="cyan bold")
-        self.run_worker(self._run_flash_dump(filename, was_console), exclusive=False)
+        self._dump_worker_running = True
+        self.run_worker(self._run_flash_dump(filename), exclusive=False)
 
-    async def _run_flash_dump(self, filename: str, resume_console: bool) -> None:
+    def _dump_btn_action(self) -> None:
+        if self._dump_worker_running:
+            # Signal cancel — dump loop will finish current block and stop
+            self._dump_worker_running = False
+            btn = self.query_one("#dump-btn", Button)
+            btn.label = "Cancelling..."
+            btn.disabled = True
+            self.query_one("#dump-action", Static).update("Finishing current block...")
+        else:
+            # "Return to Terminal" after completion
+            self._return_to_terminal()
+
+    async def _cleanup_after_dump(self) -> None:
+        """Send Ctrl-C to U-Boot and drain serial buffer after dump."""
+        if self._transport is None:
+            return
+        from defib.transport.base import Transport
+        transport: Transport = self._transport  # type: ignore[assignment]
+        try:
+            # Ctrl-C to abort any remaining md.b output
+            for _ in range(5):
+                await transport.write(b"\x03")
+                await asyncio.sleep(0.1)
+            # Drain all buffered data
+            await asyncio.sleep(0.5)
+            for _ in range(10):
+                w = await transport.bytes_waiting()
+                if w > 0:
+                    await transport.read(w, timeout=0.1)
+                    await asyncio.sleep(0.1)
+                else:
+                    break
+        except Exception:
+            pass
+        # Clear terminal so user starts fresh
+        self._term_content = ""
+        try:
+            self.query_one("#terminal", TextArea).clear()
+        except Exception:
+            pass
+
+    def _return_to_terminal(self) -> None:
+        self.query_one("#dump-overlay").display = False
+        self.query_one("#terminal", TextArea).display = True
+        self._console_mode = True
+        self._console_reader_task = asyncio.ensure_future(self._console_read_loop())
+
+    async def _run_flash_dump(self, filename: str) -> None:
         from pathlib import Path
         from defib.flashdump import dump_flash
         from defib.transport.base import Transport
@@ -366,26 +510,76 @@ class ProgressScreen(Screen[None]):
         transport: Transport = self._transport  # type: ignore[assignment]
         output_path = str(Path.cwd() / filename)
 
+        status = self.query_one("#dump-status", Static)
+        action = self.query_one("#dump-action", Static)
+        progress = self.query_one("#dump-progress", ProgressBar)
+        btn = self.query_one("#dump-btn", Button)
+
+        def on_progress(done: int, total: int) -> None:
+            pct = done * 100 // total if total else 0
+            mb_done = done / (1024 * 1024)
+            mb_total = total / (1024 * 1024)
+            progress.update(total=total, progress=done)
+            action.update(f"Dumping: {mb_done:.1f} / {mb_total:.0f} MB ({pct}%)")
+
+        def on_log(msg: str) -> None:
+            action.update(msg)
+
+        stats_widget = self.query_one("#dump-stats", Static)
+
+        def on_stats(s: dict[str, object]) -> None:
+            elapsed = float(str(s.get("elapsed_s", 0)))
+            bps = float(str(s.get("bytes_per_s", 0)))
+            eta = float(str(s.get("eta_s", 0)))
+            blocks = s.get("blocks_done", 0)
+            total = s.get("blocks_total", 0)
+            verified_n = s.get("verified", 0)
+            errors_n = s.get("errors", 0)
+            retries_n = s.get("retries", 0)
+            crc = s.get("crc_enabled", False)
+
+            elapsed_m = int(elapsed) // 60
+            elapsed_s = int(elapsed) % 60
+            eta_m = int(eta) // 60
+            eta_s = int(eta) % 60
+            speed = f"{bps / 1024:.1f} KB/s" if bps > 0 else "..."
+
+            line1 = f"Blocks: {blocks}/{total}  Speed: {speed}  Time: {elapsed_m}:{elapsed_s:02d}  ETA: {eta_m}:{eta_s:02d}"
+            if crc:
+                line2 = f"CRC32: {verified_n} OK  Errors: {errors_n}  Retries: {retries_n}"
+            else:
+                line2 = "CRC32: not available"
+            stats_widget.update(f"{line1}\n{line2}")
+
         try:
             boot_log = "\n".join(self._log_buffer)
+            status.update(f"Chip: {self._chip} → {filename}")
             bytes_dumped = await dump_flash(
-                transport, output_path, boot_log=boot_log,
-                on_progress=lambda done, total: self._log(
-                    f"  Dump: {done*100//total}% ({done//(1024*1024)}/{total//(1024*1024)} MB)"
-                ) if done % (256 * 1024) < 65536 else None,
-                on_log=lambda msg: self._log(msg),
+                transport, output_path, chip=self._chip, boot_log=boot_log,
+                on_progress=on_progress, on_log=on_log, on_stats=on_stats,
+                is_cancelled=lambda: not self._dump_worker_running,
             )
-            self._log(f"Flash dump saved: {filename} ({bytes_dumped} bytes)", style="green bold")
-            self.notify(f"Dump saved: {filename}", severity="information", title="Flash Dump")
+            if not self._dump_worker_running:
+                # Was cancelled — show partial result
+                mb = bytes_dumped / (1024 * 1024)
+                status.update(f"[yellow]Cancelled[/yellow] — {mb:.1f} MB partial dump saved")
+            else:
+                # Success
+                progress.update(total=100, progress=100)
+                mb = bytes_dumped / (1024 * 1024)
+                status.update(f"[green bold]Done![/green bold] {mb:.1f} MB saved to {filename}")
         except asyncio.CancelledError:
-            return
+            status.update("[yellow]Cancelled[/yellow]")
         except Exception as e:
-            self._log(f"Flash dump failed: {e}", style="red bold")
-            self.notify(str(e), severity="error", title="Dump Failed")
+            status.update(f"[red bold]Failed:[/red bold] {e}")
         finally:
-            if resume_console:
-                self._console_mode = True
-                self._console_reader_task = asyncio.ensure_future(self._console_read_loop())
+            self._dump_worker_running = False
+            # Clean up serial state: send Ctrl-C, drain buffer
+            await self._cleanup_after_dump()
+            action.update("")
+            btn.label = "Return to Terminal"
+            btn.variant = "success"
+            btn.disabled = False
 
     # --- Recovery ---
 

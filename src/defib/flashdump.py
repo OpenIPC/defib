@@ -25,8 +25,45 @@ from defib.transport.base import Transport, TransportTimeout
 
 logger = logging.getLogger(__name__)
 
-# Default RAM address for flash readout
-DEFAULT_RAM_ADDR = 0x82000000
+# RAM base addresses by SoC family (from qemu-hisilicon/hw/arm/hisilicon.c)
+# Used to derive safe staging address for flash readout via md.b
+RAM_BASE: dict[str, int] = {
+    # 0x80000000 family
+    "hi3516cv100": 0x80000000,
+    "hi3516cv200": 0x80000000,
+    "hi3516av100": 0x80000000,
+    "hi3516av200": 0x80000000,
+    "hi3516cv300": 0x80000000,
+    "hi3516cv500": 0x80000000,
+    "hi3519v101": 0x80000000,
+    "hi3516a": 0x80000000,
+    "hi3516dv100": 0x80000000,
+    "hi3516dv300": 0x80000000,
+    "hi3518": 0x80000000,
+    "hi3518ev200": 0x80000000,
+    "hi3520d": 0x80000000,
+    "hi3531": 0x80000000,
+    "hi3531a": 0x80000000,
+    "hi3535": 0x80000000,
+    "hi3536": 0x80000000,
+    "hi3519": 0x80000000,
+    "hi3559v100": 0x80000000,
+    # 0x40000000 family
+    "hi3516ev200": 0x40000000,
+    "hi3516ev300": 0x40000000,
+    "hi3518ev300": 0x40000000,
+    "hi3516dv200": 0x40000000,
+    "gk7205v200": 0x40000000,
+    "gk7205v300": 0x40000000,
+    "gk7202v300": 0x40000000,
+    "gk7605v100": 0x40000000,
+    "gk7205v500": 0x40000000,
+    "hi3516cv608": 0x40000000,
+    "hi3516cv610": 0x40000000,
+    "hi3516cv613": 0x40000000,
+}
+# Offset from RAM base for flash staging area (leaves room for U-Boot)
+RAM_STAGING_OFFSET = 0x2000000  # 32MB into RAM
 # Common SPI flash sizes (bytes)
 FLASH_SIZES = {
     "8MB": 0x800000,
@@ -40,6 +77,34 @@ MD_LINE_RE = re.compile(
     r"^([0-9a-fA-F]{8}):\s+"
     r"((?:[0-9a-fA-F]{2}[\s]+){0,15}[0-9a-fA-F]{2})"
 )
+
+
+def get_ram_staging_addr(chip: str) -> int:
+    """Get safe RAM address for flash staging based on SoC type.
+
+    Looks up the chip's RAM base from the known table, falling back to
+    the profile's U-Boot load address if not found.
+    """
+    chip_lower = chip.lower()
+    # Direct match
+    if chip_lower in RAM_BASE:
+        return RAM_BASE[chip_lower] + RAM_STAGING_OFFSET
+    # Try resolving via profile (some chips alias to others)
+    try:
+        from defib.profiles.loader import load_profile
+        profile = load_profile(chip_lower)
+        uboot_addr = int(profile.addresses[2], 16)
+        # Derive RAM base from U-Boot address (aligned to 0x40000000 boundary)
+        ram_base = uboot_addr & 0xF0000000
+        return ram_base + RAM_STAGING_OFFSET
+    except Exception:
+        pass
+    # Last resort: use profile name for lookup
+    for prefix, base in RAM_BASE.items():
+        if chip_lower.startswith(prefix[:8]):
+            return base + RAM_STAGING_OFFSET
+    # Default for unknown chips
+    return 0x82000000
 
 
 def parse_md_line(line: str) -> tuple[int, bytes] | None:
@@ -224,13 +289,40 @@ async def detect_flash(
     return None
 
 
+async def _detect_crc32(transport: Transport) -> bool:
+    """Check if U-Boot has the crc32 command."""
+    resp = await send_command(transport, "crc32 0 0", timeout=3.0, wait_for="# ")
+    # If crc32 exists, it will output a CRC value or usage.
+    # If not, it will say "Unknown command"
+    return "unknown command" not in resp.lower()
+
+
+async def _get_device_crc32(
+    transport: Transport, addr: int, size: int
+) -> int | None:
+    """Run crc32 on the device and parse the result.
+
+    U-Boot crc32 output: "CRC32 for 42000000 ... 42000fff ==> abcd1234"
+    """
+    cmd = f"crc32 0x{addr:x} 0x{size:x}"
+    resp = await send_command(transport, cmd, timeout=5.0, wait_for="# ")
+    # Parse "==> XXXXXXXX" pattern
+    m = re.search(r"==>\s*([0-9a-fA-F]{8})", resp)
+    if m:
+        return int(m.group(1), 16)
+    return None
+
+
 async def dump_flash(
     transport: Transport,
     output_path: str,
     flash_size: int | None = None,
-    ram_addr: int = DEFAULT_RAM_ADDR,
+    ram_addr: int | None = None,
+    chip: str = "",
     on_progress: Callable[[int, int], None] | None = None,
     on_log: Callable[[str], None] | None = None,
+    on_stats: Callable[[dict[str, object]], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
     boot_log: str = "",
 ) -> int:
     """Dump entire flash to a binary file via U-Boot md.b command.
@@ -249,6 +341,15 @@ async def dump_flash(
     Raises:
         RuntimeError: If flash detection or reading fails.
     """
+
+    # Resolve RAM staging address
+    if ram_addr is None:
+        if chip:
+            ram_addr = get_ram_staging_addr(chip)
+        else:
+            ram_addr = 0x82000000  # Legacy default, may crash on 0x40000000 boards
+    if on_log:
+        on_log(f"RAM staging address: 0x{ram_addr:08x}")
 
     # Detect flash size if not provided
     if flash_size is None:
@@ -271,29 +372,70 @@ async def dump_flash(
         if on_log:
             on_log("Warning: sf read response unclear, proceeding with dump")
 
+    # Detect if U-Boot has crc32 command for per-block verification
+    has_crc32 = await _detect_crc32(transport)
     if on_log:
-        on_log(f"Dumping {size_mb:.0f}MB via md.b (this takes a while)...")
+        if has_crc32:
+            on_log("CRC32 verification enabled")
+        else:
+            on_log("CRC32 not available — dumping without verification")
 
-    # Dump via md.b in chunks to show progress
-    # md.b can handle large sizes, but we chunk for progress reporting
-    chunk_size = 0x10000  # 64KB chunks
+    if on_log:
+        on_log(f"Dumping {size_mb:.0f}MB via md.b...")
+
+    chunk_size = 0x1000  # 4KB chunks
+    max_retries = 3
     offset = 0
+    verified = 0
+    errors = 0
+    retries_total = 0
+    start_time = time.monotonic()
 
     with open(output_path, "wb") as f:
         while offset < flash_size:
             remaining = min(chunk_size, flash_size - offset)
             addr = ram_addr + offset
-            cmd = f"md.b 0x{addr:x} 0x{remaining:x}"
 
-            # md.b output can be large — give it time
-            resp = await send_command(transport, cmd, timeout=60.0, wait_for="# ")
-            chunk_data = parse_md_output(resp)
+            for attempt in range(max_retries + 1):
+                cmd = f"md.b 0x{addr:x} 0x{remaining:x}"
+                resp = await send_command(transport, cmd, timeout=15.0, wait_for="# ")
+                chunk_data = parse_md_output(resp)
 
-            if len(chunk_data) == 0:
-                if on_log:
-                    on_log(f"Warning: no data parsed at offset 0x{offset:x}")
-                # Write zeros for missing data
-                chunk_data = b"\x00" * remaining
+                if len(chunk_data) == 0:
+                    if attempt < max_retries:
+                        if on_log:
+                            on_log(f"Retry {attempt + 1}: no data at 0x{offset:x}")
+                        retries_total += 1
+                        continue
+                    if on_log:
+                        on_log(f"Warning: no data at offset 0x{offset:x}, writing zeros")
+                    chunk_data = b"\x00" * remaining
+                    break
+
+                # CRC32 verification if available
+                if has_crc32 and len(chunk_data) == remaining:
+                    import zlib
+                    local_crc = zlib.crc32(chunk_data) & 0xFFFFFFFF
+                    device_crc = await _get_device_crc32(
+                        transport, addr, remaining
+                    )
+                    if device_crc is not None and device_crc != local_crc:
+                        errors += 1
+                        if attempt < max_retries:
+                            if on_log:
+                                retries_total += 1
+                                if on_log is not None:
+                                    on_log(
+                                        f"CRC mismatch at 0x{offset:x} "
+                                        f"(local={local_crc:08x} device={device_crc:08x}), "
+                                        f"retry {attempt + 1}"
+                                    )
+                            continue
+                        if on_log:
+                            on_log(f"CRC mismatch at 0x{offset:x} after {max_retries} retries")
+                    else:
+                        verified += 1
+                break
 
             f.write(chunk_data)
             offset += len(chunk_data)
@@ -301,7 +443,37 @@ async def dump_flash(
             if on_progress:
                 on_progress(offset, flash_size)
 
+            # Check for cancellation between blocks
+            if is_cancelled is not None and is_cancelled():
+                if on_log:
+                    on_log(f"Cancelled at {offset // 1024}KB / {flash_size // 1024}KB")
+                break
+
+            if on_stats:
+                elapsed = time.monotonic() - start_time
+                total_blocks = (flash_size + chunk_size - 1) // chunk_size
+                blocks_done = offset // chunk_size
+                bps = offset / elapsed if elapsed > 0 else 0
+                eta = (flash_size - offset) / bps if bps > 0 else 0
+                on_stats({
+                    "blocks_done": blocks_done,
+                    "blocks_total": total_blocks,
+                    "verified": verified,
+                    "errors": errors,
+                    "retries": retries_total,
+                    "elapsed_s": elapsed,
+                    "bytes_per_s": bps,
+                    "eta_s": eta,
+                    "crc_enabled": has_crc32,
+                })
+
     if on_log:
-        on_log(f"Flash dump saved: {output_path} ({offset} bytes)")
+        msg = f"Flash dump saved: {output_path} ({offset} bytes)"
+        if has_crc32:
+            total_blocks = (flash_size + chunk_size - 1) // chunk_size
+            msg += f" — {verified}/{total_blocks} blocks verified"
+            if errors:
+                msg += f", {errors} errors"
+        on_log(msg)
 
     return offset
