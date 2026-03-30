@@ -241,7 +241,7 @@ class MainScreen(Screen[None]):
 
     def _get_firmware_path(self) -> str:
         """Get firmware path: local file input takes priority, then cached download."""
-        local = self.query_one("#file-input", Input).value.strip()
+        local = str(self.query_one("#file-input", Input).value).strip()
         if local:
             return local
 
