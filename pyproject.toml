@@ -1,0 +1,63 @@
+[project]
+name = "defib"
+version = "0.1.0"
+description = "Universal camera recovery tool - shocking dead devices back to life"
+requires-python = ">=3.11"
+license = "MIT"
+readme = "README.md"
+keywords = ["uart", "serial", "hisilicon", "goke", "ipcamera", "recovery", "bootloader"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Hardware",
+]
+dependencies = [
+    "pyserial>=3.5",
+    "pyserial-asyncio>=0.6",
+    "typer>=0.9",
+    "rich>=13.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+tui = ["textual>=0.40"]
+web = ["fastapi>=0.100", "uvicorn>=0.20", "jinja2>=3.1"]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+    "hypothesis>=6",
+    "mypy",
+    "ruff",
+]
+
+[project.scripts]
+defib = "defib.cli.app:main"
+
+[project.entry-points."defib.protocols"]
+hisilicon_standard = "defib.protocol.hisilicon_standard:HiSiliconStandard"
+hisilicon_v500 = "defib.protocol.hisilicon_v500:HiSiliconV500"
+hisilicon_cv6xx = "defib.protocol.hisilicon_cv6xx:HiSiliconCV6xx"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/defib"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
