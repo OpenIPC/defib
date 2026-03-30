@@ -96,8 +96,17 @@ footer a { color: var(--accent); text-decoration: none; }
     <label>Chip Model <span class="chip-count" id="chip-count"></span></label>
     <select id="chip-select"><option value="">Loading...</option></select>
 
-    <label>Firmware File (U-Boot .bin)</label>
-    <input type="file" id="file-input" accept=".bin,.img">
+    <label>Firmware</label>
+    <div id="fw-auto" class="btn-row" style="display:none;margin-top:0">
+      <button class="btn btn-secondary" id="fw-download-btn" onclick="downloadFirmware()" style="flex:1">
+        Download from OpenIPC
+      </button>
+      <span id="fw-status" style="color:var(--green);align-self:center;font-size:0.85em"></span>
+    </div>
+    <div id="fw-manual" style="margin-top:4px">
+      <input type="file" id="file-input" accept=".bin,.img">
+    </div>
+    <div style="font-size:0.8em;color:var(--dim);margin-top:2px" id="fw-hint"></div>
 
     <label>Serial Port</label>
     <div class="btn-row">
@@ -445,6 +454,82 @@ async function cv6xxSendFirmware(firmware) {
 let selectedPort = null;
 let firmwareData = null;
 
+// Chips with pre-built u-boot on OpenIPC
+const OPENIPC_FIRMWARE = new Set([
+  "gk7202v300","gk7205v200","gk7205v300","gk7605v100",
+  "hi3516av100","hi3516av200","hi3516av300",
+  "hi3516cv100","hi3516cv200","hi3516cv300","hi3516cv500",
+  "hi3516dv100","hi3516dv200","hi3516dv300",
+  "hi3516ev100","hi3516ev200","hi3516ev300",
+  "hi3518av100","hi3518cv100","hi3518ev100","hi3518ev200","hi3518ev300",
+  "hi3519v101","t40a","t40n","t40xp",
+]);
+const CHIP_FW_ALIAS = {"hi3518ev201":"hi3518ev200","gk7201v200":"gk7205v200","gk7201v300":"gk7205v200"};
+
+function fwNameForChip(chip) {
+  return CHIP_FW_ALIAS[chip] || chip;
+}
+
+function hasFirmware(chip) {
+  return OPENIPC_FIRMWARE.has(fwNameForChip(chip));
+}
+
+function fwUrl(chip) {
+  const name = fwNameForChip(chip);
+  return `https://github.com/OpenIPC/firmware/releases/download/latest/u-boot-${name}-universal.bin`;
+}
+
+async function downloadFirmware() {
+  const chip = document.getElementById('chip-select').value;
+  if (!chip || !hasFirmware(chip)) return;
+  const btn = document.getElementById('fw-download-btn');
+  const status = document.getElementById('fw-status');
+  btn.disabled = true;
+  btn.textContent = 'Downloading...';
+  status.textContent = '';
+  try {
+    const resp = await fetch(fwUrl(chip));
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const blob = await resp.blob();
+    firmwareData = new Uint8Array(await blob.arrayBuffer());
+    status.textContent = `✓ ${(firmwareData.length / 1024).toFixed(0)} KB`;
+    btn.textContent = 'Re-download';
+    updateStartButton();
+  } catch (e) {
+    status.textContent = '';
+    btn.textContent = 'Download failed — retry?';
+    log('Firmware download failed: ' + e.message, 'error');
+  }
+  btn.disabled = false;
+}
+
+function onChipChanged() {
+  const chip = document.getElementById('chip-select').value;
+  const autoDiv = document.getElementById('fw-auto');
+  const hint = document.getElementById('fw-hint');
+  const btn = document.getElementById('fw-download-btn');
+  const status = document.getElementById('fw-status');
+
+  if (chip && hasFirmware(chip)) {
+    autoDiv.style.display = '';
+    btn.textContent = `Download U-Boot for ${chip}`;
+    btn.disabled = false;
+    status.textContent = '';
+    hint.textContent = 'Or select a local file below to use your own build.';
+  } else if (chip) {
+    autoDiv.style.display = 'none';
+    hint.textContent = 'No OpenIPC build available — select a local firmware file.';
+  } else {
+    autoDiv.style.display = 'none';
+    hint.textContent = '';
+  }
+  // Reset firmware if chip changed (unless user picked local file)
+  if (!document.getElementById('file-input').files.length) {
+    firmwareData = null;
+  }
+  updateStartButton();
+}
+
 function initChipSelector() {
   const sel = document.getElementById('chip-select');
   const allChips = [
@@ -456,7 +541,7 @@ function initChipSelector() {
   sel.innerHTML = '<option value="">— Select chip model —</option>';
   for (const c of unique) sel.innerHTML += `<option value="${c}">${c}</option>`;
   document.getElementById('chip-count').textContent = `(${unique.length} supported)`;
-  sel.onchange = updateStartButton;
+  sel.onchange = onChipChanged;
 }
 
 async function selectPort() {
