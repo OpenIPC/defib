@@ -1,7 +1,7 @@
 """Tests for flash dump via U-Boot serial console."""
 
 
-from defib.flashdump import detect_flash_from_text, parse_md_line, parse_md_output
+from defib.flashdump import detect_flash_from_text, get_ram_staging_addr, parse_md_line, parse_md_output
 
 
 class TestParseMdLine:
@@ -152,3 +152,60 @@ class TestDetectFlashFromText:
     def test_ram_128mb_alone_no_match(self):
         """RAM size alone should not be detected as flash size."""
         assert detect_flash_from_text("RAM size: 128MB\n") is None
+
+
+class TestGetRamStagingAddr:
+    """Regression: md.b 0x82000000 caused data abort on hi3516ev300.
+
+    The RAM base is 0x40000000 on ev200/ev300 chips, not 0x80000000.
+    Using 0x82000000 crashes the CPU.
+    """
+
+    def test_hi3516ev300_ram_at_0x40(self):
+        addr = get_ram_staging_addr("hi3516ev300")
+        assert addr >= 0x40000000
+        assert addr < 0x50000000
+
+    def test_hi3516cv300_ram_at_0x80(self):
+        addr = get_ram_staging_addr("hi3516cv300")
+        assert addr >= 0x80000000
+        assert addr < 0x90000000
+
+    def test_gk7205v200_ram_at_0x40(self):
+        addr = get_ram_staging_addr("gk7205v200")
+        assert addr >= 0x40000000
+        assert addr < 0x50000000
+
+    def test_hi3518ev200_ram_at_0x80(self):
+        addr = get_ram_staging_addr("hi3518ev200")
+        assert addr >= 0x80000000
+        assert addr < 0x90000000
+
+    def test_hi3516cv610_ram_at_0x40(self):
+        addr = get_ram_staging_addr("hi3516cv610")
+        assert addr >= 0x40000000
+        assert addr < 0x50000000
+
+
+class TestCrc32Detection:
+    """Test CRC32 command detection and parsing."""
+
+    def test_parse_crc32_response(self):
+        """U-Boot crc32 output: '... ==> abcd1234'."""
+        import re
+        resp = "CRC32 for 42000000 ... 42000fff ==> 1a2b3c4d\nOpenIPC # "
+        m = re.search(r"==>\s*([0-9a-fA-F]{8})", resp)
+        assert m is not None
+        assert int(m.group(1), 16) == 0x1A2B3C4D
+
+    def test_parse_crc32_no_match(self):
+        """Unknown command response has no ==> pattern."""
+        import re
+        resp = "Unknown command 'crc32'\nOpenIPC # "
+        m = re.search(r"==>\s*([0-9a-fA-F]{8})", resp)
+        assert m is None
+
+    def test_detect_unknown_command(self):
+        """'Unknown command' in response means crc32 not available."""
+        resp = "Unknown command 'crc32' - try 'help'\nOpenIPC # "
+        assert "unknown command" in resp.lower()

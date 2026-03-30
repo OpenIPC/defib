@@ -16,3 +16,4 @@ venv/
 .env
 .hypothesis/
 *.log
+*.bin
