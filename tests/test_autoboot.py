@@ -23,7 +23,6 @@ import asyncio
 import pytest
 
 from defib.protocol.crc import ACK_BYTE
-from defib.recovery.events import LogEvent, ProgressEvent
 from defib.recovery.session import RecoverySession
 from defib.transport.mock import MockTransport
 
