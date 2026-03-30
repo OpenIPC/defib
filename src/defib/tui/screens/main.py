@@ -25,7 +25,11 @@ def _get_serial_ports() -> list[tuple[str, str]]:
     """Get available serial ports as (label, value) tuples."""
     try:
         from serial.tools.list_ports import comports
-        ports = sorted(comports(), key=lambda p: p.device)
+        # Filter out ghost/placeholder ports (no USB vendor ID = not real)
+        ports = sorted(
+            [p for p in comports() if p.vid is not None],
+            key=lambda p: p.device,
+        )
         if ports:
             return [(f"{p.device} - {p.description}", p.device) for p in ports]
     except Exception:

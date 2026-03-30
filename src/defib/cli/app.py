@@ -179,7 +179,11 @@ def ports(
     from rich.table import Table
     from serial.tools.list_ports import comports
 
-    port_list = sorted(comports(), key=lambda p: p.device)
+    # Filter out ghost/placeholder ports (no USB vendor ID = not a real adapter)
+    port_list = sorted(
+        [p for p in comports() if p.vid is not None],
+        key=lambda p: p.device,
+    )
 
     if output == "json":
         print(json_mod.dumps({
