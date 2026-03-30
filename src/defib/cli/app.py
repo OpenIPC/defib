@@ -14,13 +14,17 @@ app = typer.Typer(
 @app.command()
 def burn(
     chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
-    file: str = typer.Option(..., "-f", "--file", help="U-Boot binary file to upload"),
+    file: str = typer.Option("", "-f", "--file", help="Firmware file (auto-downloads from OpenIPC if omitted)"),
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
     send_break: bool = typer.Option(False, "-b", "--break", help="Send Ctrl-C after upload"),
     output: str = typer.Option("human", "--output", help="Output mode: human, json, quiet"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
 ) -> None:
-    """Recover a device by uploading firmware via UART serial."""
+    """Recover a device by uploading firmware via UART serial.
+
+    If no firmware file is specified with -f, automatically downloads
+    the appropriate U-Boot from OpenIPC releases.
+    """
     import asyncio
     asyncio.run(_burn_async(chip, file, port, send_break, output, debug))
 
@@ -44,8 +48,53 @@ async def _burn_async(
     else:
         logging.basicConfig(level=logging.INFO)
 
+    # Resolve firmware: local file or auto-download from OpenIPC
+    firmware_path = file
+    if not firmware_path:
+        from defib.firmware import has_firmware, download_firmware, get_cached_path
+
+        if not has_firmware(chip):
+            msg = (
+                f"No pre-built firmware for '{chip}' on OpenIPC. "
+                f"Specify a local file with -f/--file."
+            )
+            if output == "json":
+                print(json_mod.dumps({"event": "error", "message": msg}))
+            else:
+                console.print(f"[red]{msg}[/red]")
+            raise typer.Exit(1)
+
+        cached = get_cached_path(chip)
+        if cached:
+            firmware_path = str(cached)
+            if output == "human":
+                console.print(f"Firmware: [cyan]{cached.name}[/cyan] (cached)")
+        else:
+            if output == "human":
+                console.print(f"Downloading U-Boot for [cyan]{chip}[/cyan] from OpenIPC...")
+            elif output == "json":
+                print(json_mod.dumps({"event": "download_start", "chip": chip}), flush=True)
+            try:
+                def _dl_progress(done: int, total: int) -> None:
+                    if output == "human":
+                        pct = done * 100 // total if total else 0
+                        console.print(f"\r  Downloading: {pct}%", end="")
+                    elif output == "json" and done == total:
+                        print(json_mod.dumps({"event": "download_complete", "bytes": total}), flush=True)
+
+                path = download_firmware(chip, on_progress=_dl_progress)
+                firmware_path = str(path)
+                if output == "human":
+                    console.print(f"\n  Saved: [cyan]{path.name}[/cyan] ({path.stat().st_size} bytes)")
+            except (ValueError, ConnectionError) as e:
+                if output == "json":
+                    print(json_mod.dumps({"event": "error", "message": str(e)}))
+                else:
+                    console.print(f"\n[red]Download failed:[/red] {e}")
+                raise typer.Exit(1)
+
     try:
-        session = RecoverySession(chip=chip, firmware_path=file)
+        session = RecoverySession(chip=chip, firmware_path=firmware_path)
     except (ValueError, FileNotFoundError) as e:
         if output == "json":
             print(json_mod.dumps({"event": "error", "message": str(e)}))
