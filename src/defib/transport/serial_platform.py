@@ -114,16 +114,25 @@ async def create_transport(
     baudrate: int = 115200,
     force_platform: str | None = None,
 ) -> Transport:
-    """Create a platform-appropriate serial transport.
+    """Create a platform-appropriate transport.
 
     Args:
-        device: Serial port device path (e.g., /dev/ttyUSB0, COM3).
-        baudrate: Baud rate (default 115200).
+        device: Serial port device path (e.g., /dev/ttyUSB0, COM3) or
+                Unix socket path with ``socket://`` prefix (e.g.,
+                ``socket:///tmp/qemu.sock``).
+        baudrate: Baud rate (default 115200, ignored for sockets).
         force_platform: Override platform detection ("linux", "darwin", "win32").
 
     Returns:
         An appropriate Transport implementation.
     """
+    # Unix socket transport (for QEMU chardev sockets)
+    if device.startswith("socket://"):
+        from defib.transport.socket import SocketTransport
+        path = device[len("socket://"):]
+        logger.info("Using SocketTransport: %s", path)
+        return await SocketTransport.create(path)
+
     platform = force_platform or sys.platform
 
     if platform == "darwin":

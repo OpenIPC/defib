@@ -52,6 +52,32 @@ defib burn -c gk7205v200 -f u-boot.bin --output json
 - macOS serial workaround (ACK byte correction)
 - Cross-platform: Linux, macOS, Windows
 
+## Testing with QEMU
+
+Defib can be tested end-to-end against the
+[qemu-hisilicon](https://github.com/OpenIPC/qemu-hisilicon) emulator without
+physical hardware. When QEMU starts without `-kernel`, it emulates the HiSilicon
+boot ROM serial protocol.
+
+```bash
+# Terminal 1: start QEMU in fastboot mode
+qemu-system-arm -M hi3516ev300 -m 64M -nographic \
+    -chardev socket,id=ser0,path=/tmp/qemu-hisi.sock,server=on,wait=off \
+    -serial chardev:ser0
+
+# Terminal 2: recover via socket (auto-downloads OpenIPC U-Boot)
+defib burn -c hi3516ev300 -p socket:///tmp/qemu-hisi.sock
+```
+
+The `socket://` transport prefix connects defib directly to QEMU's chardev Unix
+socket. All three protocol phases (DDR init, SPL, U-Boot) transfer with full
+CRC-16 validation. After the upload, QEMU starts the CPU and U-Boot output
+appears on the same connection.
+
+Supported: all Standard protocol chips (hi3516cv300, hi3516ev200, hi3516ev300,
+hi3518ev300, gk7205v200, gk7205v300, etc.). V500 and CV6xx protocol emulation
+is not yet available in QEMU.
+
 ## License
 
 MIT
