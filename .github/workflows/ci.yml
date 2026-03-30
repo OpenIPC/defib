@@ -20,15 +20,14 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
+        with:
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --dev
+        run: uv sync --dev --python ${{ matrix.python-version }}
 
       - name: Run tests
-        run: uv run pytest tests/ -x -v --ignore=tests/fuzz
+        run: uv run --python ${{ matrix.python-version }} pytest tests/ -x -v --ignore=tests/fuzz
 
   fuzz:
     name: Fuzz Tests
@@ -38,9 +37,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
-
-      - name: Set up Python
-        run: uv python install 3.12
+        with:
+          python-version: "3.12"
 
       - name: Install dependencies
         run: uv sync --dev
@@ -56,9 +54,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4
-
-      - name: Set up Python
-        run: uv python install 3.12
+        with:
+          python-version: "3.12"
 
       - name: Install dependencies
         run: uv sync --dev
