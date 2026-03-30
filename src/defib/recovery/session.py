@@ -101,8 +101,8 @@ class RecoverySession:
                 elapsed_ms=elapsed,
             )
 
-        if on_log:
-            on_log(LogEvent(level="info", message=handshake.message))
+        # Note: handshake success is already reported via on_progress,
+        # so we don't duplicate it here via on_log.
 
         # Firmware transfer
         firmware = self._load_firmware()
@@ -126,13 +126,10 @@ class RecoverySession:
                 except Exception:
                     pass
 
-        if on_log:
-            if result.success:
-                on_log(LogEvent(
-                    level="info",
-                    message=f"Recovery complete in {result.elapsed_ms:.0f}ms",
-                ))
-            else:
-                on_log(LogEvent(level="error", message=f"Recovery failed: {result.error}"))
+        # Note: completion/failure is already reported via on_progress
+        # (Stage.COMPLETE event). We only log errors here that weren't
+        # already surfaced by the protocol.
+        if on_log and not result.success:
+            on_log(LogEvent(level="error", message=f"Recovery failed: {result.error}"))
 
         return result

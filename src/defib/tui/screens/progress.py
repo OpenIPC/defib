@@ -139,7 +139,8 @@ class ProgressScreen(Screen[None]):
             with Horizontal(id="stages-row"):
                 stages = ["Handshake", "DDR Init", "SPL/GSL", "U-Boot"]
                 for name in stages:
-                    indicator = StageIndicator(name, id=f"stage-{name.lower().replace('/', '-')}")
+                    safe_id = name.lower().replace("/", "-").replace(" ", "-")
+                    indicator = StageIndicator(name, id=f"stage-{safe_id}")
                     self._stage_widgets[name.lower()] = indicator
                     yield indicator
 
@@ -204,7 +205,7 @@ class ProgressScreen(Screen[None]):
                 self._stage_widgets[indicator_name].set_active()
             self._current_stage = indicator_name
 
-        if event.message:
+        if event.message and event.stage != Stage.COMPLETE:
             self._log(event.message)
 
     def _on_log(self, event: LogEvent) -> None:

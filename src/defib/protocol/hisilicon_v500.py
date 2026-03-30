@@ -68,15 +68,14 @@ class HiSiliconV500(BootProtocol):
         """Send V500 handshake frame until device responds with chip ID."""
         _emit(on_progress, ProgressEvent(
             stage=Stage.HANDSHAKE, bytes_sent=0, bytes_total=1,
-            message="Sending V500 handshake...",
+            message="Waiting for bootrom... power-cycle the device now!",
         ))
 
         handshake_frame = append_crc(
             V500_HANDSHAKE_MAGIC + b"\x00\x00\x00\x00\x00\x00\x00\x00"
         )
 
-        start_time = time.monotonic()
-        while time.monotonic() - start_time < HANDSHAKE_TIMEOUT:
+        while True:
             await transport.write(handshake_frame)
             try:
                 response = await transport.read(14, timeout=0.1)
@@ -94,8 +93,6 @@ class HiSiliconV500(BootProtocol):
                     )
             except TransportTimeout:
                 continue
-
-        return HandshakeResult(success=False, message="V500 handshake timeout")
 
     async def _send_frame_wait_ack(
         self,

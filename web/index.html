@@ -245,10 +245,10 @@ async function sendFrameWithRetry(data, retries, timeoutMs) {
 }
 
 async function standardHandshake() {
-  log('Waiting for bootrom... power-cycle the device now', 'info');
+  log('Waiting for bootrom... power-cycle the device now!', 'info');
   setStage('handshake');
   let counter = 0;
-  for (let i = 0; i < 300; i++) { // ~30 seconds
+  while (true) {
     try {
       const b = await serialRead(1, 100);
       if (b[0] === 0x00) continue;
@@ -260,10 +260,8 @@ async function standardHandshake() {
         log('Boot mode entered!', 'info');
         return true;
       }
-    } catch (e) { /* timeout, keep waiting */ }
+    } catch (e) { /* timeout on read, keep waiting */ }
   }
-  log('Handshake timeout — no bootrom response', 'error');
-  return false;
 }
 
 async function standardSendFirmware(firmware, profile) {
@@ -348,11 +346,10 @@ async function sendDataToBootrom(data, address, label, onProgress) {
 }
 
 async function v500Handshake() {
-  log('Sending V500 handshake... power-cycle device now', 'info');
+  log('Waiting for bootrom... power-cycle the device now!', 'info');
   setStage('handshake');
   const frame = appendCrc(new Uint8Array([0xbd,0x00,0xff,0x01,0,0,0,0,0,0,0,0]));
-  const start = Date.now();
-  while (Date.now() - start < 20000) {
+  while (true) {
     await serialWrite(frame);
     try {
       const resp = await serialRead(14, 100);
@@ -361,10 +358,8 @@ async function v500Handshake() {
         log(`Detected SoC: 0x${chipId.toString(16)}`, 'info');
         return true;
       }
-    } catch (e) { /* timeout */ }
+    } catch (e) { /* timeout on read, keep waiting */ }
   }
-  log('V500 handshake timeout', 'error');
-  return false;
 }
 
 async function v500SendFirmware(firmware) {
@@ -393,7 +388,7 @@ async function v500SendFirmware(firmware) {
 // Protocol: CV6xx
 // ============================================================
 async function cv6xxHandshake() {
-  log('Sending CV6xx handshake... power-cycle device now', 'info');
+  log('Waiting for bootrom... power-cycle the device now!', 'info');
   setStage('handshake');
   const frame = new Uint8Array(16);
   frame.set([0xef,0xbe,0xad,0xde,0x12,0x00,0xf0,0x0f]);

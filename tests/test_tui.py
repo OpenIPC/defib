@@ -49,6 +49,28 @@ class TestTUIApp:
             await pilot.press("q")
 
 
+class TestProgressScreen:
+    @pytest.mark.asyncio
+    async def test_progress_screen_renders(self):
+        """Regression: ProgressScreen must not crash on compose.
+
+        Previously failed with BadIdentifier because stage names like
+        'DDR Init' produced ids with spaces ('stage-ddr init').
+        """
+        from defib.tui.screens.progress import ProgressScreen
+
+        app = DefibApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = ProgressScreen("hi3516ev300", "/tmp/fake.bin", "/dev/ttyUSB0", False)
+            app.push_screen(screen)
+            await pilot.pause()
+            # All 4 stage indicators should exist with valid ids
+            assert screen.query_one("#stage-handshake") is not None
+            assert screen.query_one("#stage-ddr-init") is not None
+            assert screen.query_one("#stage-spl-gsl") is not None
+            assert screen.query_one("#stage-u-boot") is not None
+
+
 class TestTUIFromCLI:
     def test_tui_command_exists(self):
         from typer.testing import CliRunner

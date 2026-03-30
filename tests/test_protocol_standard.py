@@ -51,15 +51,8 @@ class TestStandardHandshake:
         result = await protocol.handshake(transport)
         assert result.success
 
-    @pytest.mark.asyncio
-    async def test_handshake_timeout(self):
-        transport = MockTransport()
-        # Only 3x 0x20, not enough
-        transport.enqueue_rx(b"\x20\x20\x20")
-
-        protocol = HiSiliconStandard()
-        result = await protocol.handshake(transport)
-        assert not result.success
+    # No timeout test — handshake waits forever for user to power-cycle.
+    # User cancels via Ctrl-C, not a timeout.
 
 
 class TestStandardFirmwareTransfer:
