@@ -65,3 +65,17 @@ jobs:
 
       - name: Mypy
         run: uv run mypy src/defib/ --ignore-missing-imports
+
+  js-test:
+    name: JS Protocol Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run JS tests
+        run: node --test web/protocol.test.js
