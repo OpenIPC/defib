@@ -444,6 +444,100 @@ def replay(
         console.print(f"  [dim]... and {len(cap.records) - 50} more records[/dim]")
 
 
+@app.command("dump-flash")
+def dump_flash_cmd(
+    port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
+    output_file: str = typer.Option("flash_dump.bin", "-o", "--output", help="Output binary file"),
+    size: str = typer.Option("", "--size", help="Flash size (e.g., 8MB, 16MB) — auto-detect if empty"),
+    output: str = typer.Option("human", "--output-mode", help="Output mode: human, json"),
+) -> None:
+    """Dump flash contents via U-Boot serial console.
+
+    Requires U-Boot to be running on the device (connect to serial
+    console first, or use after 'defib burn').
+    """
+    import asyncio
+    asyncio.run(_dump_flash_async(port, output_file, size, output))
+
+
+async def _dump_flash_async(port: str, output_file: str, size: str, output: str) -> None:
+    import json as json_mod
+
+    from rich.console import Console
+
+    from defib.flashdump import FLASH_SIZES, dump_flash
+    from defib.transport.serial_platform import create_transport, normalize_port_name
+
+    console = Console()
+
+    # Parse size
+    flash_size = None
+    if size:
+        size_upper = size.upper()
+        if size_upper in FLASH_SIZES:
+            flash_size = FLASH_SIZES[size_upper]
+        else:
+            try:
+                flash_size = int(size, 0)
+            except ValueError:
+                console.print(f"[red]Invalid size:[/red] {size}. Use 8MB, 16MB, 32MB, or hex value.")
+                raise typer.Exit(1)
+
+    if output == "human":
+        console.print("[bold]Flash Dump[/bold]")
+        console.print(f"  Port: [cyan]{port}[/cyan]")
+        console.print(f"  Output: [cyan]{output_file}[/cyan]")
+        if flash_size:
+            console.print(f"  Size: [cyan]{flash_size // (1024*1024)}MB[/cyan]")
+        else:
+            console.print("  Size: [cyan]auto-detect[/cyan]")
+
+    try:
+        transport = await create_transport(normalize_port_name(port))
+    except Exception as e:
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": str(e)}))
+        else:
+            console.print(f"[red]Failed to open serial port:[/red] {e}")
+        raise typer.Exit(2)
+
+    def on_progress(done: int, total: int) -> None:
+        if output == "json":
+            print(json_mod.dumps({
+                "event": "dump_progress", "bytes_done": done, "bytes_total": total,
+            }), flush=True)
+        elif output == "human":
+            pct = done * 100 // total if total else 0
+            mb_done = done / (1024 * 1024)
+            mb_total = total / (1024 * 1024)
+            console.print(f"\r  Progress: {mb_done:.1f}/{mb_total:.0f} MB ({pct}%)", end="")
+
+    def on_log(msg: str) -> None:
+        if output == "json":
+            print(json_mod.dumps({"event": "log", "message": msg}), flush=True)
+        else:
+            console.print(f"  {msg}")
+
+    try:
+        bytes_dumped = await dump_flash(
+            transport, output_file,
+            flash_size=flash_size,
+            on_progress=on_progress, on_log=on_log,
+        )
+        if output == "human":
+            console.print(f"\n\n[green bold]Done![/green bold] {bytes_dumped} bytes saved to {output_file}")
+        elif output == "json":
+            print(json_mod.dumps({"event": "done", "bytes": bytes_dumped, "file": output_file}))
+    except Exception as e:
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": str(e)}))
+        else:
+            console.print(f"\n[red]Dump failed:[/red] {e}")
+        raise typer.Exit(1)
+    finally:
+        await transport.close()
+
+
 @app.command()
 def tui() -> None:
     """Launch the interactive TUI for device recovery."""

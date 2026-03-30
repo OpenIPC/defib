@@ -21,7 +21,7 @@ class DefibApp(App[None]):
     """
 
     BINDINGS = [
-        Binding("q", "quit", "Quit", show=True),
+        Binding("ctrl+q", "quit", "Quit", show=True),
     ]
 
     SCREENS = {"main": MainScreen}
