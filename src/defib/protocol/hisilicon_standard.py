@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 BOOTMODE_MARKER = b"\x20"
 BOOTMODE_COUNT = 5
 BOOTMODE_ACK = b"\xaa"
-MAX_INIT_READS = 30
+MAX_INIT_READS = 30  # Only used by tests; interactive mode loops forever
 
 FRAME_SEND_RETRIES_SHORT = 16
 FRAME_SEND_RETRIES_LONG = 32
@@ -77,11 +77,11 @@ class HiSiliconStandard(BootProtocol):
         """Wait for bootrom 0x20 pattern and send 0xAA acknowledgment."""
         _emit(on_progress, ProgressEvent(
             stage=Stage.HANDSHAKE, bytes_sent=0, bytes_total=1,
-            message="Waiting for bootrom...",
+            message="Waiting for bootrom... power-cycle the device now!",
         ))
 
         counter = 0
-        for i in range(MAX_INIT_READS):
+        while True:
             try:
                 byte = await transport.read(1, timeout=1.0)
             except TransportTimeout:
@@ -104,8 +104,6 @@ class HiSiliconStandard(BootProtocol):
                     message="Boot mode entered",
                 ))
                 return HandshakeResult(success=True, message="Boot mode entered")
-
-        return HandshakeResult(success=False, message="Bootrom handshake timeout")
 
     async def _send_frame_with_retry(
         self,

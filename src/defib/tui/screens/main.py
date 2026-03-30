@@ -1,4 +1,4 @@
-"""Main setup screen: chip selector, file picker, port selector, start button."""
+"""Main setup screen: chip selector, firmware (auto-download or local), port selector."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from textual.widgets import (
     Checkbox,
 )
 
+from defib.firmware import has_firmware, download_firmware, get_cached_path
 from defib.profiles.loader import list_all_chips
 
 
@@ -25,7 +26,6 @@ def _get_serial_ports() -> list[tuple[str, str]]:
     """Get available serial ports as (label, value) tuples."""
     try:
         from serial.tools.list_ports import comports
-        # Filter out ghost/placeholder ports (no USB vendor ID = not real)
         ports = sorted(
             [p for p in comports() if p.vid is not None],
             key=lambda p: p.device,
@@ -47,9 +47,9 @@ class MainScreen(Screen[None]):
     }
 
     #form-container {
-        width: 70;
+        width: 74;
         height: auto;
-        max-height: 30;
+        max-height: 34;
         border: thick $accent;
         padding: 1 2;
         background: $panel;
@@ -72,6 +72,18 @@ class MainScreen(Screen[None]):
         width: 100%;
     }
 
+    #fw-status {
+        height: 1;
+        color: $success;
+        margin-top: 0;
+    }
+
+    #fw-hint {
+        height: 1;
+        color: $text-muted;
+        text-style: italic;
+    }
+
     #button-row {
         margin-top: 1;
         align: center middle;
@@ -82,8 +94,8 @@ class MainScreen(Screen[None]):
         min-width: 20;
     }
 
-    #chip-input {
-        width: 100%;
+    #download-btn {
+        min-width: 30;
     }
 
     #file-input {
@@ -110,9 +122,17 @@ class MainScreen(Screen[None]):
                     allow_blank=True,
                 )
 
-                yield Label("Firmware File:")
+                yield Label("Firmware:")
+                yield Button(
+                    "Select a chip first",
+                    variant="default",
+                    id="download-btn",
+                    disabled=True,
+                )
+                yield Static("", id="fw-status")
+                yield Static("", id="fw-hint")
                 yield Input(
-                    placeholder="/path/to/u-boot.bin",
+                    placeholder="Or enter path to local firmware file",
                     id="file-input",
                 )
 
@@ -125,26 +145,128 @@ class MainScreen(Screen[None]):
                     value=port_options[0][1] if port_options else "",
                 )
 
-                yield Checkbox("Send Ctrl-C after upload (enter U-Boot console)", id="break-check")
+                yield Checkbox(
+                    "Send Ctrl-C after upload (enter U-Boot console)",
+                    id="break-check",
+                )
 
                 with Horizontal(id="button-row"):
                     yield Button("Start Recovery", variant="primary", id="start-btn")
 
         yield Footer()
 
+    def _get_chip(self) -> str:
+        sel = self.query_one("#chip-select", Select)
+        return str(sel.value) if sel.value != Select.BLANK else ""
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "chip-select":
+            self._on_chip_changed()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "file-input":
+            self._update_start_button()
+
+    def _on_chip_changed(self) -> None:
+        chip = self._get_chip()
+        dl_btn = self.query_one("#download-btn", Button)
+        hint = self.query_one("#fw-hint", Static)
+        status = self.query_one("#fw-status", Static)
+
+        if not chip:
+            dl_btn.label = "Select a chip first"
+            dl_btn.disabled = True
+            dl_btn.variant = "default"
+            hint.update("")
+            status.update("")
+        elif has_firmware(chip):
+            cached = get_cached_path(chip)
+            if cached:
+                dl_btn.label = f"Re-download U-Boot for {chip}"
+                dl_btn.disabled = False
+                dl_btn.variant = "default"
+                status.update(f"✓ Cached: {cached.name} ({cached.stat().st_size // 1024} KB)")
+            else:
+                dl_btn.label = f"Download U-Boot for {chip}"
+                dl_btn.disabled = False
+                dl_btn.variant = "success"
+                status.update("")
+            hint.update("Or enter a local file path below for custom builds.")
+        else:
+            dl_btn.label = "No OpenIPC build available"
+            dl_btn.disabled = True
+            dl_btn.variant = "default"
+            hint.update("Enter a local firmware file path below.")
+            status.update("")
+
+        self._update_start_button()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "start-btn":
             self._start_recovery()
+        elif event.button.id == "download-btn":
+            self._download_firmware()
+
+    def _download_firmware(self) -> None:
+        chip = self._get_chip()
+        if not chip or not has_firmware(chip):
+            return
+
+        dl_btn = self.query_one("#download-btn", Button)
+        status = self.query_one("#fw-status", Static)
+
+        dl_btn.label = "Downloading..."
+        dl_btn.disabled = True
+        status.update("")
+
+        try:
+            path = download_firmware(chip)
+            status.update(f"✓ {path.name} ({path.stat().st_size // 1024} KB)")
+            dl_btn.label = f"Re-download U-Boot for {chip}"
+            dl_btn.disabled = False
+            dl_btn.variant = "default"
+            self.notify(
+                f"Downloaded {path.name}",
+                severity="information",
+                title="Firmware Ready",
+            )
+        except (ValueError, ConnectionError) as e:
+            status.update("")
+            dl_btn.label = "Download failed — retry?"
+            dl_btn.disabled = False
+            dl_btn.variant = "error"
+            self.notify(str(e), severity="error", title="Download Failed")
+
+        self._update_start_button()
+
+    def _get_firmware_path(self) -> str:
+        """Get firmware path: local file input takes priority, then cached download."""
+        local = str(self.query_one("#file-input", Input).value).strip()
+        if local:
+            return local
+
+        chip = self._get_chip()
+        if chip:
+            cached = get_cached_path(chip)
+            if cached:
+                return str(cached)
+
+        return ""
+
+    def _update_start_button(self) -> None:
+        chip = self._get_chip()
+        firmware = self._get_firmware_path()
+        port_sel = self.query_one("#port-select", Select)
+        port = str(port_sel.value) if port_sel.value != Select.BLANK else ""
+
+        self.query_one("#start-btn", Button).disabled = not (chip and firmware and port)
 
     def _start_recovery(self) -> None:
-        chip_select = self.query_one("#chip-select", Select)
-        file_input = self.query_one("#file-input", Input)
-        port_select = self.query_one("#port-select", Select)
+        chip = self._get_chip()
+        firmware_path = self._get_firmware_path()
+        port_sel = self.query_one("#port-select", Select)
+        port = str(port_sel.value) if port_sel.value != Select.BLANK else ""
         break_check = self.query_one("#break-check", Checkbox)
-
-        chip = str(chip_select.value) if chip_select.value != Select.BLANK else ""
-        firmware_path = file_input.value.strip()
-        port = str(port_select.value) if port_select.value != Select.BLANK else ""
         send_break = break_check.value
 
         # Validation
@@ -152,7 +274,7 @@ class MainScreen(Screen[None]):
         if not chip:
             errors.append("Select a chip model")
         if not firmware_path:
-            errors.append("Enter a firmware file path")
+            errors.append("Download firmware or enter a file path")
         elif not Path(firmware_path).is_file():
             errors.append(f"File not found: {firmware_path}")
         if not port:
@@ -162,7 +284,6 @@ class MainScreen(Screen[None]):
             self.notify("\n".join(errors), severity="error", title="Validation Error")
             return
 
-        # Start recovery via the app
         from defib.tui.app import DefibApp
         app = self.app
         if isinstance(app, DefibApp):

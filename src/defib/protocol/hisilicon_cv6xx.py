@@ -166,7 +166,7 @@ class HiSiliconCV6xx(BootProtocol):
         """Send DEADBEEF handshake until 'uart ddr' or 'uart flash' response."""
         _emit(on_progress, ProgressEvent(
             stage=Stage.HANDSHAKE, bytes_sent=0, bytes_total=1,
-            message="Sending CV6xx handshake...",
+            message="Waiting for bootrom... power-cycle the device now!",
         ))
 
         # Build handshake frame: magic + baudrate(LE) + serial params + CRC(LE)
