@@ -22,7 +22,6 @@ class DefibApp(App[None]):
 
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
-        Binding("ctrl+c", "quit", "Quit", show=False),
     ]
 
     SCREENS = {"main": MainScreen}

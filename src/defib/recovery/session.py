@@ -115,16 +115,55 @@ class RecoverySession:
         result = await protocol.send_firmware(transport, firmware, on_progress)
         result.elapsed_ms = (time.monotonic() - start_time) * 1000
 
-        # Send break (Ctrl-C) if requested
+        # Send break (Ctrl-C) to interrupt U-Boot autoboot
         if send_break and result.success:
             if on_log:
-                on_log(LogEvent(level="info", message="Sending Ctrl-C to enter U-Boot console"))
-            for _ in range(49):
+                on_log(LogEvent(
+                    level="info",
+                    message="Waiting for U-Boot to start (up to 15s)...",
+                ))
+            # U-Boot needs time to decompress, relocate, and initialize
+            # hardware (SPI, NAND, MMC, network) before showing the
+            # autoboot countdown. This can take 5-10 seconds.
+            # Strategy: send Ctrl-C every 200ms while reading output,
+            # looking for the autoboot prompt or U-Boot console prompt.
+            import asyncio
+            start_break = time.monotonic()
+            prompt_found = False
+            buf = bytearray()
+            while time.monotonic() - start_break < 15.0:
                 await transport.write(b"\x03")
                 try:
-                    await transport.read(1, timeout=0.05)
+                    data = await transport.read(256, timeout=0.2)
+                    buf.extend(data)
+                    text = buf.decode("ascii", errors="replace")
+                    # Check for autoboot in full accumulated text
+                    if "autoboot" in text.lower():
+                        if on_log:
+                            on_log(LogEvent(level="info", message="Autoboot detected, sending Ctrl-C..."))
+                        for _ in range(20):
+                            await transport.write(b"\x03")
+                            await asyncio.sleep(0.1)
+                        prompt_found = True
+                        break
+                    # Check for U-Boot prompt only in the LAST chunk
+                    # (avoid false matches on boot log substrings)
+                    tail = text[-256:] if len(text) > 256 else text
+                    if "OpenIPC #" in tail or "hisilicon #" in tail or "\n=> " in tail:
+                        prompt_found = True
+                        break
                 except Exception:
                     pass
+
+            if prompt_found:
+                if on_log:
+                    on_log(LogEvent(level="info", message="U-Boot console ready"))
+            else:
+                if on_log:
+                    on_log(LogEvent(
+                        level="warn",
+                        message="U-Boot prompt not detected within 15s",
+                    ))
 
         # Note: completion/failure is already reported via on_progress
         # (Stage.COMPLETE event). We only log errors here that weren't

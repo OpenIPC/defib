@@ -138,7 +138,27 @@ footer a { color: var(--accent); text-decoration: none; }
     </div>
     <div class="log-panel" id="log-panel"></div>
     <div id="status-msg"></div>
+
+    <!-- Serial Console (shown after recovery) -->
+    <div id="console-section" class="hidden">
+      <div style="margin-top:12px;border-top:1px solid var(--surface2);padding-top:12px">
+        <h2 style="color:var(--accent)">Serial Console</h2>
+        <div class="log-panel" id="console-output" style="height:200px;margin-bottom:8px"></div>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="console-input"
+            placeholder="Type command and press Enter..."
+            style="flex:1;padding:10px 12px;background:var(--surface2);border:1px solid var(--dim);
+                   border-radius:var(--radius);color:var(--text);font-family:'Cascadia Code','Fira Code',monospace;font-size:0.9em;outline:none"
+            onkeydown="if(event.key==='Enter')sendConsoleCmd()">
+          <button class="btn btn-primary" onclick="sendConsoleCmd()" style="padding:10px 16px">Send</button>
+          <button class="btn btn-secondary" onclick="sendCtrlC()" style="padding:10px 12px" title="Send Ctrl-C (0x03) to device">Ctrl-C</button>
+        </div>
+      </div>
+    </div>
+
     <div class="btn-row">
+      <button class="btn btn-secondary" onclick="downloadLog()">Save Log</button>
+      <button class="btn btn-secondary" onclick="disconnectConsole()">Disconnect</button>
       <button class="btn btn-secondary" onclick="resetUI()">New Recovery</button>
     </div>
   </div>
@@ -583,11 +603,14 @@ function setProgress(sent, total, label) {
   bar.textContent = label ? `${label} ${pct}%` : pct + '%';
 }
 
+const logBuffer = [];
+
 function log(msg, cls = '') {
   const panel = document.getElementById('log-panel');
   const time = new Date().toLocaleTimeString();
   panel.innerHTML += `<span class="dim">${time}</span> <span class="${cls}">${msg}</span>\n`;
   panel.scrollTop = panel.scrollHeight;
+  logBuffer.push(`${time} ${msg}`);
 }
 
 function fail(msg) { log(msg, 'error'); return false; }
@@ -598,7 +621,11 @@ function showResult(success, msg) {
   el.textContent = msg;
 }
 
-function resetUI() {
+async function resetUI() {
+  // Clean up console
+  consoleActive = false;
+  if (serialPort) await closePort();
+  // Reset UI
   document.getElementById('setup-card').style.display = '';
   document.getElementById('progress-card').classList.remove('active');
   document.querySelectorAll('.stage').forEach(el => { el.classList.remove('active','done','error'); });
@@ -607,6 +634,9 @@ function resetUI() {
   document.getElementById('log-panel').innerHTML = '';
   document.getElementById('status-msg').className = '';
   document.getElementById('status-msg').textContent = '';
+  document.getElementById('console-section').classList.add('hidden');
+  document.getElementById('console-output').textContent = '';
+  logBuffer.length = 0;
 }
 
 async function startRecovery() {
@@ -640,8 +670,30 @@ async function startRecovery() {
     }
 
     if (success && sendBreak) {
-      log('Sending Ctrl-C to enter U-Boot console...', 'info');
-      for (let i = 0; i < 49; i++) { await serialWrite(new Uint8Array([0x03])); await sleep(20); }
+      log('Waiting for U-Boot to start (up to 15s)...', 'info');
+      const breakStart = Date.now();
+      let promptFound = false;
+      const breakBuf = [];
+      while (Date.now() - breakStart < 15000) {
+        await serialWrite(new Uint8Array([0x03]));
+        try {
+          const rd = await serialRead(256, 200);
+          for (const b of rd) breakBuf.push(b);
+          const text = String.fromCharCode(...breakBuf);
+          if (text.toLowerCase().includes('autoboot')) {
+            log('Autoboot detected, sending Ctrl-C...', 'info');
+            for (let i = 0; i < 20; i++) { await serialWrite(new Uint8Array([0x03])); await sleep(100); }
+            promptFound = true;
+            break;
+          }
+          if ((text.includes('hisilicon') && text.includes('# ')) || text.includes('=> ')) {
+            promptFound = true;
+            break;
+          }
+        } catch (e) { /* timeout */ }
+      }
+      if (promptFound) log('U-Boot console ready', 'info');
+      else log('U-Boot prompt not detected within 15s', 'warn');
     }
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -649,15 +701,107 @@ async function startRecovery() {
       setProgress(1, 1, 'Done');
       log(`Recovery complete in ${elapsed}s`, 'info');
       showResult(true, `Recovery successful! (${elapsed}s)`);
+      // Keep port open and enter serial console mode
+      enterConsoleMode();
+      return; // Don't close port
     } else {
       showResult(false, 'Recovery failed — check log for details');
     }
   } catch (e) {
     log('Error: ' + e.message, 'error');
     showResult(false, 'Error: ' + e.message);
-  } finally {
-    await closePort();
   }
+  await closePort();
+}
+
+// ============================================================
+// Serial Console
+// ============================================================
+let consoleActive = false;
+
+function enterConsoleMode() {
+  consoleActive = true;
+  document.getElementById('console-section').classList.remove('hidden');
+  document.getElementById('console-input').focus();
+  consoleLog('--- Serial Console (type commands below) ---');
+  consoleReadLoop();
+}
+
+function consoleLog(text) {
+  const out = document.getElementById('console-output');
+  out.textContent += text;
+  out.scrollTop = out.scrollHeight;
+  logBuffer.push(text);
+}
+
+let autobootHandled = false;
+let consoleRecent = '';
+
+async function consoleReadLoop() {
+  autobootHandled = false;
+  consoleRecent = '';
+  while (consoleActive && serialPort) {
+    try {
+      const avail = serialReadAvailable();
+      if (avail.length > 0) {
+        const text = new TextDecoder().decode(avail);
+        consoleLog(text);
+        consoleRecent += text;
+        if (consoleRecent.length > 2048) consoleRecent = consoleRecent.slice(-1024);
+        // Auto-detect autoboot and send Ctrl-C
+        if (!autobootHandled && consoleRecent.toLowerCase().includes('autoboot')) {
+          autobootHandled = true;
+          log('Autoboot detected! Sending Ctrl-C...', 'warn');
+          for (let i = 0; i < 20; i++) { await serialWrite(new Uint8Array([0x03])); await sleep(100); }
+        }
+      } else {
+        await sleep(50);
+      }
+    } catch (e) {
+      await sleep(50);
+    }
+  }
+}
+
+async function sendConsoleCmd() {
+  const input = document.getElementById('console-input');
+  const cmd = input.value;
+  input.value = '';
+  if (!cmd && !consoleActive) return;
+  try {
+    await serialWrite(new TextEncoder().encode(cmd + '\n'));
+  } catch (e) {
+    consoleLog(`[Send error: ${e.message}]\n`);
+  }
+}
+
+async function sendCtrlC() {
+  if (!consoleActive) return;
+  try {
+    await serialWrite(new Uint8Array([0x03]));
+    consoleLog('^C');
+  } catch (e) {
+    consoleLog(`[Send error: ${e.message}]\n`);
+  }
+}
+
+function downloadLog() {
+  const chip = document.getElementById('chip-select').value || 'unknown';
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const filename = `defib_${chip}_${ts}.log`;
+  const text = logBuffer.join('\n') + '\n';
+  const blob = new Blob([text], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function disconnectConsole() {
+  consoleActive = false;
+  await closePort();
+  consoleLog('\n[Disconnected]\n');
 }
 
 // Init
