@@ -94,6 +94,18 @@ async def send_packet(transport: Transport, cmd: int, data: bytes = b"") -> None
         await transport.write(packet)
 
 
+# Per-port read buffer — survives across recv_packet calls so bytes
+# read past the first 0x00 delimiter aren't lost.
+_port_buffers: dict[int, bytearray] = {}
+
+
+def _get_port_buf(port: object) -> bytearray:
+    key = id(port)
+    if key not in _port_buffers:
+        _port_buffers[key] = bytearray()
+    return _port_buffers[key]
+
+
 async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, bytes]:
     """Receive and parse a COBS-framed packet from the device.
 
@@ -108,8 +120,7 @@ async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, 
         return _recv_packet_sync(port, timeout)
 
     # Fallback: async transport
-    buf = bytearray()
-    import asyncio
+    frame = bytearray()
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
@@ -120,16 +131,16 @@ async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, 
             data = await transport.read(256, timeout=min(remaining, 1.0))
             for byte in data:
                 if byte == 0x00:
-                    if buf:
+                    if frame:
                         try:
-                            return parse_packet(bytes(buf))
+                            return parse_packet(bytes(frame))
                         except ValueError:
                             pass
-                        buf.clear()
+                        frame.clear()
                 else:
-                    buf.append(byte)
-                    if len(buf) > MAX_PACKET_SIZE:
-                        buf.clear()
+                    frame.append(byte)
+                    if len(frame) > MAX_PACKET_SIZE:
+                        frame.clear()
         except TransportTimeout:
             continue
 
@@ -137,33 +148,66 @@ async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, 
 
 
 def _recv_packet_sync(port: object, timeout: float) -> tuple[int, bytes]:
-    """Synchronous recv using pyserial directly."""
+    """Synchronous recv using pyserial directly.
+
+    Uses a per-port persistent buffer so bytes read past the first
+    complete packet aren't lost between calls.
+    """
     import time
-    buf = bytearray()
+    portbuf = _get_port_buf(port)
+    frame = bytearray()
     old_timeout = port.timeout  # type: ignore[union-attr]
-    port.timeout = min(timeout, 1.0)  # type: ignore[union-attr]
     deadline = time.monotonic() + timeout
 
+    def _process_byte(b: int) -> tuple[int, bytes] | None:
+        """Process one byte. Returns parsed packet or None."""
+        if b == 0x00:
+            if frame:
+                try:
+                    result = parse_packet(bytes(frame))
+                    frame.clear()
+                    return result
+                except ValueError:
+                    pass
+                frame.clear()
+        else:
+            frame.append(b)
+            if len(frame) > MAX_PACKET_SIZE:
+                frame.clear()
+        return None
+
+    def _drain(source: bytes | bytearray) -> tuple[int, bytes] | None:
+        for i, byte in enumerate(source):
+            result = _process_byte(byte)
+            if result is not None:
+                # Stash remaining unprocessed bytes
+                portbuf.extend(source[i + 1:])
+                return result
+        return None
+
     try:
+        # First drain any leftover bytes from previous call
+        if portbuf:
+            leftover = bytes(portbuf)
+            portbuf.clear()
+            result = _drain(leftover)
+            if result is not None:
+                return result
+
         while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            port.timeout = min(remaining, 1.0)  # type: ignore[union-attr]
-            data = port.read(256)  # type: ignore[union-attr]
+            waiting = port.in_waiting  # type: ignore[union-attr]
+            if waiting > 0:
+                data = port.read(waiting)  # type: ignore[union-attr]
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                port.timeout = min(remaining, 0.1)  # type: ignore[union-attr]
+                data = port.read(1)  # type: ignore[union-attr]
             if data:
-                for byte in data:
-                    if byte == 0x00:
-                        if buf:
-                            try:
-                                return parse_packet(bytes(buf))
-                            except ValueError:
-                                pass
-                            buf.clear()
-                    else:
-                        buf.append(byte)
-                        if len(buf) > MAX_PACKET_SIZE:
-                            buf.clear()
+                result = _drain(data)
+                if result is not None:
+                    return result
     finally:
         port.timeout = old_timeout  # type: ignore[union-attr]
 

@@ -1,0 +1,349 @@
+"""Tests for agent protocol: recv_packet, send_packet, wait_for_ready.
+
+Uses a fake serial port (BytesIO-based) to simulate device responses
+without real hardware.
+"""
+
+import asyncio
+import struct
+import time
+
+import pytest
+
+from defib.agent.cobs import encode
+from defib.agent.protocol import (
+    ACK_OK,
+    CMD_INFO,
+    CMD_READ,
+    RSP_ACK,
+    RSP_CRC32,
+    RSP_DATA,
+    RSP_INFO,
+    RSP_READY,
+    FRAME_DELIMITER,
+    MAX_PACKET_SIZE,
+    build_packet,
+    parse_packet,
+    _recv_packet_sync,
+    recv_packet,
+    recv_response,
+    send_packet,
+    wait_for_ready,
+)
+from defib.transport.base import Transport, TransportTimeout
+
+
+# ---------------------------------------------------------------------------
+# Fake serial port that behaves like pyserial's Serial
+# ---------------------------------------------------------------------------
+
+class FakePort:
+    """Minimal pyserial-compatible port backed by a byte buffer."""
+
+    def __init__(self, rx_data: bytes = b""):
+        self._rx = bytearray(rx_data)
+        self._tx = bytearray()
+        self.timeout = None
+
+    def feed(self, data: bytes) -> None:
+        """Add bytes to the RX buffer (simulates device sending data)."""
+        self._rx.extend(data)
+
+    @property
+    def in_waiting(self) -> int:
+        return len(self._rx)
+
+    def read(self, size: int = 1) -> bytes:
+        if not self._rx:
+            return b""
+        n = min(size, len(self._rx))
+        data = bytes(self._rx[:n])
+        del self._rx[:n]
+        return data
+
+    def write(self, data: bytes) -> int:
+        self._tx.extend(data)
+        return len(data)
+
+    @property
+    def is_open(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        pass
+
+    @property
+    def tx_data(self) -> bytes:
+        return bytes(self._tx)
+
+
+# ---------------------------------------------------------------------------
+# Fake transport that wraps FakePort
+# ---------------------------------------------------------------------------
+
+class FakeTransport(Transport):
+    """Transport wrapping a FakePort so recv_packet uses the sync path."""
+
+    def __init__(self, port: FakePort):
+        self._port = port
+
+    async def read(self, size: int, timeout: float | None = None) -> bytes:
+        data = self._port.read(size)
+        if not data and timeout is not None:
+            raise TransportTimeout("timeout")
+        return data
+
+    async def write(self, data: bytes) -> None:
+        self._port.write(data)
+
+    async def flush_input(self) -> None:
+        self._port._rx.clear()
+
+    async def flush_output(self) -> None:
+        self._port._tx.clear()
+
+    async def bytes_waiting(self) -> int:
+        return self._port.in_waiting
+
+    async def close(self) -> None:
+        pass
+
+
+def make_device_packet(cmd: int, data: bytes = b"") -> bytes:
+    """Build a COBS-framed packet as the device would send it."""
+    return build_packet(cmd, data)
+
+
+# ---------------------------------------------------------------------------
+# Tests: _recv_packet_sync
+# ---------------------------------------------------------------------------
+
+class TestRecvPacketSync:
+    def test_single_packet(self):
+        pkt = make_device_packet(RSP_INFO, b"\x01\x02\x03\x04" * 4)
+        port = FakePort(pkt)
+        cmd, data = _recv_packet_sync(port, timeout=1.0)
+        assert cmd == RSP_INFO
+        assert data == b"\x01\x02\x03\x04" * 4
+
+    def test_ready_packet(self):
+        pkt = make_device_packet(RSP_READY, b"DEFIB")
+        port = FakePort(pkt)
+        cmd, data = _recv_packet_sync(port, timeout=1.0)
+        assert cmd == RSP_READY
+        assert data == b"DEFIB"
+
+    def test_multiple_packets_returns_first(self):
+        pkt1 = make_device_packet(RSP_READY, b"DEFIB")
+        pkt2 = make_device_packet(RSP_INFO, b"\x00" * 16)
+        port = FakePort(pkt1 + pkt2)
+        cmd, data = _recv_packet_sync(port, timeout=1.0)
+        assert cmd == RSP_READY
+
+    def test_garbage_before_valid_packet(self):
+        garbage = b"\x01\x02\x03\x00"  # Invalid COBS frame (CRC fail)
+        valid = make_device_packet(RSP_INFO, b"\xAA" * 16)
+        port = FakePort(garbage + valid)
+        cmd, data = _recv_packet_sync(port, timeout=1.0)
+        assert cmd == RSP_INFO
+
+    def test_empty_frames_skipped(self):
+        # Multiple 0x00 delimiters followed by a valid packet
+        delimiters = b"\x00\x00\x00"
+        valid = make_device_packet(RSP_ACK, bytes([ACK_OK]))
+        port = FakePort(delimiters + valid)
+        cmd, data = _recv_packet_sync(port, timeout=1.0)
+        assert cmd == RSP_ACK
+        assert data == bytes([ACK_OK])
+
+    def test_timeout_raises(self):
+        port = FakePort(b"")
+        with pytest.raises(TransportTimeout):
+            _recv_packet_sync(port, timeout=0.1)
+
+    def test_oversized_frame_discarded(self):
+        # Frame larger than MAX_PACKET_SIZE should be discarded
+        huge = bytes(range(1, 256)) * 5  # >1100 bytes, no 0x00
+        valid = make_device_packet(RSP_READY, b"DEFIB")
+        port = FakePort(huge + b"\x00" + valid)
+        cmd, data = _recv_packet_sync(port, timeout=1.0)
+        assert cmd == RSP_READY
+
+
+# ---------------------------------------------------------------------------
+# Tests: recv_packet (async, routes to sync for transport with _port)
+# ---------------------------------------------------------------------------
+
+class TestRecvPacket:
+    @pytest.mark.asyncio
+    async def test_via_fake_transport(self):
+        pkt = make_device_packet(RSP_INFO, b"\x01" * 16)
+        port = FakePort(pkt)
+        transport = FakeTransport(port)
+        cmd, data = await recv_packet(transport, timeout=1.0)
+        assert cmd == RSP_INFO
+        assert len(data) == 16
+
+    @pytest.mark.asyncio
+    async def test_timeout(self):
+        port = FakePort(b"")
+        transport = FakeTransport(port)
+        with pytest.raises(TransportTimeout):
+            await recv_packet(transport, timeout=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Tests: send_packet
+# ---------------------------------------------------------------------------
+
+class TestSendPacket:
+    @pytest.mark.asyncio
+    async def test_sends_cobs_framed_packet(self):
+        port = FakePort()
+        transport = FakeTransport(port)
+        await send_packet(transport, CMD_INFO)
+        tx = port.tx_data
+        assert tx[-1:] == b"\x00"  # COBS delimiter
+        # Should be parseable
+        cmd, data = parse_packet(tx[:-1])
+        assert cmd == CMD_INFO
+
+    @pytest.mark.asyncio
+    async def test_sends_with_data(self):
+        port = FakePort()
+        transport = FakeTransport(port)
+        payload = struct.pack("<II", 0x41000000, 1024)
+        await send_packet(transport, CMD_READ, payload)
+        tx = port.tx_data
+        cmd, data = parse_packet(tx[:-1])
+        assert cmd == CMD_READ
+        assert struct.unpack("<II", data) == (0x41000000, 1024)
+
+
+# ---------------------------------------------------------------------------
+# Tests: recv_response (skips READY)
+# ---------------------------------------------------------------------------
+
+class TestRecvResponse:
+    @pytest.mark.asyncio
+    async def test_skips_ready_packets(self):
+        ready = make_device_packet(RSP_READY, b"DEFIB")
+        info = make_device_packet(RSP_INFO, b"\x00" * 16)
+        port = FakePort(ready + ready + info)
+        transport = FakeTransport(port)
+        cmd, data = await recv_response(transport, timeout=2.0)
+        assert cmd == RSP_INFO
+
+    @pytest.mark.asyncio
+    async def test_returns_non_ready_immediately(self):
+        ack = make_device_packet(RSP_ACK, bytes([ACK_OK]))
+        port = FakePort(ack)
+        transport = FakeTransport(port)
+        cmd, data = await recv_response(transport, timeout=1.0)
+        assert cmd == RSP_ACK
+        assert data == bytes([ACK_OK])
+
+
+# ---------------------------------------------------------------------------
+# Tests: wait_for_ready
+# ---------------------------------------------------------------------------
+
+class TestWaitForReady:
+    @pytest.mark.asyncio
+    async def test_finds_ready(self):
+        pkt = make_device_packet(RSP_READY, b"DEFIB")
+        port = FakePort(pkt)
+        transport = FakeTransport(port)
+        result = await wait_for_ready(transport, timeout=1.0)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_skips_non_ready(self):
+        info = make_device_packet(RSP_INFO, b"\x00" * 16)
+        ready = make_device_packet(RSP_READY, b"DEFIB")
+        port = FakePort(info + ready)
+        transport = FakeTransport(port)
+        result = await wait_for_ready(transport, timeout=2.0)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_false(self):
+        port = FakePort(b"")
+        transport = FakeTransport(port)
+        result = await wait_for_ready(transport, timeout=0.2)
+        assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Tests: data stream (simulated READ response)
+# ---------------------------------------------------------------------------
+
+class TestDataStream:
+    @pytest.mark.asyncio
+    async def test_read_multiple_data_packets_then_ack(self):
+        """Simulate agent READ response: N DATA packets + final ACK."""
+        port = FakePort()
+        transport = FakeTransport(port)
+
+        # Build stream: 3 DATA packets + ACK
+        for seq in range(3):
+            chunk = bytes(range(seq * 10, seq * 10 + 100))
+            pkt_data = struct.pack("<H", seq) + chunk
+            port.feed(make_device_packet(RSP_DATA, pkt_data))
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_OK])))
+
+        received = bytearray()
+        packets = 0
+        while True:
+            cmd, data = await recv_packet(transport, timeout=1.0)
+            if cmd == RSP_DATA:
+                seq = struct.unpack("<H", data[:2])[0]
+                assert seq == packets
+                received.extend(data[2:])
+                packets += 1
+            elif cmd == RSP_ACK:
+                assert data[0] == ACK_OK
+                break
+
+        assert packets == 3
+        assert len(received) == 300
+
+    @pytest.mark.asyncio
+    async def test_ready_interleaved_with_data(self):
+        """READY packets during data stream should be skippable."""
+        port = FakePort()
+        transport = FakeTransport(port)
+
+        port.feed(make_device_packet(RSP_DATA, struct.pack("<H", 0) + b"\xAA" * 100))
+        port.feed(make_device_packet(RSP_READY, b"DEFIB"))
+        port.feed(make_device_packet(RSP_DATA, struct.pack("<H", 1) + b"\xBB" * 100))
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_OK])))
+
+        received = bytearray()
+        packets = 0
+        while True:
+            cmd, data = await recv_packet(transport, timeout=1.0)
+            if cmd == RSP_READY:
+                continue
+            elif cmd == RSP_DATA:
+                received.extend(data[2:])
+                packets += 1
+            elif cmd == RSP_ACK:
+                break
+
+        assert packets == 2
+        assert len(received) == 200
+
+
+# ---------------------------------------------------------------------------
+# Tests: CRC32 command roundtrip
+# ---------------------------------------------------------------------------
+
+class TestCRC32Packet:
+    def test_crc32_response_parse(self):
+        """CRC32 response carries 4-byte LE value."""
+        crc_val = 0xDEADBEEF
+        pkt = make_device_packet(RSP_CRC32, struct.pack("<I", crc_val))
+        cmd, data = parse_packet(pkt[:-1])
+        assert cmd == RSP_CRC32
+        assert struct.unpack("<I", data)[0] == crc_val
