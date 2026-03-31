@@ -13,6 +13,7 @@ Commands (host → device):
   0x04  ERASE    — Erase sectors: addr(4B LE) + size(4B LE)
   0x05  CRC32    — CRC32 of flash region: addr(4B LE) + size(4B LE)
   0x06  REBOOT   — Reset device
+  0x07  SELFUPDATE — Update agent: addr(4B LE) + size(4B LE) + crc32(4B LE)
 
 Responses (device → host):
   0x81  INFO_RSP — chip_id(4B) + flash_size(4B) + ram_base(4B)

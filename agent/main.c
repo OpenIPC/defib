@@ -139,13 +139,19 @@ static void handle_crc32_cmd(const uint8_t *data, uint32_t len) {
 
 /*
  * CMD_SELFUPDATE: receive new agent binary into RAM and jump to it.
- * Validates address is in writable RAM and size is bounded.
+ *
+ * Protocol:
+ *   Host sends: CMD_SELFUPDATE [addr:4LE] [size:4LE] [expected_crc:4LE]
+ *   Agent ACKs ready, then receives RSP_DATA packets.
+ *   After all data received, agent verifies CRC32 of written region.
+ *   Only jumps if CRC matches. On failure, NAKs and stays alive.
  */
 static void handle_selfupdate(const uint8_t *data, uint32_t len) {
-    if (len < 8) { proto_send_ack(ACK_CRC_ERROR); return; }
+    if (len < 12) { proto_send_ack(ACK_CRC_ERROR); return; }
 
     uint32_t addr = read_le32(&data[0]);
     uint32_t size = read_le32(&data[4]);
+    uint32_t expected_crc = read_le32(&data[8]);
 
     /* Validate: must be in RAM, reasonable size */
     if (size == 0 || size > MAX_UPDATE_SIZE ||
@@ -172,7 +178,13 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
         }
     }
 
-    /* Verify: host should send CRC after all data */
+    /* Verify CRC32 of received data before jumping */
+    uint32_t actual_crc = crc32(0, dest, size);
+    if (actual_crc != expected_crc) {
+        proto_send_ack(ACK_CRC_ERROR);
+        return;  /* Stay alive — don't jump to bad code */
+    }
+
     proto_send_ack(ACK_OK);
 
     /* Flush UART, then jump */
