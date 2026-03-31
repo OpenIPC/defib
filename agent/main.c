@@ -1,13 +1,33 @@
 /*
  * defib flash agent — bare-metal main loop.
- *
- * Phase 1: UART protocol testing. Flash reads via memory-mapped window.
  * Receives commands from host via COBS-framed UART protocol.
  */
 
 #include <stdint.h>
 #include "uart.h"
 #include "protocol.h"
+#include "spi_flash.h"
+
+static flash_info_t flash_info;
+
+/* --- Diagnostic: data abort handler --- */
+
+static void uart_puthex(uint32_t val) {
+    static const char hex[] = "0123456789abcdef";
+    uart_putc('0'); uart_putc('x');
+    for (int i = 28; i >= 0; i -= 4)
+        uart_putc(hex[(val >> i) & 0xF]);
+}
+
+void data_abort_handler(uint32_t dfar, uint32_t dfsr, uint32_t pc) {
+    uart_puts("\r\n!ABORT addr=");
+    uart_puthex(dfar);
+    uart_puts(" dfsr=");
+    uart_puthex(dfsr);
+    uart_puts(" pc=");
+    uart_puthex(pc);
+    uart_puts("\r\n");
+}
 
 #ifndef RAM_BASE
 #define RAM_BASE 0x40000000
@@ -67,20 +87,31 @@ static void write_le32(uint8_t *p, uint32_t v) {
 }
 
 /* Check if address range is in safe readable memory */
+static int flash_readable = 0;  /* Set to 1 after flash init succeeds */
+
 static int addr_readable(uint32_t addr, uint32_t size) {
     if (size == 0 || (addr + size) <= addr) return 0;  /* Overflow */
     /* RAM region: RAM_BASE to RAM_BASE + 128MB */
     if (addr >= RAM_BASE && (addr + size) <= (RAM_BASE + 128 * 1024 * 1024))
         return 1;
-    /* Flash memory-mapped: only if explicitly tested and known safe.
-     * Disabled by default — flash window may not be active after SPL. */
+    /* I/O register regions (CRG, FMC controller, system controller) */
+    if (addr >= 0x10000000 && (addr + size) <= 0x10001000) return 1; /* FMC regs */
+    if (addr >= 0x12010000 && (addr + size) <= 0x12020000) return 1; /* CRG */
+    if (addr >= 0x12020000 && (addr + size) <= 0x12030000) return 1; /* SYS_CTRL */
+    /* Flash memory-mapped window — only after flash_init succeeds */
+    if (flash_readable && addr >= FLASH_MEM && (addr + size) <= (FLASH_MEM + 32 * 1024 * 1024))
+        return 1;
     return 0;
 }
 
 static void handle_info(void) {
     uint8_t resp[16];
-    write_le32(&resp[0], 0);
-    write_le32(&resp[4], 0x1000000);   /* 16MB default flash */
+    /* JEDEC ID in first 4 bytes (3 bytes + padding) */
+    resp[0] = flash_info.jedec_id[0];
+    resp[1] = flash_info.jedec_id[1];
+    resp[2] = flash_info.jedec_id[2];
+    resp[3] = 0;
+    write_le32(&resp[4], flash_info.size);
     write_le32(&resp[8], RAM_BASE);
     write_le32(&resp[12], 0x10000);    /* 64KB sector */
     proto_send(RSP_INFO, resp, 16);
@@ -98,7 +129,10 @@ static void handle_read(const uint8_t *data, uint32_t len) {
         return;
     }
 
-    const uint8_t *ptr = (const uint8_t *)addr;
+    /* I/O registers require 32-bit word-aligned access (ldr not ldrb).
+     * RAM and flash can use byte access. */
+    int io_region = (addr >= 0x10000000 && addr < 0x13000000);
+
     uint16_t seq = 0;
     uint32_t offset = 0;
     uint8_t pkt[MAX_PAYLOAD];
@@ -109,8 +143,20 @@ static void handle_read(const uint8_t *data, uint32_t len) {
 
         pkt[0] = (seq >> 0) & 0xFF;
         pkt[1] = (seq >> 8) & 0xFF;
-        for (uint32_t i = 0; i < chunk; i++)
-            pkt[2 + i] = ptr[offset + i];
+        if (io_region) {
+            /* Word-aligned 32-bit reads, split into bytes */
+            for (uint32_t i = 0; i < chunk; i += 4) {
+                uint32_t word_addr = (addr + offset + i) & ~3u;
+                uint32_t val = *(volatile uint32_t *)word_addr;
+                uint32_t byte_off = (addr + offset + i) & 3;
+                for (uint32_t j = 0; j < 4 && (i + j) < chunk; j++)
+                    pkt[2 + i + j] = (val >> ((byte_off + j) * 8)) & 0xFF;
+            }
+        } else {
+            const uint8_t *ptr = (const uint8_t *)addr;
+            for (uint32_t i = 0; i < chunk; i++)
+                pkt[2 + i] = ptr[offset + i];
+        }
 
         proto_send(RSP_DATA, pkt, 2 + chunk);
         offset += chunk;
@@ -346,6 +392,11 @@ int main(void) {
 
     /* Drain any stale bytes left in UART RX FIFO from boot protocol */
     while (uart_readable()) uart_getc();
+
+    /* Initialize flash controller — enables memory-mapped reads */
+    if (flash_init(&flash_info) == 0) {
+        flash_readable = 1;
+    }
 
     proto_send_ready();
 
