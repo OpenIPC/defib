@@ -17,6 +17,7 @@ from typing import Callable
 from defib.agent.protocol import (
     ACK_OK,
     CMD_CRC32,
+    CMD_ERASE,
     CMD_INFO,
     CMD_READ,
     CMD_SCAN,
@@ -302,6 +303,78 @@ class FlashAgentClient:
             seq += 1
 
         cmd, resp = await recv_response(self._transport, timeout=60.0)
+        return cmd == RSP_ACK and resp[0] == ACK_OK
+
+    async def erase_flash(
+        self,
+        addr: int,
+        size: int,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        """Erase flash sectors. addr and size must be sector-aligned."""
+        payload = struct.pack("<II", addr, size)
+        await send_packet(self._transport, CMD_ERASE, payload)
+
+        cmd, resp = await recv_response(self._transport, timeout=5.0)
+        if cmd != RSP_ACK or resp[0] != ACK_OK:
+            return False
+
+        sector_sz = self._sector_size or 0x10000
+        num_sectors = size // sector_sz
+
+        # Receive progress packets (RSP_DATA with sectors_done count)
+        for _ in range(num_sectors):
+            cmd, data = await recv_packet(self._transport, timeout=30.0)
+            if cmd == RSP_READY:
+                continue
+            if cmd == RSP_DATA and len(data) >= 2:
+                done = data[0] | (data[1] << 8)
+                if on_progress:
+                    on_progress(done * sector_sz, size)
+
+        # Final ACK
+        cmd, resp = await recv_response(self._transport, timeout=10.0)
+        return cmd == RSP_ACK and resp[0] == ACK_OK
+
+    async def write_flash(
+        self,
+        addr: int,
+        data: bytes,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> bool:
+        """Write data to flash (assumes sectors already erased).
+
+        Uses CMD_WRITE with a flash address — agent receives data into
+        RAM staging, verifies CRC, then programs page-by-page and
+        verifies the result.
+        """
+        if self._current_baud != FALLBACK_BAUD:
+            await self._switch_baud(FALLBACK_BAUD)
+
+        total = len(data)
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        payload = struct.pack("<III", addr, total, crc)
+        await send_packet(self._transport, CMD_WRITE, payload)
+
+        cmd, resp = await recv_response(self._transport, timeout=5.0)
+        if cmd != RSP_ACK or resp[0] != ACK_OK:
+            return False
+
+        # Send data in chunks
+        offset = 0
+        seq = 0
+        while offset < total:
+            chunk = min(WRITE_CHUNK_SIZE, total - offset)
+            pkt = struct.pack("<H", seq) + data[offset:offset + chunk]
+            await send_packet(self._transport, RSP_DATA, pkt)
+            offset += chunk
+            seq += 1
+            if on_progress:
+                on_progress(offset, total)
+
+        # Wait for program + verify ACK (can take a while for large writes)
+        timeout = max(60.0, total / 1000)  # ~1s per KB for page programming
+        cmd, resp = await recv_response(self._transport, timeout=timeout)
         return cmd == RSP_ACK and resp[0] == ACK_OK
 
     async def crc32(self, addr: int, size: int) -> int:

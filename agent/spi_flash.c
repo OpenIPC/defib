@@ -70,6 +70,23 @@ static uint32_t detect_size(uint8_t id2) {
     return 0x1000000; /* Default 16MB */
 }
 
+/* Forward declarations */
+static void fmc_wait_ready(void);
+static void spi_wait_wip(void);
+
+/* Mode switching: normal mode for register commands, boot mode for reads */
+static void fmc_enter_normal(void) {
+    fmc_reg(FMC_CFG) = 0x1821;  /* OP_MODE_NORMAL | bootrom defaults */
+}
+
+static void fmc_enter_boot(void) {
+    /* Wait for any pending operation */
+    fmc_wait_ready();
+    spi_wait_wip();
+    /* Write boot mode (bit 0 = 0), keeping other config bits */
+    fmc_reg(FMC_CFG) = 0x1820;  /* bootrom default without OP_MODE_NORMAL */
+}
+
 static void fmc_wait_ready(void) {
     volatile uint32_t timeout = 400000;
     while ((fmc_reg(FMC_OP) & FMC_OP_REG_OP_START) && timeout > 0)
@@ -91,6 +108,40 @@ static void spi_write_enable(void) {
     fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0);
     fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_REG_OP_START;
     fmc_wait_ready();
+}
+
+/*
+ * Clear block protection bits in the flash status register.
+ * HiSilicon SPL locks all sectors (BP0-BP3 = 0x38 in status register).
+ * Must be called before any erase/write operation.
+ */
+#define SPI_CMD_WRITE_STATUS  0x01
+#define SPI_STATUS_BP_MASK    0x7C  /* BP0-BP4: bits 2-6 */
+
+static void flash_unlock(void) {
+    /* Read current status */
+    fmc_reg(FMC_CMD) = SPI_CMD_READ_STATUS;
+    fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0);
+    fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_READ_STATUS | FMC_OP_REG_OP_START;
+    fmc_wait_ready();
+    uint32_t status = fmc_reg(FMC_STATUS);
+
+    if (!(status & SPI_STATUS_BP_MASK)) return;  /* Already unlocked */
+
+    /* Write enable required before status register write */
+    spi_write_enable();
+
+    /* Clear all BP bits */
+    uint8_t new_status = (uint8_t)(status & ~SPI_STATUS_BP_MASK);
+    volatile uint8_t *fmc_buf = (volatile uint8_t *)(FLASH_MEM);
+    fmc_buf[0] = new_status;
+
+    fmc_reg(FMC_CMD) = SPI_CMD_WRITE_STATUS;
+    fmc_reg(FMC_DATA_NUM) = 1;
+    fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0);
+    fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_WRITE_DATA | FMC_OP_REG_OP_START;
+    fmc_wait_ready();
+    spi_wait_wip();
 }
 
 void flash_read_id(uint8_t id[3]) {
@@ -117,11 +168,6 @@ int flash_init(flash_info_t *info) {
     /* Verify FMC IP version */
     if (fmc_reg(FMC_VERSION) != 0x100) return -1;
 
-    /* Switch to normal mode.
-     * Keep SPI NOR selected. Preserve page/ECC config from bootrom.
-     * FMC_CFG typical bootrom value: 0x1820. We only set bit 0 (normal). */
-    fmc_reg(FMC_CFG) = 0x1821;  /* 0x1820 (bootrom default) | OP_MODE_NORMAL */
-
     /* Set SPI timing parameters */
     fmc_reg(FMC_SPI_TIMING_CFG) = SPI_TIMING_VAL;
 
@@ -129,16 +175,9 @@ int flash_init(flash_info_t *info) {
     fmc_reg(FMC_INT_CLR) = 0xFF;
 
     /* Read JEDEC ID (requires normal mode) */
+    fmc_enter_normal();
     flash_read_id(info->jedec_id);
-
-    /* Switch back to boot mode for transparent memory-mapped reads.
-     * In boot mode, FLASH_MEM window reads directly from flash.
-     * In normal mode, it's the FMC I/O buffer. */
-    {
-        uint32_t c = fmc_reg(FMC_CFG);
-        c &= ~FMC_CFG_OP_MODE_NORMAL;
-        fmc_reg(FMC_CFG) = c;
-    }
+    fmc_enter_boot();
 
     info->size = detect_size(info->jedec_id[2]);
     info->sector_size = 0x10000;  /* 64KB */
@@ -154,6 +193,9 @@ void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
 }
 
 int flash_erase_sector(uint32_t addr) {
+    fmc_enter_normal();
+    flash_unlock();
+
     spi_write_enable();
 
     fmc_reg(FMC_CMD) = SPI_CMD_SECTOR_ERASE;
@@ -163,15 +205,19 @@ int flash_erase_sector(uint32_t addr) {
     fmc_wait_ready();
 
     spi_wait_wip();
+    fmc_enter_boot();
     return 0;
 }
 
 int flash_write_page(uint32_t addr, const uint8_t *data, uint32_t len) {
     if (len > 256) len = 256;
 
+    fmc_enter_normal();
+    flash_unlock();
+
     spi_write_enable();
 
-    /* Copy data to FMC I/O buffer (memory window) */
+    /* Copy data to FMC I/O buffer (memory window in normal mode) */
     volatile uint8_t *fmc_buf = (volatile uint8_t *)(FLASH_MEM);
     for (uint32_t i = 0; i < len; i++)
         fmc_buf[i] = data[i];
@@ -184,6 +230,7 @@ int flash_write_page(uint32_t addr, const uint8_t *data, uint32_t len) {
     fmc_wait_ready();
 
     spi_wait_wip();
+    fmc_enter_boot();
     return 0;
 }
 
