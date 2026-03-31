@@ -273,16 +273,21 @@ static void handle_erase(const uint8_t *data, uint32_t len) {
     }
 
     uint32_t num_sectors = size / sector_sz;
+
+    /* Send ACK to start erasing */
     proto_send_ack(ACK_OK);
 
     for (uint32_t i = 0; i < num_sectors; i++) {
         flash_erase_sector(addr + i * sector_sz);
 
-        /* Progress: send sectors_done count */
-        uint8_t progress[2];
+        /* Progress: [sectors_done:2LE][debug:3B] */
+        uint8_t progress[5];
         progress[0] = ((i + 1) >> 0) & 0xFF;
         progress[1] = ((i + 1) >> 8) & 0xFF;
-        proto_send(RSP_DATA, progress, 2);
+        progress[2] = flash_unlock_debug[0];  /* SR before unlock */
+        progress[3] = flash_unlock_debug[1];  /* SR after write_enable */
+        progress[4] = flash_unlock_debug[2];  /* SR after unlock */
+        proto_send(RSP_DATA, progress, 5);
     }
 
     proto_send_ack(ACK_OK);

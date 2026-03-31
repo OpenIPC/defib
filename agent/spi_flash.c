@@ -75,16 +75,41 @@ static void fmc_wait_ready(void);
 static void spi_wait_wip(void);
 
 /* Mode switching: normal mode for register commands, boot mode for reads */
+/* I/O pad configuration base for SPI flash pins */
+#define IO_BASE  0x100C0000
+#define io_reg(off) (*(volatile uint32_t *)(IO_BASE + (off)))
+
 static void fmc_enter_normal(void) {
+    /* Full FMC init for register-mode operations (matching U-Boot) */
+
+    /* Configure SPI flash I/O pads (SPL may have left them in boot-mode config) */
+    io_reg(0x14) = 0x401;  /* sfc_clk */
+    io_reg(0x18) = 0x461;  /* sfc_hold_io0 */
+    io_reg(0x1C) = 0x461;  /* sfc_miso_io1 */
+    io_reg(0x20) = 0x461;  /* sfc_wp_io2 */
+    io_reg(0x24) = 0x461;  /* sfc_mosi_io3 */
+    io_reg(0x28) = 0x461;  /* sfc_csn */
+
     fmc_reg(FMC_CFG) = 0x1821;  /* OP_MODE_NORMAL | bootrom defaults */
+    fmc_reg(FMC_SPI_TIMING_CFG) = SPI_TIMING_VAL;
+    fmc_reg(FMC_INT_CLR) = 0xFF;
+    fmc_reg(FMC_GLOBAL_CFG) = 0;  /* Disable all write protection */
 }
 
 static void fmc_enter_boot(void) {
-    /* Wait for any pending operation */
+    /* FMC_CFG bit 0 can't be cleared by writing — once in normal mode,
+     * the only way back to boot mode is a soft reset via CRG register.
+     * This resets the FMC controller state, restoring boot mode. */
     fmc_wait_ready();
     spi_wait_wip();
-    /* Write boot mode (bit 0 = 0), keeping other config bits */
-    fmc_reg(FMC_CFG) = 0x1820;  /* bootrom default without OP_MODE_NORMAL */
+
+    /* Soft reset: set bit 0, then clear it */
+    uint32_t crg = REG_FMC_CRG;
+    REG_FMC_CRG = crg | FMC_SOFT_RESET;
+    /* Brief delay for reset to take effect */
+    for (volatile int i = 0; i < 1000; i++) {}
+    REG_FMC_CRG = crg & ~FMC_SOFT_RESET;
+    for (volatile int i = 0; i < 1000; i++) {}
 }
 
 static void fmc_wait_ready(void) {
@@ -104,6 +129,11 @@ static void spi_wait_wip(void) {
 }
 
 static void spi_write_enable(void) {
+    /* Ensure hardware WP is deasserted before write enable.
+     * FMC_GLOBAL_CFG bit 2 = WP_ENABLE, bit 6 = WP_LEVEL.
+     * Clear both to fully disable write protection. */
+    fmc_reg(FMC_GLOBAL_CFG) = 0;
+
     fmc_reg(FMC_CMD) = SPI_CMD_WRITE_ENABLE;
     fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0);
     fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_REG_OP_START;
@@ -120,21 +150,25 @@ static void spi_write_enable(void) {
 
 static void flash_unlock(void) {
     /* Read current status */
-    fmc_reg(FMC_CMD) = SPI_CMD_READ_STATUS;
-    fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0);
-    fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_READ_STATUS | FMC_OP_REG_OP_START;
-    fmc_wait_ready();
-    uint32_t status = fmc_reg(FMC_STATUS);
+    uint8_t sr_before = flash_read_status();
 
-    if (!(status & SPI_STATUS_BP_MASK)) return;  /* Already unlocked */
+    if (!(sr_before & SPI_STATUS_BP_MASK)) return;  /* Already unlocked */
+
+    /* Disable write protect in FMC_GLOBAL_CFG (bit 2 = WP_ENABLE).
+     * U-Boot does this before any status register write. */
+    uint32_t gcfg = fmc_reg(FMC_GLOBAL_CFG);
+    fmc_reg(FMC_GLOBAL_CFG) = gcfg & ~(1 << 2);
 
     /* Write enable required before status register write */
     spi_write_enable();
 
-    /* Clear all BP bits */
-    uint8_t new_status = (uint8_t)(status & ~SPI_STATUS_BP_MASK);
+    /* Verify WEL is set */
+    uint8_t sr_wel = flash_read_status();
+    (void)sr_wel;  /* Available for debugging */
+
+    /* Write status register = 0x00 (clear all BP bits) */
     volatile uint8_t *fmc_buf = (volatile uint8_t *)(FLASH_MEM);
-    fmc_buf[0] = new_status;
+    fmc_buf[0] = 0x00;
 
     fmc_reg(FMC_CMD) = SPI_CMD_WRITE_STATUS;
     fmc_reg(FMC_DATA_NUM) = 1;
@@ -142,6 +176,14 @@ static void flash_unlock(void) {
     fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_WRITE_DATA | FMC_OP_REG_OP_START;
     fmc_wait_ready();
     spi_wait_wip();
+
+    /* Verify status cleared */
+    uint8_t sr_after = flash_read_status();
+
+    /* Store results for diagnostic (accessible via flash_info) */
+    flash_unlock_debug[0] = sr_before;
+    flash_unlock_debug[1] = sr_wel;
+    flash_unlock_debug[2] = sr_after;
 }
 
 void flash_read_id(uint8_t id[3]) {
@@ -192,10 +234,28 @@ void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
         buf[i] = flash[addr + i];
 }
 
+uint8_t flash_unlock_debug[3];
+
+/* Read SPI flash status register (must be in normal mode).
+ * Uses READ_DATA path (reads into I/O buffer) instead of READ_STATUS
+ * path (FMC_STATUS register) for more reliable results. */
+uint8_t flash_read_status(void) {
+    fmc_reg(FMC_CMD) = SPI_CMD_READ_STATUS;
+    fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0);
+    fmc_reg(FMC_DATA_NUM) = 1;
+    fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
+    fmc_wait_ready();
+    return (uint8_t)(*(volatile uint32_t *)(FLASH_MEM) & 0xFF);
+}
+
 int flash_erase_sector(uint32_t addr) {
     fmc_enter_normal();
-    flash_unlock();
 
+    /* Disable hardware write protect — must be done every time because
+     * fmc_enter_boot (soft reset) restores the GLOBAL_CFG register. */
+    fmc_reg(FMC_GLOBAL_CFG) = fmc_reg(FMC_GLOBAL_CFG) & ~(1 << 2);
+
+    flash_unlock();
     spi_write_enable();
 
     fmc_reg(FMC_CMD) = SPI_CMD_SECTOR_ERASE;
@@ -204,8 +264,13 @@ int flash_erase_sector(uint32_t addr) {
     fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_REG_OP_START;
     fmc_wait_ready();
 
+    /* Erase takes up to 150ms for 64KB sector — poll WIP */
     spi_wait_wip();
+
+    /* Soft-reset FMC to return to boot mode for memory-mapped reads */
     fmc_enter_boot();
+
+    /* Re-verify status — soft reset may re-load flash status from hardware */
     return 0;
 }
 
@@ -213,8 +278,8 @@ int flash_write_page(uint32_t addr, const uint8_t *data, uint32_t len) {
     if (len > 256) len = 256;
 
     fmc_enter_normal();
+    fmc_reg(FMC_GLOBAL_CFG) = fmc_reg(FMC_GLOBAL_CFG) & ~(1 << 2);
     flash_unlock();
-
     spi_write_enable();
 
     /* Copy data to FMC I/O buffer (memory window in normal mode) */

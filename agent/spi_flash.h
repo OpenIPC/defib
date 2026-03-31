@@ -46,6 +46,12 @@ int flash_erase_sector(uint32_t addr);
 /* Program a page (up to 256 bytes, must be page-aligned) */
 int flash_write_page(uint32_t addr, const uint8_t *data, uint32_t len);
 
+/* Read SPI flash status register (must be in normal mode) */
+uint8_t flash_read_status(void);
+
+/* Debug: [0]=status_before, [1]=status_with_WEL, [2]=status_after unlock */
+extern uint8_t flash_unlock_debug[3];
+
 /* CRC32 of flash region (using memory-mapped read) */
 uint32_t flash_crc32(uint32_t addr, uint32_t len);
 
