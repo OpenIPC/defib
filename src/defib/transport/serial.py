@@ -40,7 +40,10 @@ class SerialTransport(Transport):
                 stopbits=serial.STOPBITS_ONE,
                 bytesize=serial.EIGHTBITS,
                 timeout=None,
+                dsrdtr=False,       # Don't toggle DTR (may be wired to reset)
+                rtscts=False,       # Don't use hardware flow control
             )
+            port.dtr = False        # Keep DTR deasserted to avoid reset
         except serial.SerialException as e:
             raise TransportError(f"Failed to open {device}: {e}") from e
 
