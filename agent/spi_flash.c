@@ -128,8 +128,17 @@ int flash_init(flash_info_t *info) {
     /* Clear pending interrupts */
     fmc_reg(FMC_INT_CLR) = 0xFF;
 
-    /* Read JEDEC ID */
+    /* Read JEDEC ID (requires normal mode) */
     flash_read_id(info->jedec_id);
+
+    /* Switch back to boot mode for transparent memory-mapped reads.
+     * In boot mode, FLASH_MEM window reads directly from flash.
+     * In normal mode, it's the FMC I/O buffer. */
+    {
+        uint32_t c = fmc_reg(FMC_CFG);
+        c &= ~FMC_CFG_OP_MODE_NORMAL;
+        fmc_reg(FMC_CFG) = c;
+    }
 
     info->size = detect_size(info->jedec_id[2]);
     info->sector_size = 0x10000;  /* 64KB */
