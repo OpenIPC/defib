@@ -111,9 +111,10 @@ class SectorGrid(Widget):
         self,
         num_sectors: int = 0,
         cols: int = 32,
-        **kwargs: object,
+        *,
+        id: str | None = None,  # noqa: A002
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__(id=id)
         self._num_sectors = num_sectors
         self._cols = cols
         # Status per sector: None=pending, or SectorStatus value
@@ -167,7 +168,7 @@ class SectorGrid(Widget):
                     else:
                         parts.append(f"[bright_black]{BLOCK_PENDING}[/]")
                 else:
-                    char, color = status_map.get(status, (BLOCK_ERROR, "red"))
+                    char, color = status_map.get(SectorStatus(status), (BLOCK_ERROR, "red"))
                     if status == SectorStatus.GOOD:
                         parts.append(f"[{color}]{char}[/]")
                     elif status == SectorStatus.EMPTY:
@@ -532,7 +533,7 @@ class FlashDoctorScreen(Screen[None]):
         # Switch to scan view
         self.query_one("#setup-panel").display = False
         subtitle = f"{jedec} — {self._flash_size // 1024}KB — {self._num_sectors} sectors"
-        self.query_one("#doctor-banner").update(_build_banner(subtitle))
+        self.query_one("#doctor-banner", Static).update(_build_banner(subtitle))
         self.query_one("#scan-view").display = True
 
         # Configure grid

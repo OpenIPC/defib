@@ -398,7 +398,7 @@ class FlashAgentClient:
         flash_sz = self._flash_size
         if flash_sz == 0:
             info = await self.get_info()
-            flash_sz = info.get("flash_size", 0)
+            flash_sz = int(info.get("flash_size", 0))
         num_sectors = flash_sz // sector_sz if sector_sz else 0
 
         # Pre-compute CRC32 of an empty sector for comparison

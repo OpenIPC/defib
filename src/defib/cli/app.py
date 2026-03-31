@@ -1123,9 +1123,11 @@ async def _agent_scan_async(port: str, output_file: str, output: str) -> None:
     if output == "human":
         console.print()
         with Live(build_map(), console=console, refresh_per_second=8) as live:
-            scan_result = await client.scan_flash(
-                on_sector=lambda r: (on_sector(r), live.update(build_map())),
-            )
+            def on_sector_live(r: SectorResult) -> None:
+                on_sector(r)
+                live.update(build_map())
+
+            scan_result = await client.scan_flash(on_sector=on_sector_live)
             live.update(build_map())  # final refresh
     else:
         scan_result = await client.scan_flash(on_sector=on_sector)
