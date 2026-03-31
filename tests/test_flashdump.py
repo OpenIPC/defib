@@ -1,6 +1,9 @@
 """Tests for flash dump via U-Boot serial console."""
 
 import asyncio
+import os
+import tempfile
+
 import pytest
 
 from defib.flashdump import detect_flash_from_text, get_ram_staging_addr, parse_md_line, parse_md_output
@@ -278,7 +281,7 @@ class TestDumpFlashSanityCheck:
 
         with pytest.raises(RuntimeError, match="sanity check failed.*0x55"):
             await dump_flash(
-                transport, "/tmp/test_sanity.bin",
+                transport, os.path.join(tempfile.gettempdir(), "test_sanity.bin"),
                 flash_size=4096, ram_addr=0x42000000,
             )
 
@@ -297,7 +300,7 @@ class TestDumpFlashSanityCheck:
 
         with pytest.raises(RuntimeError, match="sanity check failed.*0xff"):
             await dump_flash(
-                transport, "/tmp/test_sanity.bin",
+                transport, os.path.join(tempfile.gettempdir(), "test_sanity.bin"),
                 flash_size=4096, ram_addr=0x42000000,
             )
 
@@ -317,7 +320,7 @@ class TestDumpFlashSanityCheck:
             "md.b 0x42000000 0x10": f"42000000: {valid_hex}    ................\nOpenIPC # \n",
         }
         transport = MockTransport(responses)
-        outpath = "/tmp/test_sanity_ok.bin"
+        outpath = os.path.join(tempfile.gettempdir(), "test_sanity_ok.bin")
 
         try:
             await dump_flash(
@@ -347,7 +350,7 @@ class TestDumpFlashSfProbe:
 
         with pytest.raises(RuntimeError, match="sf probe failed"):
             await dump_flash(
-                transport, "/tmp/test_probe.bin",
+                transport, os.path.join(tempfile.gettempdir(), "test_probe.bin"),
                 flash_size=4096, ram_addr=0x42000000,
             )
 
@@ -364,7 +367,7 @@ class TestDumpFlashSfProbe:
 
         with pytest.raises(RuntimeError, match="sf read failed"):
             await dump_flash(
-                transport, "/tmp/test_sfread.bin",
+                transport, os.path.join(tempfile.gettempdir(), "test_sfread.bin"),
                 flash_size=4096, ram_addr=0x42000000,
             )
 
@@ -378,7 +381,7 @@ class TestDumpFlashResume:
         from defib.flashdump import dump_flash
         import os
 
-        outpath = "/tmp/test_resume.bin"
+        outpath = os.path.join(tempfile.gettempdir(), "test_resume.bin")
         # Create partial file with 8KB of data
         with open(outpath, "wb") as f:
             f.write(b"\xAA" * 8192)
