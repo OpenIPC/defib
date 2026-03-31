@@ -449,11 +449,10 @@ int main(void) {
                 handle_set_baud(cmd_buf, data_len);
                 break;
             case CMD_REBOOT:
-                /* Trigger reset via watchdog */
-                WDT_LOCK = WDT_UNLOCK_KEY;
-                WDT_CONTROL = 3;  /* Enable interrupt + reset */
-                WDT_LOCK = 0;
-                while (1) {}
+                /* Rejected — watchdog reset re-enters bootrom on serial
+                 * boot pin, killing the agent with no recovery. Use
+                 * SELFUPDATE to reload, or physical power cycle. */
+                proto_send_ack(ACK_FLASH_ERROR);
                 break;
             default:
                 proto_send_ack(ACK_CRC_ERROR);
