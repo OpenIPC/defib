@@ -17,7 +17,6 @@ from defib.agent.protocol import (
     CMD_CRC32,
     CMD_INFO,
     CMD_READ,
-    CMD_REBOOT,
     CMD_SELFUPDATE,
     CMD_SET_BAUD,
     CMD_WRITE,
@@ -342,5 +341,9 @@ class FlashAgentClient:
         return False
 
     async def reboot(self) -> None:
-        """Tell the agent to reset the device."""
-        await send_packet(self._transport, CMD_REBOOT)
+        """Reboot is disabled — watchdog reset kills the agent on serial
+        boot pin with no recovery. Use selfupdate() to reload code."""
+        raise RuntimeError(
+            "Reboot disabled: watchdog reset re-enters bootrom on serial "
+            "boot mode, requiring physical power cycle. Use selfupdate() instead."
+        )

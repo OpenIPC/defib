@@ -1,5 +1,10 @@
 """Tests for flash dump via U-Boot serial console."""
 
+import asyncio
+import os
+import tempfile
+
+import pytest
 
 from defib.flashdump import detect_flash_from_text, get_ram_staging_addr, parse_md_line, parse_md_output
 
@@ -209,3 +214,198 @@ class TestCrc32Detection:
         """'Unknown command' in response means crc32 not available."""
         resp = "Unknown command 'crc32' - try 'help'\nOpenIPC # "
         assert "unknown command" in resp.lower()
+
+
+# ---------------------------------------------------------------------------
+# Mock transport for dump_flash integration tests
+# ---------------------------------------------------------------------------
+
+class MockTransport:
+    """Fake transport that simulates U-Boot responses."""
+
+    def __init__(self, responses: dict[str, str] | None = None):
+        self._responses = responses or {}
+        self._default = "OpenIPC # \n"
+        self._rx = bytearray()
+        self._tx_log: list[bytes] = []
+
+    async def write(self, data: bytes) -> None:
+        self._tx_log.append(data)
+        cmd = data.decode("ascii", errors="replace").strip()
+        # Match command prefix
+        for prefix, response in self._responses.items():
+            if cmd.startswith(prefix):
+                self._rx.extend(response.encode())
+                return
+        self._rx.extend(self._default.encode())
+
+    async def read(self, size: int, timeout: float | None = None) -> bytes:
+        if not self._rx:
+            await asyncio.sleep(0.01)
+            if not self._rx:
+                return b""
+        n = min(size, len(self._rx))
+        data = bytes(self._rx[:n])
+        del self._rx[:n]
+        return data
+
+    async def bytes_waiting(self) -> int:
+        return len(self._rx)
+
+    async def close(self) -> None:
+        pass
+
+    async def flush_input(self) -> None:
+        self._rx.clear()
+
+    async def flush_output(self) -> None:
+        pass
+
+
+class TestDumpFlashSanityCheck:
+    """Test the sanity check that detects garbage after sf read."""
+
+    @pytest.mark.asyncio
+    async def test_sanity_check_catches_all_0x55(self):
+        """If first 16 bytes are all 0x55, dump should fail early."""
+        from defib.flashdump import dump_flash
+
+        # Simulate: sf probe OK, sf read OK, but md.b returns all 0x55
+        hex_55 = " ".join(["55"] * 16)
+        responses = {
+            "sf probe": "SF: Detected W25Q128\nOpenIPC # \n",
+            "sf read": "SF: 4096 bytes @ 0x0 Read: OK\nOpenIPC # \n",
+            "md.b 0x42000000 10": f"42000000: {hex_55}    UUUUUUUUUUUUUUUU\nOpenIPC # \n",
+        }
+        transport = MockTransport(responses)
+
+        with pytest.raises(RuntimeError, match="sanity check failed.*0x55"):
+            await dump_flash(
+                transport, os.path.join(tempfile.gettempdir(), "test_sanity.bin"),
+                flash_size=4096, ram_addr=0x42000000,
+            )
+
+    @pytest.mark.asyncio
+    async def test_sanity_check_catches_all_0xff(self):
+        """All 0xFF = erased flash or uninitialized RAM."""
+        from defib.flashdump import dump_flash
+
+        hex_ff = " ".join(["ff"] * 16)
+        responses = {
+            "sf probe": "OpenIPC # \n",
+            "sf read": "SF: 4096 bytes @ 0x0 Read: OK\nOpenIPC # \n",
+            "md.b 0x42000000 10": f"42000000: {hex_ff}    ................\nOpenIPC # \n",
+        }
+        transport = MockTransport(responses)
+
+        with pytest.raises(RuntimeError, match="sanity check failed.*0xff"):
+            await dump_flash(
+                transport, os.path.join(tempfile.gettempdir(), "test_sanity.bin"),
+                flash_size=4096, ram_addr=0x42000000,
+            )
+
+    @pytest.mark.asyncio
+    async def test_sanity_check_passes_valid_data(self):
+        """Valid flash header passes sanity check."""
+        from defib.flashdump import dump_flash
+        import os
+
+        # ARM vector table start
+        valid_hex = "15 05 00 ea fe ff ff ea fe ff ff ea fe ff ff ea"
+        responses = {
+            "sf probe": "OpenIPC # \n",
+            "sf read": "SF: 16 bytes @ 0x0 Read: OK\nOpenIPC # \n",
+            "md.b 0x42000000 10": f"42000000: {valid_hex}    ................\nOpenIPC # \n",
+            "crc32": "Unknown command\nOpenIPC # \n",
+            "md.b 0x42000000 0x10": f"42000000: {valid_hex}    ................\nOpenIPC # \n",
+        }
+        transport = MockTransport(responses)
+        outpath = os.path.join(tempfile.gettempdir(), "test_sanity_ok.bin")
+
+        try:
+            await dump_flash(
+                transport, outpath,
+                flash_size=16, ram_addr=0x42000000,
+            )
+            assert os.path.exists(outpath)
+            data = open(outpath, "rb").read()
+            assert len(data) == 16
+        finally:
+            if os.path.exists(outpath):
+                os.unlink(outpath)
+
+
+class TestDumpFlashSfProbe:
+    """Test that sf probe always runs before sf read."""
+
+    @pytest.mark.asyncio
+    async def test_sf_probe_error_raises(self):
+        """If sf probe fails, dump should raise RuntimeError."""
+        from defib.flashdump import dump_flash
+
+        responses = {
+            "sf probe": "Error: SPI flash probe failed\nOpenIPC # \n",
+        }
+        transport = MockTransport(responses)
+
+        with pytest.raises(RuntimeError, match="sf probe failed"):
+            await dump_flash(
+                transport, os.path.join(tempfile.gettempdir(), "test_probe.bin"),
+                flash_size=4096, ram_addr=0x42000000,
+            )
+
+    @pytest.mark.asyncio
+    async def test_sf_read_no_ok_raises(self):
+        """If sf read doesn't return 'Read: OK', should raise."""
+        from defib.flashdump import dump_flash
+
+        responses = {
+            "sf probe": "OpenIPC # \n",
+            "sf read": "device 0 offset 0x0, size 0x1000\nOpenIPC # \n",  # No "Read: OK"
+        }
+        transport = MockTransport(responses)
+
+        with pytest.raises(RuntimeError, match="sf read failed"):
+            await dump_flash(
+                transport, os.path.join(tempfile.gettempdir(), "test_sfread.bin"),
+                flash_size=4096, ram_addr=0x42000000,
+            )
+
+
+class TestDumpFlashResume:
+    """Test resume from partial file."""
+
+    @pytest.mark.asyncio
+    async def test_resume_skips_completed_blocks(self):
+        """If output file exists with 8KB, should resume from 8KB."""
+        from defib.flashdump import dump_flash
+        import os
+
+        outpath = os.path.join(tempfile.gettempdir(), "test_resume.bin")
+        # Create partial file with 8KB of data
+        with open(outpath, "wb") as f:
+            f.write(b"\xAA" * 8192)
+
+        valid_hex = "15 05 00 ea fe ff ff ea fe ff ff ea fe ff ff ea"
+        block_hex = " ".join(["bb"] * 16)
+        responses = {
+            "sf probe": "OpenIPC # \n",
+            "sf read": "SF: 12288 bytes @ 0x0 Read: OK\nOpenIPC # \n",
+            "md.b 0x42000000 10": f"42000000: {valid_hex}    ................\nOpenIPC # \n",
+            "crc32": "Unknown command\nOpenIPC # \n",
+            # Block at 0x2000 (8KB offset)
+            "md.b 0x42002000": f"42002000: {block_hex}    ................\nOpenIPC # \n",
+        }
+        transport = MockTransport(responses)
+
+        logs: list[str] = []
+        try:
+            await dump_flash(
+                transport, outpath,
+                flash_size=12288, ram_addr=0x42000000,
+                on_log=logs.append,
+            )
+            assert any("Resuming" in msg for msg in logs)
+        finally:
+            if os.path.exists(outpath):
+                os.unlink(outpath)

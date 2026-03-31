@@ -71,7 +71,9 @@ FLASH_SIZES = {
     "32MB": 0x2000000,
 }
 # How long to wait for sf read to complete (large flash can be slow)
-SF_READ_TIMEOUT = 30.0
+# sf read timeout: 16MB at SPI ~50MHz takes ~3s, but some chips/modes are
+# much slower. 120s handles even worst-case 1MHz SPI clock.
+SF_READ_TIMEOUT = 120.0
 # Regex for md.b output line
 MD_LINE_RE = re.compile(
     r"^([0-9a-fA-F]{8}):\s+"
@@ -360,6 +362,16 @@ async def dump_flash(
             )
 
     size_mb = flash_size / (1024 * 1024)
+
+    # Always run sf probe before sf read — even if we already know the
+    # flash size from boot log. Without sf probe, the SPI flash subsystem
+    # isn't initialized and sf read silently writes nothing to RAM.
+    if on_log:
+        on_log("Initializing SPI flash...")
+    probe_resp = await send_command(transport, "sf probe 0", timeout=5.0, wait_for="# ")
+    if "error" in probe_resp.lower() or "fail" in probe_resp.lower():
+        raise RuntimeError(f"sf probe failed: {probe_resp.strip()}")
+
     if on_log:
         on_log(f"Reading {size_mb:.0f}MB flash into RAM at 0x{ram_addr:08x}...")
 
@@ -367,10 +379,31 @@ async def dump_flash(
     cmd = f"sf read 0x{ram_addr:x} 0x0 0x{flash_size:x}"
     resp = await send_command(transport, cmd, timeout=SF_READ_TIMEOUT, wait_for="# ")
 
-    if "OK" not in resp and "ok" not in resp.lower():
-        # Try anyway — some U-Boot versions don't print OK
+    if "Read: OK" not in resp:
+        raise RuntimeError(
+            f"sf read failed or timed out. Response: {resp.strip()[-200:]}"
+        )
+
+    # Sanity check: read first 16 bytes and verify they look like flash content.
+    # Valid SPI NOR flash starts with ARM vectors (0xEA branch opcodes) or
+    # a bootloader header — never all-zeros, all-0xFF, or all-0x55.
+    check_resp = await send_command(
+        transport, f"md.b 0x{ram_addr:x} 10", timeout=5.0, wait_for="# ",
+    )
+    check_data = parse_md_output(check_resp)
+    if len(check_data) >= 16:
+        # Detect garbage patterns
+        unique = len(set(check_data[:16]))
+        all_same = unique == 1
+        if all_same:
+            bad_byte = check_data[0]
+            raise RuntimeError(
+                f"Flash read sanity check failed: first 16 bytes are all "
+                f"0x{bad_byte:02x}. This usually means sf probe/sf read "
+                f"failed silently. Try running 'sf probe 0' manually first."
+            )
         if on_log:
-            on_log("Warning: sf read response unclear, proceeding with dump")
+            on_log(f"Sanity check OK: first bytes {check_data[:4].hex()}")
 
     # Detect if U-Boot has crc32 command for per-block verification
     has_crc32 = await _detect_crc32(transport)
@@ -384,28 +417,66 @@ async def dump_flash(
         on_log(f"Dumping {size_mb:.0f}MB via md.b...")
 
     chunk_size = 0x1000  # 4KB chunks
-    max_retries = 3
+    max_retries = 5
+
+    # Resume support: if output file exists with partial data, continue
+    # from where it left off instead of starting over.
+    import os
     offset = 0
+    file_mode = "wb"
+    if os.path.exists(output_path):
+        existing = os.path.getsize(output_path)
+        # Round down to chunk boundary
+        resume_offset = (existing // chunk_size) * chunk_size
+        if 0 < resume_offset < flash_size:
+            offset = resume_offset
+            file_mode = "r+b"
+            if on_log:
+                pct = offset * 100 // flash_size
+                on_log(f"Resuming from 0x{offset:x} ({pct}% already done)")
+
     verified = 0
     errors = 0
     retries_total = 0
     start_time = time.monotonic()
 
-    with open(output_path, "wb") as f:
+    with open(output_path, file_mode) as f:
+        if offset > 0:
+            f.seek(offset)
         while offset < flash_size:
             remaining = min(chunk_size, flash_size - offset)
             addr = ram_addr + offset
+            chunk_data = b""
 
             for attempt in range(max_retries + 1):
-                cmd = f"md.b 0x{addr:x} 0x{remaining:x}"
-                resp = await send_command(transport, cmd, timeout=15.0, wait_for="# ")
-                chunk_data = parse_md_output(resp)
+                try:
+                    cmd = f"md.b 0x{addr:x} 0x{remaining:x}"
+                    resp = await send_command(transport, cmd, timeout=15.0, wait_for="# ")
+                    chunk_data = parse_md_output(resp)
+                except Exception as exc:
+                    # Transport error (serial disconnect, timeout, etc.)
+                    retries_total += 1
+                    if attempt < max_retries:
+                        if on_log:
+                            on_log(f"Transport error at 0x{offset:x}: {exc}, retry {attempt + 1}")
+                        import asyncio
+                        await asyncio.sleep(1.0)
+                        # Try to recover: send empty line to get a prompt
+                        try:
+                            await send_command(transport, "", timeout=3.0, wait_for="# ")
+                        except Exception:
+                            pass
+                        continue
+                    if on_log:
+                        on_log(f"Transport error at 0x{offset:x} after {max_retries} retries: {exc}")
+                    chunk_data = b"\x00" * remaining
+                    break
 
                 if len(chunk_data) == 0:
+                    retries_total += 1
                     if attempt < max_retries:
                         if on_log:
                             on_log(f"Retry {attempt + 1}: no data at 0x{offset:x}")
-                        retries_total += 1
                         continue
                     if on_log:
                         on_log(f"Warning: no data at offset 0x{offset:x}, writing zeros")
@@ -414,22 +485,25 @@ async def dump_flash(
 
                 # CRC32 verification if available
                 if has_crc32 and len(chunk_data) == remaining:
-                    import zlib
-                    local_crc = zlib.crc32(chunk_data) & 0xFFFFFFFF
-                    device_crc = await _get_device_crc32(
-                        transport, addr, remaining
-                    )
+                    try:
+                        import zlib
+                        local_crc = zlib.crc32(chunk_data) & 0xFFFFFFFF
+                        device_crc = await _get_device_crc32(
+                            transport, addr, remaining
+                        )
+                    except Exception:
+                        # CRC check failed due to transport — still have data, use it
+                        break
                     if device_crc is not None and device_crc != local_crc:
                         errors += 1
                         if attempt < max_retries:
+                            retries_total += 1
                             if on_log:
-                                retries_total += 1
-                                if on_log is not None:
-                                    on_log(
-                                        f"CRC mismatch at 0x{offset:x} "
-                                        f"(local={local_crc:08x} device={device_crc:08x}), "
-                                        f"retry {attempt + 1}"
-                                    )
+                                on_log(
+                                    f"CRC mismatch at 0x{offset:x} "
+                                    f"(local={local_crc:08x} device={device_crc:08x}), "
+                                    f"retry {attempt + 1}"
+                                )
                             continue
                         if on_log:
                             on_log(f"CRC mismatch at 0x{offset:x} after {max_retries} retries")
