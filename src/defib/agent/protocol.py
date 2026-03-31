@@ -86,17 +86,30 @@ def parse_packet(raw: bytes) -> tuple[int, bytes]:
 async def send_packet(transport: Transport, cmd: int, data: bytes = b"") -> None:
     """Send a COBS-framed packet to the device."""
     packet = build_packet(cmd, data)
-    await transport.write(packet)
+    # Use direct pyserial when available for consistent timing
+    port = getattr(transport, '_port', None)
+    if port is not None:
+        port.write(packet)
+    else:
+        await transport.write(packet)
 
 
 async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, bytes]:
     """Receive and parse a COBS-framed packet from the device.
 
     Reads chunks until 0x00 delimiter found, then COBS-decodes and verifies CRC.
+    Uses direct pyserial access when available for reliable timing.
     """
+    import time
+
+    # Try direct pyserial access (bypasses async executor overhead)
+    port = getattr(transport, '_port', None)
+    if port is not None:
+        return _recv_packet_sync(port, timeout)
+
+    # Fallback: async transport
     buf = bytearray()
     import asyncio
-    import time
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
@@ -104,23 +117,55 @@ async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, 
         if remaining <= 0:
             break
         try:
-            # Read with blocking timeout — let the serial port accumulate data
             data = await transport.read(256, timeout=min(remaining, 1.0))
-
             for byte in data:
                 if byte == 0x00:
                     if buf:
                         try:
                             return parse_packet(bytes(buf))
                         except ValueError:
-                            pass  # CRC error — discard and keep reading
+                            pass
                         buf.clear()
                 else:
                     buf.append(byte)
                     if len(buf) > MAX_PACKET_SIZE:
-                        buf.clear()  # Discard oversized frame, don't crash
+                        buf.clear()
         except TransportTimeout:
             continue
+
+    raise TransportTimeout(f"No packet received within {timeout}s")
+
+
+def _recv_packet_sync(port: object, timeout: float) -> tuple[int, bytes]:
+    """Synchronous recv using pyserial directly."""
+    import time
+    buf = bytearray()
+    old_timeout = port.timeout  # type: ignore[union-attr]
+    port.timeout = min(timeout, 1.0)  # type: ignore[union-attr]
+    deadline = time.monotonic() + timeout
+
+    try:
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            port.timeout = min(remaining, 1.0)  # type: ignore[union-attr]
+            data = port.read(256)  # type: ignore[union-attr]
+            if data:
+                for byte in data:
+                    if byte == 0x00:
+                        if buf:
+                            try:
+                                return parse_packet(bytes(buf))
+                            except ValueError:
+                                pass
+                            buf.clear()
+                    else:
+                        buf.append(byte)
+                        if len(buf) > MAX_PACKET_SIZE:
+                            buf.clear()
+    finally:
+        port.timeout = old_timeout  # type: ignore[union-attr]
 
     raise TransportTimeout(f"No packet received within {timeout}s")
 

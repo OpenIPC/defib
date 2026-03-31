@@ -40,19 +40,53 @@ void uart_init(void) {
 }
 
 void uart_putc(uint8_t ch) {
-    /* Wait until TX FIFO has space */
-    while (uart_reg(UART_FR) & UART_FR_TXFF) {}
+    /* Wait until TX FIFO has space, with timeout */
+    volatile uint32_t timeout = 100000;
+    while ((uart_reg(UART_FR) & UART_FR_TXFF) && timeout > 0) { timeout--; }
     uart_reg(UART_DR) = ch;
+}
+
+int uart_putc_safe(uint8_t ch) {
+    /* Wait until TX FIFO has space, with timeout. Returns 0 on success, -1 on timeout. */
+    volatile uint32_t timeout = 100000;
+    while ((uart_reg(UART_FR) & UART_FR_TXFF) && timeout > 0) { timeout--; }
+    if (timeout == 0) return -1;
+    uart_reg(UART_DR) = ch;
+    return 0;
 }
 
 uint8_t uart_getc(void) {
     /* Wait until RX FIFO has data */
     while (uart_reg(UART_FR) & UART_FR_RXFE) {}
-    return (uint8_t)(uart_reg(UART_DR) & 0xFF);
+    uint32_t dr = uart_reg(UART_DR);
+    if (dr & UART_DR_ERR) uart_reg(UART_RSR) = 0;  /* Clear errors */
+    return (uint8_t)(dr & 0xFF);
+}
+
+int uart_getc_safe(void) {
+    /* Non-blocking read. Returns byte (0-255) or -1 if empty, -2 if error (BREAK/framing). */
+    if (uart_reg(UART_FR) & UART_FR_RXFE) return -1;
+    uint32_t dr = uart_reg(UART_DR);
+    if (dr & UART_DR_ERR) {
+        uart_reg(UART_RSR) = 0;  /* Clear errors */
+        if (dr & (UART_DR_BE | UART_DR_FE)) return -2;  /* BREAK or framing error */
+    }
+    return (int)(dr & 0xFF);
 }
 
 int uart_readable(void) {
     return !(uart_reg(UART_FR) & UART_FR_RXFE);
+}
+
+void uart_clear_errors(void) {
+    uart_reg(UART_RSR) = 0;
+}
+
+void uart_drain_rx(void) {
+    while (uart_readable()) {
+        (void)uart_reg(UART_DR);
+    }
+    uart_reg(UART_RSR) = 0;
 }
 
 void uart_puts(const char *s) {

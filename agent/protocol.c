@@ -86,14 +86,18 @@ uint8_t proto_recv(uint8_t *data, uint32_t *len, uint32_t timeout_ms) {
     uint32_t deadline = timeout_ms * 100;
 
     while (cobs_len < sizeof(rx_cobs)) {
-        if (uart_readable()) {
-            uint8_t b = uart_getc();
+        int b = uart_getc_safe();
+        if (b >= 0) {
             if (b == 0x00) {
                 if (cobs_len == 0) continue; /* Skip empty frames */
                 break;
             }
-            rx_cobs[cobs_len++] = b;
+            rx_cobs[cobs_len++] = (uint8_t)b;
             deadline = timeout_ms * 100;
+        } else if (b == -2) {
+            /* BREAK or framing error — discard, reset partial frame */
+            cobs_len = 0;
+            uart_clear_errors();
         } else {
             if (deadline == 0) return 0; /* Timeout */
             deadline--;

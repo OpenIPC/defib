@@ -12,6 +12,7 @@
 
 /* PL011 register offsets */
 #define UART_DR         0x00    /* Data register */
+#define UART_RSR        0x04    /* Receive status / error clear */
 #define UART_FR         0x18    /* Flag register */
 #define UART_IBRD       0x24    /* Integer baud rate divisor */
 #define UART_FBRD       0x28    /* Fractional baud rate divisor */
@@ -19,6 +20,13 @@
 #define UART_CR         0x30    /* Control register */
 #define UART_IMSC       0x38    /* Interrupt mask */
 #define UART_ICR        0x44    /* Interrupt clear */
+
+/* Data register error bits (read) */
+#define UART_DR_FE      (1 << 8)    /* Framing error */
+#define UART_DR_PE      (1 << 9)    /* Parity error */
+#define UART_DR_BE      (1 << 10)   /* Break error */
+#define UART_DR_OE      (1 << 11)   /* Overrun error */
+#define UART_DR_ERR     (UART_DR_FE | UART_DR_PE | UART_DR_BE | UART_DR_OE)
 
 /* Flag register bits */
 #define UART_FR_TXFF    (1 << 5)    /* TX FIFO full */
@@ -52,8 +60,12 @@
 
 void uart_init(void);
 void uart_putc(uint8_t ch);
+int uart_putc_safe(uint8_t ch);
 uint8_t uart_getc(void);
+int uart_getc_safe(void);
 int uart_readable(void);
+void uart_clear_errors(void);
+void uart_drain_rx(void);
 void uart_puts(const char *s);
 void uart_write(const uint8_t *buf, uint32_t len);
 uint32_t uart_read(uint8_t *buf, uint32_t max_len, uint32_t timeout_ms);
