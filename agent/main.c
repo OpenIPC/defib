@@ -163,7 +163,6 @@ static void handle_write(const uint8_t *data, uint32_t len) {
     proto_send_ack(ACK_OK);  /* Ready to receive */
 
     uint32_t received = 0;
-    uint32_t pkt_count = 0;
     uint8_t pkt[MAX_PAYLOAD + 16];
     while (received < size) {
         uint32_t pkt_len = 0;
@@ -172,9 +171,8 @@ static void handle_write(const uint8_t *data, uint32_t len) {
             uint32_t chunk = pkt_len - 2;
             for (uint32_t i = 0; i < chunk && received < size; i++)
                 dest[received++] = pkt[2 + i];
-            pkt_count++;
+            /* No per-packet ACK — continuous receive for throughput */
         } else if (cmd == 0) {
-            /* Timeout — report progress in ACK data: [status, received_bytes LE32] */
             uint8_t err[5];
             err[0] = ACK_FLASH_ERROR;
             write_le32(&err[1], received);

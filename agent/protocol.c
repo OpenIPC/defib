@@ -42,6 +42,9 @@ static const uint32_t crc32_table[256] = {
     0xB3667A2E,0xC4614AB8,0x5D681B02,0x2A6F2B94,0xB40BBE37,0xC30C8EA1,0x5A05DF1B,0x2D02EF8D,
 };
 
+/* Forward declaration — defined below */
+void soft_rx_drain(void);
+
 uint32_t crc32(uint32_t crc, const uint8_t *buf, uint32_t len) {
     crc = crc ^ 0xFFFFFFFF;
     for (uint32_t i = 0; i < len; i++) {
@@ -55,6 +58,37 @@ static uint8_t tx_raw[MAX_PAYLOAD + 16];   /* cmd + data + crc */
 static uint8_t tx_cobs[MAX_PAYLOAD + 32];  /* COBS encoded */
 static uint8_t rx_cobs[MAX_PAYLOAD + 32];
 static uint8_t rx_raw[MAX_PAYLOAD + 16];
+
+/* Software RX FIFO — drains PL011 hardware FIFO (16 bytes) to prevent
+ * overflow during COBS decode + CRC32 processing on uncached DDR. */
+static uint8_t soft_rx[4096];
+static uint32_t soft_rx_head = 0;
+static uint32_t soft_rx_tail = 0;
+
+void soft_rx_drain(void) {
+    while (uart_readable()) {
+        int b = uart_getc_safe();
+        if (b >= 0) {
+            uint32_t next = (soft_rx_head + 1) % sizeof(soft_rx);
+            if (next != soft_rx_tail) {
+                soft_rx[soft_rx_head] = (uint8_t)b;
+                soft_rx_head = next;
+            }
+        } else if (b == -2) {
+            uart_clear_errors();
+        }
+    }
+}
+
+static int soft_rx_get(void) {
+    soft_rx_drain();
+    if (soft_rx_head != soft_rx_tail) {
+        uint8_t b = soft_rx[soft_rx_tail];
+        soft_rx_tail = (soft_rx_tail + 1) % sizeof(soft_rx);
+        return b;
+    }
+    return -1;
+}
 
 void proto_send(uint8_t cmd, const uint8_t *data, uint32_t len) {
     /* Build raw packet: cmd + data + crc32 */
@@ -81,12 +115,22 @@ void proto_send(uint8_t cmd, const uint8_t *data, uint32_t len) {
 }
 
 uint8_t proto_recv(uint8_t *data, uint32_t *len, uint32_t timeout_ms) {
-    /* Read until 0x00 delimiter */
+    /* Read until 0x00 delimiter.
+     * Uses soft_rx buffer: reads from software FIFO first (leftovers
+     * from previous drain), then from hardware FIFO. */
     uint32_t cobs_len = 0;
     uint32_t deadline = timeout_ms * 100;
 
     while (cobs_len < sizeof(rx_cobs)) {
-        int b = uart_getc_safe();
+        /* Try software buffer first, then hardware */
+        int b;
+        if (soft_rx_head != soft_rx_tail) {
+            b = soft_rx[soft_rx_tail];
+            soft_rx_tail = (soft_rx_tail + 1) % sizeof(soft_rx);
+        } else {
+            b = uart_getc_safe();
+        }
+
         if (b >= 0) {
             if (b == 0x00) {
                 if (cobs_len == 0) continue; /* Skip empty frames */
@@ -95,19 +139,26 @@ uint8_t proto_recv(uint8_t *data, uint32_t *len, uint32_t timeout_ms) {
             rx_cobs[cobs_len++] = (uint8_t)b;
             deadline = timeout_ms * 100;
         } else if (b == -2) {
-            /* BREAK or framing error — discard, reset partial frame */
             cobs_len = 0;
             uart_clear_errors();
         } else {
             if (deadline == 0) return 0; /* Timeout */
             deadline--;
-            /* Short delay — tuned for uncached DDR access on Cortex-A7 */
             for (volatile int d = 25; d > 0; d--) {}
         }
     }
 
+    /* Drain hardware FIFO into software buffer BEFORE heavy processing.
+     * COBS decode + CRC32 on uncached DDR takes ~1-2ms, enough for
+     * the 16-byte PL011 FIFO to overflow if data keeps arriving. */
+    soft_rx_drain();
+
     /* COBS decode */
     uint32_t raw_len = cobs_decode(rx_cobs, cobs_len, rx_raw);
+
+    /* Drain again after decode */
+    soft_rx_drain();
+
     if (raw_len < 5) return 0; /* Too short: need cmd + crc32 */
 
     /* Verify CRC32 — read bytes individually to avoid unaligned access */
@@ -115,6 +166,10 @@ uint8_t proto_recv(uint8_t *data, uint32_t *len, uint32_t timeout_ms) {
     volatile uint8_t *cp = &rx_raw[payload_len];
     uint32_t expected_crc = cp[0] | (cp[1] << 8) | (cp[2] << 16) | (cp[3] << 24);
     uint32_t actual_crc = crc32(0, rx_raw, payload_len);
+
+    /* Drain after CRC */
+    soft_rx_drain();
+
     if (actual_crc != expected_crc) return 0; /* CRC error */
 
     /* Extract command and data */
@@ -131,4 +186,8 @@ void proto_send_ready(void) {
 
 void proto_send_ack(uint8_t status) {
     proto_send(RSP_ACK, &status, 1);
+}
+
+void proto_drain_fifo(void) {
+    soft_rx_drain();
 }

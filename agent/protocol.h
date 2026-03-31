@@ -47,4 +47,8 @@ void proto_send_ack(uint8_t status);
 /* CRC32 (same as zlib) */
 uint32_t crc32(uint32_t crc, const uint8_t *buf, uint32_t len);
 
+/* Drain PL011 FIFO into software buffer. Call frequently during
+ * long computations to prevent 16-byte hardware FIFO overflow. */
+void proto_drain_fifo(void);
+
 #endif /* PROTOCOL_H */
