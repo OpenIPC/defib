@@ -294,6 +294,8 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
  *   Agent ACKs at current baud, waits for TX to drain, switches.
  *   Host should switch immediately after receiving the ACK.
  */
+static int at_default_baud = 1;
+
 static void handle_set_baud(const uint8_t *data, uint32_t len) {
     if (len < 4) { proto_send_ack(ACK_CRC_ERROR); return; }
 
@@ -324,9 +326,10 @@ static void handle_set_baud(const uint8_t *data, uint32_t len) {
         /* No valid command — revert */
         uart_set_baud(115200);
         while (uart_readable()) uart_getc();
+        at_default_baud = 1;
     } else {
-        /* Got a valid command at new baud — process it normally.
-         * Re-inject into main loop by handling it here. */
+        /* Got a valid command at new baud — confirmed working */
+        at_default_baud = (baud == 115200);
         switch (cmd) {
             case CMD_INFO:  handle_info(); break;
             case CMD_READ:  handle_read(pkt, pkt_len); break;
@@ -347,22 +350,33 @@ int main(void) {
     proto_send_ready();
 
     uint32_t idle_count = 0;
+    uint32_t baud_idle = 0;
+    at_default_baud = 1;
     while (1) {
         uint32_t data_len = 0;
         uint8_t cmd = proto_recv(cmd_buf, &data_len, 500);
 
         if (cmd == 0) {
             idle_count++;
-            /* Send READY every ~2s (4 x 500ms) so host can detect us
-             * after reconnect. Suppress briefly after a command to
-             * avoid interfering with multi-packet responses. */
             if (idle_count >= 4) {
                 proto_send_ready();
                 idle_count = 0;
             }
+            /* If at non-default baud and idle for ~10s (20 x 500ms),
+             * revert to 115200. Host may have disconnected. */
+            if (!at_default_baud) {
+                baud_idle++;
+                if (baud_idle >= 20) {
+                    uart_set_baud(115200);
+                    while (uart_readable()) uart_getc();
+                    at_default_baud = 1;
+                    baud_idle = 0;
+                }
+            }
             continue;
         }
         idle_count = 0;
+        baud_idle = 0;
 
         switch (cmd) {
             case CMD_INFO:

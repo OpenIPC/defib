@@ -36,10 +36,15 @@ from defib.transport.base import Transport
 logger = logging.getLogger(__name__)
 
 # Max bytes per WRITE transfer before PL011 FIFO overflow on uncached DDR.
-# Agent processes COBS+CRC between packets; at 115200 baud with no D-cache,
-# cumulative FIFO overflow occurs after ~30-60KB of continuous streaming.
 WRITE_CHUNK_SIZE = 512
 WRITE_MAX_TRANSFER = 16 * 1024
+
+# Optimal baud rate from hi3516ev300 + FT232R benchmarks.
+# 921600 is the highest rate verified for both READ and WRITE with
+# CRC32 integrity on real hardware. 1152000 works for READ-only but
+# WRITE is marginal. Single rate avoids unnecessary switching.
+DEFAULT_FAST_BAUD = 921600    # ~82 KB/s both directions
+FALLBACK_BAUD = 115200        # Always works
 
 
 def get_agent_binary(chip: str) -> Path | None:
@@ -88,6 +93,7 @@ class FlashAgentClient:
         self._flash_size = 0
         self._ram_base = 0
         self._sector_size = 0x10000
+        self._current_baud = FALLBACK_BAUD
 
     @property
     def connected(self) -> bool:
@@ -105,6 +111,22 @@ class FlashAgentClient:
         """Wait for agent READY packet."""
         self._connected = await wait_for_ready(self._transport, timeout)
         return self._connected
+
+    async def _switch_baud(self, target: int) -> bool:
+        """Switch to target baud if not already there. Returns success."""
+        if self._current_baud == target:
+            return True
+        ok = await self.set_baud(target)
+        if ok:
+            self._current_baud = target
+        return ok
+
+    async def _restore_baud(self) -> None:
+        """Return to fallback baud rate."""
+        if self._current_baud != FALLBACK_BAUD:
+            ok = await self.set_baud(FALLBACK_BAUD)
+            if ok:
+                self._current_baud = FALLBACK_BAUD
 
     async def get_info(self) -> dict[str, int | str]:
         """Request device info from the agent."""
@@ -134,8 +156,16 @@ class FlashAgentClient:
         addr: int,
         size: int,
         on_progress: Callable[[int, int], None] | None = None,
+        fast: bool = True,
     ) -> bytes:
-        """Read a memory region from the device. Returns bytes."""
+        """Read a memory region from the device. Returns bytes.
+
+        If fast=True and size > 4KB, switches to DEFAULT_FAST_BAUD,
+        falling back to FALLBACK_BAUD if the switch fails.
+        """
+        if fast and size > 4096:
+            await self._switch_baud(DEFAULT_FAST_BAUD)
+
         payload = struct.pack("<II", addr, size)
         await send_packet(self._transport, CMD_READ, payload)
 
@@ -172,12 +202,17 @@ class FlashAgentClient:
         addr: int,
         data: bytes,
         on_progress: Callable[[int, int], None] | None = None,
+        fast: bool = True,
     ) -> bool:
         """Write data to device RAM in chunked transfers.
 
+        If fast=True and data > 4KB, switches to DEFAULT_FAST_BAUD.
         Splits into WRITE_MAX_TRANSFER-sized blocks to avoid PL011 FIFO
         overflow on uncached DDR. Each block uses WRITE_CHUNK_SIZE packets.
         """
+        if fast and len(data) > 4096:
+            await self._switch_baud(DEFAULT_FAST_BAUD)
+
         total = len(data)
         offset = 0
 
