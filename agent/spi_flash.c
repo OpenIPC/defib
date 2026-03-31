@@ -120,11 +120,8 @@ static void fmc_wait_ready(void) {
 
 static void spi_wait_wip(void) {
     for (int i = 0; i < 10000000; i++) {
-        fmc_reg(FMC_CMD) = SPI_CMD_READ_STATUS;
-        fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0);
-        fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_READ_STATUS | FMC_OP_REG_OP_START;
-        fmc_wait_ready();
-        if (!(fmc_reg(FMC_STATUS) & SPI_STATUS_WIP)) return;
+        uint8_t sr = flash_read_status();
+        if (!(sr & SPI_STATUS_WIP)) return;
     }
 }
 
