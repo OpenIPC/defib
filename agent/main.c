@@ -163,6 +163,7 @@ static void handle_write(const uint8_t *data, uint32_t len) {
     proto_send_ack(ACK_OK);  /* Ready to receive */
 
     uint32_t received = 0;
+    uint32_t pkt_count = 0;
     uint8_t pkt[MAX_PAYLOAD + 16];
     while (received < size) {
         uint32_t pkt_len = 0;
@@ -171,8 +172,13 @@ static void handle_write(const uint8_t *data, uint32_t len) {
             uint32_t chunk = pkt_len - 2;
             for (uint32_t i = 0; i < chunk && received < size; i++)
                 dest[received++] = pkt[2 + i];
+            pkt_count++;
         } else if (cmd == 0) {
-            proto_send_ack(ACK_FLASH_ERROR);
+            /* Timeout — report progress in ACK data: [status, received_bytes LE32] */
+            uint8_t err[5];
+            err[0] = ACK_FLASH_ERROR;
+            write_le32(&err[1], received);
+            proto_send(RSP_ACK, err, 5);
             return;
         }
     }
@@ -180,7 +186,11 @@ static void handle_write(const uint8_t *data, uint32_t len) {
     /* Verify CRC32 */
     uint32_t actual_crc = crc32(0, dest, size);
     if (actual_crc != expected_crc) {
-        proto_send_ack(ACK_CRC_ERROR);
+        uint8_t err[9];
+        err[0] = ACK_CRC_ERROR;
+        write_le32(&err[1], actual_crc);
+        write_le32(&err[5], received);
+        proto_send(RSP_ACK, err, 9);
         return;
     }
 
@@ -188,13 +198,40 @@ static void handle_write(const uint8_t *data, uint32_t len) {
 }
 
 /*
- * CMD_SELFUPDATE: receive new agent binary into RAM and jump to it.
+ * ARM32 position-independent trampoline (machine code).
+ * Copies r2 bytes from r1 to r0, then branches to r0-r2 (original dst).
  *
- * Protocol:
- *   Host sends: CMD_SELFUPDATE [addr:4LE] [size:4LE] [expected_crc:4LE]
- *   Agent ACKs ready, then receives RSP_DATA packets.
- *   After all data received, agent verifies CRC32 of written region.
- *   Only jumps if CRC matches. On failure, NAKs and stays alive.
+ *   mov r3, r0          @ save dst
+ *   cmp r2, #0
+ *   beq done
+ * loop:
+ *   ldrb r4, [r1], #1
+ *   strb r4, [r0], #1
+ *   subs r2, r2, #1
+ *   bne loop
+ * done:
+ *   bx r3               @ jump to saved dst
+ */
+static const uint32_t trampoline_arm[] = {
+    0xe1a03000,  /* mov  r3, r0       ; save dst  */
+    0xe3520000,  /* cmp  r2, #0                    */
+    0x0a000003,  /* beq  done                      */
+    /* loop: */
+    0xe4d14001,  /* ldrb r4, [r1], #1              */
+    0xe4c04001,  /* strb r4, [r0], #1              */
+    0xe2522001,  /* subs r2, r2, #1                */
+    0x1afffffb,  /* bne  loop                      */
+    /* done: */
+    0xe12fff13,  /* bx   r3           ; jump to dst */
+};
+
+/*
+ * CMD_SELFUPDATE: receive new agent binary, verify, copy and jump.
+ *
+ * Receives data to a staging area (1MB above load addr) to avoid
+ * overwriting the running code. After CRC verification, copies a
+ * small trampoline to the stack, which then copies staging → load
+ * addr and jumps to the new code.
  */
 static void handle_selfupdate(const uint8_t *data, uint32_t len) {
     if (len < 12) { proto_send_ack(ACK_CRC_ERROR); return; }
@@ -203,15 +240,17 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
     uint32_t size = read_le32(&data[4]);
     uint32_t expected_crc = read_le32(&data[8]);
 
-    /* Validate: must be in RAM, reasonable size */
     if (size == 0 || size > MAX_UPDATE_SIZE ||
         addr < RAM_BASE || (addr + size) <= addr) {
         proto_send_ack(ACK_FLASH_ERROR);
         return;
     }
 
-    uint8_t *dest = (uint8_t *)addr;
-    proto_send_ack(ACK_OK);  /* Ready to receive */
+    /* Stage 1MB above target to avoid overwriting running code */
+    uint32_t staging = addr + 0x100000;
+    uint8_t *dest = (uint8_t *)staging;
+
+    proto_send_ack(ACK_OK);
 
     uint32_t received = 0;
     uint8_t pkt[MAX_PAYLOAD + 16];
@@ -228,20 +267,27 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
         }
     }
 
-    /* Verify CRC32 of received data before jumping */
     uint32_t actual_crc = crc32(0, dest, size);
     if (actual_crc != expected_crc) {
         proto_send_ack(ACK_CRC_ERROR);
-        return;  /* Stay alive — don't jump to bad code */
+        return;
     }
 
     proto_send_ack(ACK_OK);
 
-    /* Flush UART, then jump */
+    /* Flush UART TX */
     for (volatile int i = 0; i < 100000; i++) {}
 
-    void (*entry)(void) = (void (*)(void))addr;
-    entry();
+    /* Copy trampoline to a fixed safe RAM location (RAM_BASE + 0x200)
+     * well below the agent code and stack. Then execute it. */
+    volatile uint32_t *tramp_dst = (volatile uint32_t *)(RAM_BASE + 0x200);
+    for (uint32_t i = 0; i < sizeof(trampoline_arm) / sizeof(uint32_t); i++)
+        tramp_dst[i] = trampoline_arm[i];
+
+    void (*tramp)(uint32_t, uint32_t, uint32_t) =
+        (void (*)(uint32_t, uint32_t, uint32_t))(void *)(RAM_BASE + 0x200);
+    tramp(addr, staging, size);
+    /* Never returns */
 }
 
 int main(void) {
