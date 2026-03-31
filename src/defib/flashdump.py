@@ -71,7 +71,9 @@ FLASH_SIZES = {
     "32MB": 0x2000000,
 }
 # How long to wait for sf read to complete (large flash can be slow)
-SF_READ_TIMEOUT = 30.0
+# sf read timeout: 16MB at SPI ~50MHz takes ~3s, but some chips/modes are
+# much slower. 120s handles even worst-case 1MHz SPI clock.
+SF_READ_TIMEOUT = 120.0
 # Regex for md.b output line
 MD_LINE_RE = re.compile(
     r"^([0-9a-fA-F]{8}):\s+"
@@ -377,9 +379,10 @@ async def dump_flash(
     cmd = f"sf read 0x{ram_addr:x} 0x0 0x{flash_size:x}"
     resp = await send_command(transport, cmd, timeout=SF_READ_TIMEOUT, wait_for="# ")
 
-    if "OK" not in resp and "ok" not in resp.lower():
-        if on_log:
-            on_log("Warning: sf read response unclear, proceeding with dump")
+    if "Read: OK" not in resp:
+        raise RuntimeError(
+            f"sf read failed or timed out. Response: {resp.strip()[-200:]}"
+        )
 
     # Sanity check: read first 16 bytes and verify they look like flash content.
     # Valid SPI NOR flash starts with ARM vectors (0xEA branch opcodes) or
