@@ -4,13 +4,10 @@ Uses a fake serial port (BytesIO-based) to simulate device responses
 without real hardware.
 """
 
-import asyncio
 import struct
-import time
 
 import pytest
 
-from defib.agent.cobs import encode
 from defib.agent.protocol import (
     ACK_OK,
     ACK_CRC_ERROR,
@@ -23,8 +20,6 @@ from defib.agent.protocol import (
     RSP_DATA,
     RSP_INFO,
     RSP_READY,
-    FRAME_DELIMITER,
-    MAX_PACKET_SIZE,
     build_packet,
     parse_packet,
     _recv_packet_sync,
