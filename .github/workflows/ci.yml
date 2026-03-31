@@ -66,6 +66,15 @@ jobs:
       - name: Mypy
         run: uv run mypy src/defib/ --ignore-missing-imports
 
+  agent-test:
+    name: Agent C Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run agent unit tests
+        run: make -C agent test HOST_CC=gcc
+
   js-test:
     name: JS Protocol Tests
     runs-on: ubuntu-latest

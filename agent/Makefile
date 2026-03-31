@@ -117,7 +117,7 @@ $(TARGET).bin: $(TARGET).elf
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f *.o *.elf *.bin
+	rm -f *.o *.elf *.bin test_agent
 
 # Build all supported SoCs
 all-socs:
@@ -126,4 +126,12 @@ all-socs:
 	$(MAKE) clean && $(MAKE) SOC=gk7205v200
 	$(MAKE) clean && $(MAKE) SOC=hi3516cv610
 
-.PHONY: all clean all-socs
+# Host-native unit tests (not cross-compiled)
+test: test_agent.c cobs.c protocol.c
+	$(HOST_CC) -Wall -Wextra -O2 -DUART_BASE=0 -DUART_CLOCK=24000000 \
+		-o test_agent test_agent.c cobs.c protocol.c
+	./test_agent
+
+HOST_CC ?= gcc
+
+.PHONY: all clean all-socs test
