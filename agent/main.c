@@ -288,6 +288,33 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
     /* Never returns */
 }
 
+/*
+ * CMD_SET_BAUD: change UART baud rate.
+ *   Host sends: CMD_SET_BAUD [baud_rate:4LE]
+ *   Agent ACKs at current baud, waits for TX to drain, switches.
+ *   Host should switch immediately after receiving the ACK.
+ */
+static void handle_set_baud(const uint8_t *data, uint32_t len) {
+    if (len < 4) { proto_send_ack(ACK_CRC_ERROR); return; }
+
+    uint32_t baud = read_le32(&data[0]);
+
+    /* Sanity check: reject absurd baud rates */
+    if (baud < 9600 || baud > 3000000) {
+        proto_send_ack(ACK_FLASH_ERROR);
+        return;
+    }
+
+    /* ACK at current baud rate so host knows we accepted */
+    proto_send_ack(ACK_OK);
+
+    /* Switch to new baud (uart_set_baud waits for TX drain) */
+    uart_set_baud(baud);
+
+    /* Drain any garbage from baud rate transition */
+    while (uart_readable()) uart_getc();
+}
+
 int main(void) {
     watchdog_disable();
     uart_init();
@@ -330,6 +357,9 @@ int main(void) {
                 break;
             case CMD_SELFUPDATE:
                 handle_selfupdate(cmd_buf, data_len);
+                break;
+            case CMD_SET_BAUD:
+                handle_set_baud(cmd_buf, data_len);
                 break;
             case CMD_REBOOT:
                 /* Trigger reset via watchdog */

@@ -19,6 +19,7 @@ from defib.agent.protocol import (
     CMD_READ,
     CMD_REBOOT,
     CMD_SELFUPDATE,
+    CMD_SET_BAUD,
     CMD_WRITE,
     RSP_ACK,
     RSP_CRC32,
@@ -261,6 +262,49 @@ class FlashAgentClient:
 
         cmd, resp = await recv_response(self._transport, timeout=10.0)
         return cmd == RSP_ACK and resp[0] == ACK_OK
+
+    async def set_baud(self, baud: int) -> bool:
+        """Switch UART to a higher baud rate.
+
+        Protocol: send SET_BAUD command, receive ACK at current baud,
+        then both sides switch. Verifies with INFO at new baud.
+        Falls back to original baud on failure.
+        """
+        import asyncio
+
+        port = getattr(self._transport, '_port', None)
+        if port is None:
+            logger.error("set_baud requires serial transport with _port")
+            return False
+
+        old_baud = port.baudrate
+        payload = struct.pack("<I", baud)
+        await send_packet(self._transport, CMD_SET_BAUD, payload)
+
+        cmd, resp = await recv_response(self._transport, timeout=5.0)
+        if cmd != RSP_ACK or resp[0] != ACK_OK:
+            logger.error("Agent rejected baud rate %d", baud)
+            return False
+
+        # Agent has switched — now switch host side
+        await asyncio.sleep(0.05)  # Brief pause for agent to complete switch
+        port.baudrate = baud
+
+        # Verify communication at new baud
+        await asyncio.sleep(0.05)
+        try:
+            await send_packet(self._transport, CMD_INFO)
+            cmd, data = await recv_response(self._transport, timeout=3.0)
+            if cmd == RSP_INFO:
+                logger.info("Baud rate switched to %d", baud)
+                return True
+        except Exception:
+            pass
+
+        # Failed — switch back
+        logger.warning("Verification at %d baud failed, reverting to %d", baud, old_baud)
+        port.baudrate = old_baud
+        return False
 
     async def reboot(self) -> None:
         """Tell the agent to reset the device."""

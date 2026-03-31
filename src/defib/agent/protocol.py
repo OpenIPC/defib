@@ -14,6 +14,7 @@ Commands (host → device):
   0x05  CRC32    — CRC32 of flash region: addr(4B LE) + size(4B LE)
   0x06  REBOOT   — Reset device
   0x07  SELFUPDATE — Update agent: addr(4B LE) + size(4B LE) + crc32(4B LE)
+  0x08  SET_BAUD   — Change baud rate: baud(4B LE)
 
 Responses (device → host):
   0x81  INFO_RSP — chip_id(4B) + flash_size(4B) + ram_base(4B)
@@ -39,6 +40,7 @@ CMD_ERASE = 0x04
 CMD_CRC32 = 0x05
 CMD_REBOOT = 0x06
 CMD_SELFUPDATE = 0x07
+CMD_SET_BAUD = 0x08
 
 # Responses
 RSP_INFO = 0x81

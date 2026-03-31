@@ -38,6 +38,29 @@ void uart_init(void) {
     uart_reg(UART_IMSC) = 0;
 }
 
+void uart_set_baud(uint32_t baud) {
+    /* Wait for TX FIFO to drain */
+    while (!(uart_reg(UART_FR) & UART_FR_TXFE)) {}
+    while (uart_reg(UART_FR) & UART_FR_BUSY) {}
+
+    /* Disable UART before changing baud */
+    uart_reg(UART_CR) = 0;
+
+    /* Recompute divisors: IBRD = clock / (16 * baud), FBRD = frac * 64 */
+    uint32_t divisor = UART_CLOCK / (16 * baud);
+    uint32_t remainder = UART_CLOCK % (16 * baud);
+    uint32_t frac = (remainder * 64 + (16 * baud) / 2) / (16 * baud);
+    uart_reg(UART_IBRD) = divisor;
+    uart_reg(UART_FBRD) = frac & 0x3F;
+
+    /* Must write LCR_H after baud rate to latch the divisors */
+    uart_reg(UART_LCR_H) = UART_LCR_WLEN8 | UART_LCR_FEN;
+
+    /* Re-enable */
+    uart_reg(UART_CR) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
+    uart_reg(UART_ICR) = 0x7FF;
+}
+
 void uart_putc(uint8_t ch) {
     /* Wait until TX FIFO has space, with timeout */
     volatile uint32_t timeout = 100000;
