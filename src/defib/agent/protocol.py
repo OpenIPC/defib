@@ -15,6 +15,7 @@ Commands (host → device):
   0x06  REBOOT   — Reset device
   0x07  SELFUPDATE — Update agent: addr(4B LE) + size(4B LE) + crc32(4B LE)
   0x08  SET_BAUD   — Change baud rate: baud(4B LE)
+  0x09  SCAN       — Scan flash health sector-by-sector
 
 Responses (device → host):
   0x81  INFO_RSP — chip_id(4B) + flash_size(4B) + ram_base(4B)
@@ -22,6 +23,7 @@ Responses (device → host):
   0x83  ACK      — status(1B): 0=OK, 1=CRC error, 2=flash error
   0x84  CRC32_RSP— crc32(4B LE)
   0x85  READY    — Agent is running and ready
+  0x86  SCAN_RSP — Sector scan results: [status:1B][crc32:4B] per sector
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ CMD_CRC32 = 0x05
 CMD_REBOOT = 0x06
 CMD_SELFUPDATE = 0x07
 CMD_SET_BAUD = 0x08
+CMD_SCAN = 0x09
 
 # Responses
 RSP_INFO = 0x81
@@ -48,6 +51,7 @@ RSP_DATA = 0x82
 RSP_ACK = 0x83
 RSP_CRC32 = 0x84
 RSP_READY = 0x85
+RSP_SCAN = 0x86
 
 # ACK status codes
 ACK_OK = 0x00

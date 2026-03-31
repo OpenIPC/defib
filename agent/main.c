@@ -335,6 +335,107 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
 }
 
 /*
+ * CMD_SCAN: scan flash health sector-by-sector.
+ *
+ * For each sector, computes CRC32 and checks for patterns (all-FF, all-same).
+ * Does a second CRC32 pass to detect unstable (degrading) sectors.
+ * Returns compact results: [status:1B][crc32:4B] per sector.
+ *
+ * Sector status:
+ *   0x00 = GOOD (non-trivial data, CRC stable)
+ *   0x01 = EMPTY (all 0xFF)
+ *   0x02 = STUCK_ZERO (all 0x00)
+ *   0x03 = STUCK_PATTERN (all same byte, not FF/00)
+ *   0x04 = UNSTABLE (CRC differs between two reads)
+ *   0x05 = READ_ERROR
+ */
+#define SCAN_GOOD         0x00
+#define SCAN_EMPTY        0x01
+#define SCAN_STUCK_ZERO   0x02
+#define SCAN_STUCK_PAT    0x03
+#define SCAN_UNSTABLE     0x04
+#define SCAN_READ_ERROR   0x05
+
+#define SCAN_BATCH_MAX    200  /* sectors per RSP_SCAN packet (200*5=1000 bytes) */
+
+static void handle_scan(const uint8_t *data __attribute__((unused)),
+                        uint32_t len __attribute__((unused))) {
+    if (!flash_readable) {
+        proto_send_ack(ACK_FLASH_ERROR);
+        return;
+    }
+
+    uint32_t sector_sz = flash_info.sector_size;
+    if (sector_sz == 0) sector_sz = 0x10000;
+    uint32_t num_sectors = flash_info.size / sector_sz;
+    if (num_sectors == 0) {
+        proto_send_ack(ACK_FLASH_ERROR);
+        return;
+    }
+
+    /* Send header: sector count */
+    uint8_t header[4];
+    write_le32(header, num_sectors);
+    proto_send(RSP_SCAN, header, 4);
+
+    /* Process sectors in batches */
+    uint8_t result_buf[SCAN_BATCH_MAX * 5];
+    uint32_t buf_idx = 0;
+
+    for (uint32_t s = 0; s < num_sectors; s++) {
+        const uint8_t *ptr = (const uint8_t *)(FLASH_MEM + s * sector_sz);
+        uint8_t status = SCAN_GOOD;
+
+        proto_drain_fifo();
+
+        /* Pass 1: CRC32 */
+        uint32_t crc1 = crc32(0, ptr, sector_sz);
+
+        proto_drain_fifo();
+
+        /* Pattern check: sample first byte, scan for uniformity */
+        uint8_t first = ptr[0];
+        int all_ff = (first == 0xFF);
+        int all_same = 1;
+
+        for (uint32_t i = 1; i < sector_sz; i++) {
+            uint8_t b = ptr[i];
+            if (b != 0xFF) all_ff = 0;
+            if (b != first) all_same = 0;
+            if (!all_ff && !all_same) break;
+        }
+
+        if (all_ff) {
+            status = SCAN_EMPTY;
+        } else if (all_same && first == 0x00) {
+            status = SCAN_STUCK_ZERO;
+        } else if (all_same) {
+            status = SCAN_STUCK_PAT;
+        } else {
+            /* Pass 2: stability check — re-read CRC */
+            proto_drain_fifo();
+            uint32_t crc2 = crc32(0, ptr, sector_sz);
+            if (crc2 != crc1) status = SCAN_UNSTABLE;
+        }
+
+        /* Pack result: [status:1][crc32:4] */
+        result_buf[buf_idx++] = status;
+        write_le32(&result_buf[buf_idx], crc1);
+        buf_idx += 4;
+
+        proto_drain_fifo();
+
+        /* Flush batch when full or last sector */
+        if (buf_idx >= SCAN_BATCH_MAX * 5 || s == num_sectors - 1) {
+            proto_send(RSP_SCAN, result_buf, buf_idx);
+            buf_idx = 0;
+        }
+    }
+
+    proto_send_ack(ACK_OK);
+}
+
+/*
  * CMD_SET_BAUD: change UART baud rate.
  *   Host sends: CMD_SET_BAUD [baud_rate:4LE]
  *   Agent ACKs at current baud, waits for TX to drain, switches.
@@ -381,6 +482,7 @@ static void handle_set_baud(const uint8_t *data, uint32_t len) {
             case CMD_READ:  handle_read(pkt, pkt_len); break;
             case CMD_WRITE: handle_write(pkt, pkt_len); break;
             case CMD_CRC32: handle_crc32_cmd(pkt, pkt_len); break;
+            case CMD_SCAN:  handle_scan(pkt, pkt_len); break;
             default:        proto_send_ack(ACK_OK); break;
         }
     }
@@ -444,6 +546,9 @@ int main(void) {
                 break;
             case CMD_SELFUPDATE:
                 handle_selfupdate(cmd_buf, data_len);
+                break;
+            case CMD_SCAN:
+                handle_scan(cmd_buf, data_len);
                 break;
             case CMD_SET_BAUD:
                 handle_set_baud(cmd_buf, data_len);
