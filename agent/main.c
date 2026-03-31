@@ -288,6 +288,58 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
     /* Never returns */
 }
 
+/*
+ * CMD_SET_BAUD: change UART baud rate.
+ *   Host sends: CMD_SET_BAUD [baud_rate:4LE]
+ *   Agent ACKs at current baud, waits for TX to drain, switches.
+ *   Host should switch immediately after receiving the ACK.
+ */
+static int at_default_baud = 1;
+
+static void handle_set_baud(const uint8_t *data, uint32_t len) {
+    if (len < 4) { proto_send_ack(ACK_CRC_ERROR); return; }
+
+    uint32_t baud = read_le32(&data[0]);
+
+    /* Sanity check: reject absurd baud rates */
+    if (baud < 9600 || baud > 3000000) {
+        proto_send_ack(ACK_FLASH_ERROR);
+        return;
+    }
+
+    /* ACK at current baud rate so host knows we accepted */
+    proto_send_ack(ACK_OK);
+
+    /* Switch to new baud (uart_set_baud waits for TX drain) */
+    uart_set_baud(baud);
+
+    /* Drain any garbage from baud rate transition */
+    while (uart_readable()) uart_getc();
+
+    /* Wait for host to confirm with any valid command within 3 seconds.
+     * If nothing arrives, revert to 115200 — the host may have failed
+     * to switch or the new baud rate doesn't work on this link. */
+    uint8_t pkt[MAX_PAYLOAD + 16];
+    uint32_t pkt_len = 0;
+    uint8_t cmd = proto_recv(pkt, &pkt_len, 3000);
+    if (cmd == 0) {
+        /* No valid command — revert */
+        uart_set_baud(115200);
+        while (uart_readable()) uart_getc();
+        at_default_baud = 1;
+    } else {
+        /* Got a valid command at new baud — confirmed working */
+        at_default_baud = (baud == 115200);
+        switch (cmd) {
+            case CMD_INFO:  handle_info(); break;
+            case CMD_READ:  handle_read(pkt, pkt_len); break;
+            case CMD_WRITE: handle_write(pkt, pkt_len); break;
+            case CMD_CRC32: handle_crc32_cmd(pkt, pkt_len); break;
+            default:        proto_send_ack(ACK_OK); break;
+        }
+    }
+}
+
 int main(void) {
     watchdog_disable();
     uart_init();
@@ -298,22 +350,33 @@ int main(void) {
     proto_send_ready();
 
     uint32_t idle_count = 0;
+    uint32_t baud_idle = 0;
+    at_default_baud = 1;
     while (1) {
         uint32_t data_len = 0;
         uint8_t cmd = proto_recv(cmd_buf, &data_len, 500);
 
         if (cmd == 0) {
             idle_count++;
-            /* Send READY every ~2s (4 x 500ms) so host can detect us
-             * after reconnect. Suppress briefly after a command to
-             * avoid interfering with multi-packet responses. */
             if (idle_count >= 4) {
                 proto_send_ready();
                 idle_count = 0;
             }
+            /* If at non-default baud and idle for ~10s (20 x 500ms),
+             * revert to 115200. Host may have disconnected. */
+            if (!at_default_baud) {
+                baud_idle++;
+                if (baud_idle >= 20) {
+                    uart_set_baud(115200);
+                    while (uart_readable()) uart_getc();
+                    at_default_baud = 1;
+                    baud_idle = 0;
+                }
+            }
             continue;
         }
         idle_count = 0;
+        baud_idle = 0;
 
         switch (cmd) {
             case CMD_INFO:
@@ -330,6 +393,9 @@ int main(void) {
                 break;
             case CMD_SELFUPDATE:
                 handle_selfupdate(cmd_buf, data_len);
+                break;
+            case CMD_SET_BAUD:
+                handle_set_baud(cmd_buf, data_len);
                 break;
             case CMD_REBOOT:
                 /* Trigger reset via watchdog */

@@ -15,6 +15,7 @@
 #define CMD_CRC32   0x05
 #define CMD_REBOOT      0x06
 #define CMD_SELFUPDATE  0x07
+#define CMD_SET_BAUD    0x08
 
 /* Responses (device → host) */
 #define RSP_INFO    0x81

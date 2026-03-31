@@ -19,6 +19,7 @@ from defib.agent.protocol import (
     CMD_READ,
     CMD_REBOOT,
     CMD_SELFUPDATE,
+    CMD_SET_BAUD,
     CMD_WRITE,
     RSP_ACK,
     RSP_CRC32,
@@ -35,10 +36,15 @@ from defib.transport.base import Transport
 logger = logging.getLogger(__name__)
 
 # Max bytes per WRITE transfer before PL011 FIFO overflow on uncached DDR.
-# Agent processes COBS+CRC between packets; at 115200 baud with no D-cache,
-# cumulative FIFO overflow occurs after ~30-60KB of continuous streaming.
 WRITE_CHUNK_SIZE = 512
 WRITE_MAX_TRANSFER = 16 * 1024
+
+# Optimal baud rate from hi3516ev300 + FT232R benchmarks.
+# 921600 is the highest rate verified for both READ and WRITE with
+# CRC32 integrity on real hardware. 1152000 works for READ-only but
+# WRITE is marginal. Single rate avoids unnecessary switching.
+DEFAULT_FAST_BAUD = 921600    # ~82 KB/s both directions
+FALLBACK_BAUD = 115200        # Always works
 
 
 def get_agent_binary(chip: str) -> Path | None:
@@ -87,6 +93,7 @@ class FlashAgentClient:
         self._flash_size = 0
         self._ram_base = 0
         self._sector_size = 0x10000
+        self._current_baud = FALLBACK_BAUD
 
     @property
     def connected(self) -> bool:
@@ -104,6 +111,22 @@ class FlashAgentClient:
         """Wait for agent READY packet."""
         self._connected = await wait_for_ready(self._transport, timeout)
         return self._connected
+
+    async def _switch_baud(self, target: int) -> bool:
+        """Switch to target baud if not already there. Returns success."""
+        if self._current_baud == target:
+            return True
+        ok = await self.set_baud(target)
+        if ok:
+            self._current_baud = target
+        return ok
+
+    async def _restore_baud(self) -> None:
+        """Return to fallback baud rate."""
+        if self._current_baud != FALLBACK_BAUD:
+            ok = await self.set_baud(FALLBACK_BAUD)
+            if ok:
+                self._current_baud = FALLBACK_BAUD
 
     async def get_info(self) -> dict[str, int | str]:
         """Request device info from the agent."""
@@ -133,8 +156,16 @@ class FlashAgentClient:
         addr: int,
         size: int,
         on_progress: Callable[[int, int], None] | None = None,
+        fast: bool = True,
     ) -> bytes:
-        """Read a memory region from the device. Returns bytes."""
+        """Read a memory region from the device. Returns bytes.
+
+        If fast=True and size > 4KB, switches to DEFAULT_FAST_BAUD,
+        falling back to FALLBACK_BAUD if the switch fails.
+        """
+        if fast and size > 4096:
+            await self._switch_baud(DEFAULT_FAST_BAUD)
+
         payload = struct.pack("<II", addr, size)
         await send_packet(self._transport, CMD_READ, payload)
 
@@ -171,12 +202,17 @@ class FlashAgentClient:
         addr: int,
         data: bytes,
         on_progress: Callable[[int, int], None] | None = None,
+        fast: bool = True,
     ) -> bool:
         """Write data to device RAM in chunked transfers.
 
+        If fast=True and data > 4KB, switches to DEFAULT_FAST_BAUD.
         Splits into WRITE_MAX_TRANSFER-sized blocks to avoid PL011 FIFO
         overflow on uncached DDR. Each block uses WRITE_CHUNK_SIZE packets.
         """
+        if fast and len(data) > 4096:
+            await self._switch_baud(DEFAULT_FAST_BAUD)
+
         total = len(data)
         offset = 0
 
@@ -261,6 +297,49 @@ class FlashAgentClient:
 
         cmd, resp = await recv_response(self._transport, timeout=10.0)
         return cmd == RSP_ACK and resp[0] == ACK_OK
+
+    async def set_baud(self, baud: int) -> bool:
+        """Switch UART to a higher baud rate.
+
+        Protocol: send SET_BAUD command, receive ACK at current baud,
+        then both sides switch. Verifies with INFO at new baud.
+        Falls back to original baud on failure.
+        """
+        import asyncio
+
+        port = getattr(self._transport, '_port', None)
+        if port is None:
+            logger.error("set_baud requires serial transport with _port")
+            return False
+
+        old_baud = port.baudrate
+        payload = struct.pack("<I", baud)
+        await send_packet(self._transport, CMD_SET_BAUD, payload)
+
+        cmd, resp = await recv_response(self._transport, timeout=5.0)
+        if cmd != RSP_ACK or resp[0] != ACK_OK:
+            logger.error("Agent rejected baud rate %d", baud)
+            return False
+
+        # Agent has switched — now switch host side
+        await asyncio.sleep(0.05)  # Brief pause for agent to complete switch
+        port.baudrate = baud
+
+        # Verify communication at new baud
+        await asyncio.sleep(0.05)
+        try:
+            await send_packet(self._transport, CMD_INFO)
+            cmd, data = await recv_response(self._transport, timeout=3.0)
+            if cmd == RSP_INFO:
+                logger.info("Baud rate switched to %d", baud)
+                return True
+        except Exception:
+            pass
+
+        # Failed — switch back
+        logger.warning("Verification at %d baud failed, reverting to %d", baud, old_baud)
+        port.baudrate = old_baud
+        return False
 
     async def reboot(self) -> None:
         """Tell the agent to reset the device."""

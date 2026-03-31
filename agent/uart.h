@@ -59,6 +59,7 @@
 #define uart_reg(off)   (*(volatile uint32_t *)(UART_BASE + (off)))
 
 void uart_init(void);
+void uart_set_baud(uint32_t baud);
 void uart_putc(uint8_t ch);
 int uart_putc_safe(uint8_t ch);
 uint8_t uart_getc(void);
