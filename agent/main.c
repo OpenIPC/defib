@@ -6,6 +6,9 @@
 #include <stdint.h>
 #include "uart.h"
 #include "protocol.h"
+#include "spi_flash.h"
+
+static flash_info_t flash_info;
 
 /* --- Diagnostic: data abort handler --- */
 
@@ -103,8 +106,12 @@ static int addr_readable(uint32_t addr, uint32_t size) {
 
 static void handle_info(void) {
     uint8_t resp[16];
-    write_le32(&resp[0], 0);
-    write_le32(&resp[4], 0x1000000);   /* 16MB default flash */
+    /* JEDEC ID in first 4 bytes (3 bytes + padding) */
+    resp[0] = flash_info.jedec_id[0];
+    resp[1] = flash_info.jedec_id[1];
+    resp[2] = flash_info.jedec_id[2];
+    resp[3] = 0;
+    write_le32(&resp[4], flash_info.size);
     write_le32(&resp[8], RAM_BASE);
     write_le32(&resp[12], 0x10000);    /* 64KB sector */
     proto_send(RSP_INFO, resp, 16);
@@ -385,6 +392,11 @@ int main(void) {
 
     /* Drain any stale bytes left in UART RX FIFO from boot protocol */
     while (uart_readable()) uart_getc();
+
+    /* Initialize flash controller — enables memory-mapped reads */
+    if (flash_init(&flash_info) == 0) {
+        flash_readable = 1;
+    }
 
     proto_send_ready();
 
