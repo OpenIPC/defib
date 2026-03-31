@@ -22,13 +22,36 @@ _vectors:
     b       _exc_hang           /* Undefined instruction */
     b       _exc_hang           /* SWI */
     b       _exc_hang           /* Prefetch abort */
-    b       _exc_hang           /* Data abort */
+    b       _data_abort         /* Data abort */
     b       _exc_hang           /* Reserved */
     b       _exc_hang           /* IRQ */
     b       _exc_hang           /* FIQ */
 
 _exc_hang:
-    /* Exception: just loop (don't reset!) */
+    b       _exc_hang
+
+/*
+ * Data abort handler — prints fault info over UART before hanging.
+ * On entry (ABT mode): LR_abt = faulting instruction + 8.
+ * We must NOT use the stack (SP_abt is uninitialized).
+ * Instead, read CP15 regs and call handler using SVC stack.
+ */
+    .global _data_abort
+_data_abort:
+    sub     lr, lr, #8              /* LR = faulting PC */
+
+    /* Read fault info into r0-r2 (caller-saved, safe to clobber) */
+    mrc     p15, 0, r0, c6, c0, 0  /* r0 = DFAR (fault address) */
+    mrc     p15, 0, r1, c5, c0, 0  /* r1 = DFSR (fault status) */
+    mov     r2, lr                  /* r2 = faulting PC */
+
+    /* Switch to SVC mode (which has a valid stack) with IRQ/FIQ disabled */
+    cps     #0x13                   /* SVC mode */
+
+    push    {r0-r3, lr}
+    bl      data_abort_handler
+    pop     {r0-r3, lr}
+
     b       _exc_hang
 
 _start_code:
