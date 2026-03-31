@@ -171,7 +171,7 @@ static void handle_write(const uint8_t *data, uint32_t len) {
             uint32_t chunk = pkt_len - 2;
             for (uint32_t i = 0; i < chunk && received < size; i++)
                 dest[received++] = pkt[2 + i];
-            /* No per-packet ACK — continuous receive for throughput */
+            /* No per-packet ACK — continuous streaming for throughput */
         } else if (cmd == 0) {
             uint8_t err[5];
             err[0] = ACK_FLASH_ERROR;

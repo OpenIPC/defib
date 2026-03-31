@@ -14,24 +14,23 @@ static void delay_us(uint32_t us) {
 }
 
 void uart_init(void) {
-    /* UART is already configured by bootrom. Just ensure it's enabled. */
-    uint32_t cr = uart_reg(UART_CR);
-    if (!(cr & UART_CR_UARTEN)) {
-        /* Disable UART first */
-        uart_reg(UART_CR) = 0;
+    /* Always reconfigure UART to known-good state.
+     * Bootrom/SPL may have left loopback or other flags set. */
 
-        /* Set baud rate: divisor = clock / (16 * baud) */
-        uint32_t divisor = UART_CLOCK / (16 * UART_BAUD);
-        uint32_t frac = ((UART_CLOCK % (16 * UART_BAUD)) * 64 + (16 * UART_BAUD) / 2) / (16 * UART_BAUD);
-        uart_reg(UART_IBRD) = divisor;
-        uart_reg(UART_FBRD) = frac & 0x3F;
+    /* Disable UART first (required before changing config) */
+    uart_reg(UART_CR) = 0;
 
-        /* 8N1, FIFO enabled */
-        uart_reg(UART_LCR_H) = UART_LCR_WLEN8 | UART_LCR_FEN;
+    /* Set baud rate: divisor = clock / (16 * baud) */
+    uint32_t divisor = UART_CLOCK / (16 * UART_BAUD);
+    uint32_t frac = ((UART_CLOCK % (16 * UART_BAUD)) * 64 + (16 * UART_BAUD) / 2) / (16 * UART_BAUD);
+    uart_reg(UART_IBRD) = divisor;
+    uart_reg(UART_FBRD) = frac & 0x3F;
 
-        /* Enable UART, TX, RX */
-        uart_reg(UART_CR) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
-    }
+    /* 8N1, FIFO enabled */
+    uart_reg(UART_LCR_H) = UART_LCR_WLEN8 | UART_LCR_FEN;
+
+    /* Enable UART, TX, RX — explicitly NO loopback (bit 7 = 0) */
+    uart_reg(UART_CR) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
 
     /* Clear any pending interrupts */
     uart_reg(UART_ICR) = 0x7FF;
