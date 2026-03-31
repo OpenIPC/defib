@@ -13,8 +13,10 @@ import pytest
 from defib.agent.cobs import encode
 from defib.agent.protocol import (
     ACK_OK,
+    ACK_CRC_ERROR,
     CMD_INFO,
     CMD_READ,
+    CMD_SELFUPDATE,
     RSP_ACK,
     RSP_CRC32,
     RSP_DATA,
@@ -347,3 +349,108 @@ class TestCRC32Packet:
         cmd, data = parse_packet(pkt[:-1])
         assert cmd == RSP_CRC32
         assert struct.unpack("<I", data)[0] == crc_val
+
+
+# ---------------------------------------------------------------------------
+# Tests: SELFUPDATE command
+# ---------------------------------------------------------------------------
+
+class TestSelfUpdate:
+    def test_selfupdate_packet_format(self):
+        """SELFUPDATE command includes addr + size + expected CRC32."""
+        import zlib
+        addr = 0x41000000
+        firmware = b"\xAA" * 256
+        expected_crc = zlib.crc32(firmware) & 0xFFFFFFFF
+        payload = struct.pack("<III", addr, len(firmware), expected_crc)
+        pkt = build_packet(CMD_SELFUPDATE, payload)
+
+        cmd, data = parse_packet(pkt[:-1])
+        assert cmd == CMD_SELFUPDATE
+        a, s, c = struct.unpack("<III", data)
+        assert a == addr
+        assert s == 256
+        assert c == expected_crc
+
+    @pytest.mark.asyncio
+    async def test_selfupdate_sends_correct_payload(self):
+        """Host sends SELFUPDATE with addr, size, CRC32."""
+        import zlib
+        port = FakePort()
+        transport = FakeTransport(port)
+
+        firmware = bytes(range(128)) * 2  # 256 bytes
+        addr = 0x41000000
+        expected_crc = zlib.crc32(firmware) & 0xFFFFFFFF
+        payload = struct.pack("<III", addr, len(firmware), expected_crc)
+
+        await send_packet(transport, CMD_SELFUPDATE, payload)
+        tx = port.tx_data
+        cmd, data = parse_packet(tx[:-1])
+        assert cmd == CMD_SELFUPDATE
+        a, s, c = struct.unpack("<III", data)
+        assert a == addr
+        assert s == len(firmware)
+        assert c == expected_crc
+
+    @pytest.mark.asyncio
+    async def test_selfupdate_data_transfer(self):
+        """Simulate full SELFUPDATE: command → ACK → data packets → ACK."""
+        port = FakePort()
+        transport = FakeTransport(port)
+
+        # Simulate device ACK (ready to receive)
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_OK])))
+
+        cmd, data = await recv_packet(transport, timeout=1.0)
+        assert cmd == RSP_ACK
+        assert data[0] == ACK_OK
+
+        # Send data packets
+        firmware = b"\xBB" * 300
+        offset = 0
+        seq = 0
+        while offset < len(firmware):
+            chunk = min(100, len(firmware) - offset)
+            pkt = struct.pack("<H", seq) + firmware[offset:offset+chunk]
+            await send_packet(transport, RSP_DATA, pkt)
+            offset += chunk
+            seq += 1
+
+        assert seq == 3
+        # Verify all data packets were sent
+        assert len(port.tx_data) > 0
+
+    @pytest.mark.asyncio
+    async def test_selfupdate_crc_mismatch_returns_error(self):
+        """Device should NAK with CRC_ERROR if verification fails."""
+        port = FakePort()
+        transport = FakeTransport(port)
+
+        # Simulate device rejecting bad CRC
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_CRC_ERROR])))
+
+        cmd, data = await recv_packet(transport, timeout=1.0)
+        assert cmd == RSP_ACK
+        assert data[0] == ACK_CRC_ERROR
+
+    @pytest.mark.asyncio
+    async def test_selfupdate_success_flow(self):
+        """Full success flow: ACK(ready) → data → ACK(ok)."""
+        port = FakePort()
+        transport = FakeTransport(port)
+
+        # Device: ACK ready, then after data, ACK ok
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_OK])))
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_OK])))
+
+        # Read first ACK (ready)
+        cmd, data = await recv_packet(transport, timeout=1.0)
+        assert cmd == RSP_ACK and data[0] == ACK_OK
+
+        # Send some data
+        await send_packet(transport, RSP_DATA, struct.pack("<H", 0) + b"\xFF" * 100)
+
+        # Read final ACK (verified)
+        cmd, data = await recv_packet(transport, timeout=1.0)
+        assert cmd == RSP_ACK and data[0] == ACK_OK
