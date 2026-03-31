@@ -157,7 +157,7 @@ def _recv_packet_sync(port: object, timeout: float) -> tuple[int, bytes]:
     import time
     portbuf = _get_port_buf(port)
     frame = bytearray()
-    old_timeout = port.timeout  # type: ignore[union-attr]
+    old_timeout = port.timeout  # type: ignore[attr-defined]
     deadline = time.monotonic() + timeout
 
     def _process_byte(b: int) -> tuple[int, bytes] | None:
@@ -196,21 +196,21 @@ def _recv_packet_sync(port: object, timeout: float) -> tuple[int, bytes]:
                 return result
 
         while time.monotonic() < deadline:
-            waiting = port.in_waiting  # type: ignore[union-attr]
+            waiting = port.in_waiting  # type: ignore[attr-defined]
             if waiting > 0:
-                data = port.read(waiting)  # type: ignore[union-attr]
+                data = port.read(waiting)  # type: ignore[attr-defined]
             else:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                port.timeout = min(remaining, 0.1)  # type: ignore[union-attr]
-                data = port.read(1)  # type: ignore[union-attr]
+                port.timeout = min(remaining, 0.1)  # type: ignore[attr-defined]
+                data = port.read(1)  # type: ignore[attr-defined]
             if data:
                 result = _drain(data)
                 if result is not None:
                     return result
     finally:
-        port.timeout = old_timeout  # type: ignore[union-attr]
+        port.timeout = old_timeout  # type: ignore[attr-defined]
 
     raise TransportTimeout(f"No packet received within {timeout}s")
 
