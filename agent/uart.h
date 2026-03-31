@@ -18,8 +18,15 @@
 #define UART_FBRD       0x28    /* Fractional baud rate divisor */
 #define UART_LCR_H      0x2C    /* Line control */
 #define UART_CR         0x30    /* Control register */
-#define UART_IMSC       0x38    /* Interrupt mask */
+#define UART_IFLS       0x34    /* Interrupt FIFO level select */
+#define UART_IMSC       0x38    /* Interrupt mask set/clear */
+#define UART_RIS        0x3C    /* Raw interrupt status */
+#define UART_MIS        0x40    /* Masked interrupt status */
 #define UART_ICR        0x44    /* Interrupt clear */
+
+/* Interrupt bits */
+#define UART_INT_RX     (1 << 4)    /* RX interrupt */
+#define UART_INT_RT     (1 << 6)    /* RX timeout interrupt */
 
 /* Data register error bits (read) */
 #define UART_DR_FE      (1 << 8)    /* Framing error */

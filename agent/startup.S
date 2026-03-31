@@ -23,7 +23,7 @@ _vectors:
     b       _exc_hang           /* Prefetch abort */
     b       _data_abort         /* Data abort */
     b       _exc_hang           /* Reserved */
-    b       _exc_hang           /* IRQ */
+    b       _irq_handler        /* IRQ */
     b       _exc_hang           /* FIQ */
 
 _exc_hang:
@@ -43,6 +43,29 @@ _data_abort:
     bl      data_abort_handler
     pop     {r0-r3, lr}
     b       _exc_hang
+
+/*
+ * IRQ handler — saves context, calls uart_irq_handler, acknowledges GIC.
+ */
+    .global _irq_handler
+_irq_handler:
+    sub     lr, lr, #4              /* Return address */
+    push    {r0-r3, r12, lr}
+
+    /* Read GIC IAR to acknowledge interrupt */
+    ldr     r0, =0x10302000         /* GIC_CPU_BASE */
+    ldr     r1, [r0, #0x0C]        /* GICC_IAR */
+
+    /* Call UART IRQ handler */
+    push    {r0, r1}
+    bl      uart_irq_handler
+    pop     {r0, r1}
+
+    /* Write EOIR to signal end of interrupt */
+    str     r1, [r0, #0x10]         /* GICC_EOIR */
+
+    pop     {r0-r3, r12, lr}
+    movs    pc, lr                  /* Return from IRQ, restore CPSR */
 
 _start_code:
     /* Set VBAR to our vector table */
@@ -167,6 +190,17 @@ pt_fill_ddr:
     mcr     p15, 0, r0, c1, c0, 0
     dsb
     isb
+
+    /* Set up IRQ mode stack (needed for IRQ handler context save) */
+    cps     #0x12                  /* IRQ mode */
+    ldr     sp, =_start
+    sub     sp, sp, #0x5000        /* 4KB below SVC stack */
+    cps     #0x13                  /* Back to SVC mode */
+
+    /* Enable IRQ (clear I bit in CPSR), keep FIQ disabled */
+    mrs     r0, cpsr
+    bic     r0, r0, #0x80          /* Clear IRQ disable bit */
+    msr     cpsr_c, r0
 
     /* Jump to C main */
     bl      main

@@ -3,7 +3,6 @@
  */
 
 #include "cobs.h"
-#include "protocol.h"
 
 uint32_t cobs_encode(const uint8_t *input, uint32_t len, uint8_t *output) {
     uint32_t out_idx = 0;
