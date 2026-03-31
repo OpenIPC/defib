@@ -360,6 +360,16 @@ async def dump_flash(
             )
 
     size_mb = flash_size / (1024 * 1024)
+
+    # Always run sf probe before sf read — even if we already know the
+    # flash size from boot log. Without sf probe, the SPI flash subsystem
+    # isn't initialized and sf read silently writes nothing to RAM.
+    if on_log:
+        on_log("Initializing SPI flash...")
+    probe_resp = await send_command(transport, "sf probe 0", timeout=5.0, wait_for="# ")
+    if "error" in probe_resp.lower() or "fail" in probe_resp.lower():
+        raise RuntimeError(f"sf probe failed: {probe_resp.strip()}")
+
     if on_log:
         on_log(f"Reading {size_mb:.0f}MB flash into RAM at 0x{ram_addr:08x}...")
 
