@@ -191,35 +191,30 @@ int main(void) {
 
     proto_send_ready();
 
-    int first_cmd = 0;
-    uint32_t heartbeat = 0;
+    uint32_t idle_count = 0;
     while (1) {
-        /* Beacon BEFORE recv — proves we enter the loop */
-        uart_putc('*');
-
         uint32_t data_len = 0;
         uint8_t cmd = proto_recv(cmd_buf, &data_len, 500);
 
         if (cmd == 0) {
-            uart_putc('.');
-            heartbeat++;
-            if (!first_cmd) {
+            idle_count++;
+            /* Send READY every ~2s (4 x 500ms) so host can detect us
+             * after reconnect. Suppress briefly after a command to
+             * avoid interfering with multi-packet responses. */
+            if (idle_count >= 4) {
                 proto_send_ready();
+                idle_count = 0;
             }
             continue;
         }
-        first_cmd = 1;
-
-        uart_putc('[');  /* Beacon: command received */
+        idle_count = 0;
 
         switch (cmd) {
             case CMD_INFO:
                 handle_info();
                 break;
             case CMD_READ:
-                uart_putc('R');  /* Beacon: entering READ */
                 handle_read(cmd_buf, data_len);
-                uart_putc('r');  /* Beacon: READ done */
                 break;
             case CMD_CRC32:
                 handle_crc32_cmd(cmd_buf, data_len);
