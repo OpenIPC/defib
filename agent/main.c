@@ -356,7 +356,7 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
 #define SCAN_UNSTABLE     0x04
 #define SCAN_READ_ERROR   0x05
 
-#define SCAN_BATCH_MAX    200  /* sectors per RSP_SCAN packet (200*5=1000 bytes) */
+#define SCAN_BATCH_MAX    8  /* sectors per RSP_SCAN packet — small for live progress */
 
 static void handle_scan(const uint8_t *data __attribute__((unused)),
                         uint32_t len __attribute__((unused))) {
