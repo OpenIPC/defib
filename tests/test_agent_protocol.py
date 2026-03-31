@@ -17,6 +17,7 @@ from defib.agent.protocol import (
     CMD_INFO,
     CMD_READ,
     CMD_SELFUPDATE,
+    CMD_WRITE,
     RSP_ACK,
     RSP_CRC32,
     RSP_DATA,
@@ -454,3 +455,77 @@ class TestSelfUpdate:
         # Read final ACK (verified)
         cmd, data = await recv_packet(transport, timeout=1.0)
         assert cmd == RSP_ACK and data[0] == ACK_OK
+
+
+# ---------------------------------------------------------------------------
+# Tests: WRITE command (host→device data transfer)
+# ---------------------------------------------------------------------------
+
+class TestWrite:
+    def test_write_packet_format(self):
+        """WRITE command includes addr + size + expected CRC32."""
+        import zlib
+        addr = 0x40200000
+        data = b"\xAA" * 4096
+        expected_crc = zlib.crc32(data) & 0xFFFFFFFF
+        payload = struct.pack("<III", addr, len(data), expected_crc)
+        pkt = build_packet(CMD_WRITE, payload)
+
+        cmd, parsed = parse_packet(pkt[:-1])
+        assert cmd == CMD_WRITE
+        a, s, c = struct.unpack("<III", parsed)
+        assert a == addr
+        assert s == 4096
+        assert c == expected_crc
+
+    @pytest.mark.asyncio
+    async def test_write_success_flow(self):
+        """Full WRITE: command → ACK(ready) → data packets → ACK(ok)."""
+        port = FakePort()
+        transport = FakeTransport(port)
+
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_OK])))  # ready
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_OK])))  # verified
+
+        # Send WRITE command
+        import zlib
+        data = bytes(range(256)) * 4  # 1024 bytes
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        payload = struct.pack("<III", 0x40200000, len(data), crc)
+        await send_packet(transport, CMD_WRITE, payload)
+
+        # Read ACK (ready)
+        cmd, resp = await recv_packet(transport, timeout=1.0)
+        assert cmd == RSP_ACK and resp[0] == ACK_OK
+
+        # Send data
+        offset = 0
+        seq = 0
+        while offset < len(data):
+            chunk = min(1022, len(data) - offset)
+            pkt = struct.pack("<H", seq) + data[offset:offset+chunk]
+            await send_packet(transport, RSP_DATA, pkt)
+            offset += chunk
+            seq += 1
+
+        # Read final ACK
+        cmd, resp = await recv_packet(transport, timeout=1.0)
+        assert cmd == RSP_ACK and resp[0] == ACK_OK
+
+    @pytest.mark.asyncio
+    async def test_write_crc_mismatch_rejected(self):
+        """WRITE with bad CRC should be rejected, agent stays alive."""
+        port = FakePort()
+        transport = FakeTransport(port)
+
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_OK])))       # ready
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_CRC_ERROR])))  # bad CRC
+
+        cmd, resp = await recv_packet(transport, timeout=1.0)
+        assert cmd == RSP_ACK and resp[0] == ACK_OK
+
+        # Send garbage data
+        await send_packet(transport, RSP_DATA, struct.pack("<H", 0) + b"\x00" * 100)
+
+        cmd, resp = await recv_packet(transport, timeout=1.0)
+        assert cmd == RSP_ACK and resp[0] == ACK_CRC_ERROR

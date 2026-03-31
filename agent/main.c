@@ -138,6 +138,56 @@ static void handle_crc32_cmd(const uint8_t *data, uint32_t len) {
 }
 
 /*
+ * CMD_WRITE: receive data from host and write to RAM (or flash later).
+ *
+ * Protocol:
+ *   Host sends: CMD_WRITE [addr:4LE] [size:4LE] [expected_crc:4LE]
+ *   Agent ACKs ready, then receives RSP_DATA packets.
+ *   After all data, verifies CRC32. ACKs OK or CRC_ERROR.
+ */
+static void handle_write(const uint8_t *data, uint32_t len) {
+    if (len < 12) { proto_send_ack(ACK_CRC_ERROR); return; }
+
+    uint32_t addr = read_le32(&data[0]);
+    uint32_t size = read_le32(&data[4]);
+    uint32_t expected_crc = read_le32(&data[8]);
+
+    /* Validate: must be in writable RAM, reasonable size */
+    if (size == 0 || size > MAX_READ_SIZE ||
+        addr < RAM_BASE || (addr + size) <= addr) {
+        proto_send_ack(ACK_FLASH_ERROR);
+        return;
+    }
+
+    uint8_t *dest = (uint8_t *)addr;
+    proto_send_ack(ACK_OK);  /* Ready to receive */
+
+    uint32_t received = 0;
+    uint8_t pkt[MAX_PAYLOAD + 16];
+    while (received < size) {
+        uint32_t pkt_len = 0;
+        uint8_t cmd = proto_recv(pkt, &pkt_len, 10000);
+        if (cmd == RSP_DATA && pkt_len > 2) {
+            uint32_t chunk = pkt_len - 2;
+            for (uint32_t i = 0; i < chunk && received < size; i++)
+                dest[received++] = pkt[2 + i];
+        } else if (cmd == 0) {
+            proto_send_ack(ACK_FLASH_ERROR);
+            return;
+        }
+    }
+
+    /* Verify CRC32 */
+    uint32_t actual_crc = crc32(0, dest, size);
+    if (actual_crc != expected_crc) {
+        proto_send_ack(ACK_CRC_ERROR);
+        return;
+    }
+
+    proto_send_ack(ACK_OK);
+}
+
+/*
  * CMD_SELFUPDATE: receive new agent binary into RAM and jump to it.
  *
  * Protocol:
@@ -227,6 +277,9 @@ int main(void) {
                 break;
             case CMD_READ:
                 handle_read(cmd_buf, data_len);
+                break;
+            case CMD_WRITE:
+                handle_write(cmd_buf, data_len);
                 break;
             case CMD_CRC32:
                 handle_crc32_cmd(cmd_buf, data_len);
