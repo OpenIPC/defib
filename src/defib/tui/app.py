@@ -7,6 +7,7 @@ from textual.binding import Binding
 
 from defib.tui.screens.main import MainScreen
 from defib.tui.screens.progress import ProgressScreen
+from defib.tui.screens.flash_doctor import FlashDoctorScreen
 
 
 class DefibApp(App[None]):
@@ -34,6 +35,11 @@ class DefibApp(App[None]):
     ) -> None:
         """Switch to progress screen and begin recovery."""
         screen = ProgressScreen(chip, firmware_path, port, send_break)
+        self.push_screen(screen)
+
+    def start_flash_doctor(self, port: str = "") -> None:
+        """Switch to Flash Doctor screen."""
+        screen = FlashDoctorScreen(port=port)
         self.push_screen(screen)
 
 

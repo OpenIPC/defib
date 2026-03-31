@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 import struct
 import zlib
+from dataclasses import dataclass, field
+from enum import IntEnum
 from pathlib import Path
 from typing import Callable
 
@@ -17,6 +19,7 @@ from defib.agent.protocol import (
     CMD_CRC32,
     CMD_INFO,
     CMD_READ,
+    CMD_SCAN,
     CMD_SELFUPDATE,
     CMD_SET_BAUD,
     CMD_WRITE,
@@ -25,6 +28,7 @@ from defib.agent.protocol import (
     RSP_DATA,
     RSP_INFO,
     RSP_READY,
+    RSP_SCAN,
     recv_packet,
     recv_response,
     send_packet,
@@ -33,6 +37,54 @@ from defib.agent.protocol import (
 from defib.transport.base import Transport
 
 logger = logging.getLogger(__name__)
+
+
+class SectorStatus(IntEnum):
+    GOOD = 0x00
+    EMPTY = 0x01
+    STUCK_ZERO = 0x02
+    STUCK_PATTERN = 0x03
+    UNSTABLE = 0x04
+    READ_ERROR = 0x05
+
+
+@dataclass
+class SectorResult:
+    index: int
+    address: int
+    status: SectorStatus
+    crc32: int
+
+
+@dataclass
+class ScanResult:
+    sectors: list[SectorResult] = field(default_factory=list)
+    flash_size: int = 0
+    sector_size: int = 0
+
+    @property
+    def total(self) -> int:
+        return len(self.sectors)
+
+    @property
+    def good(self) -> list[SectorResult]:
+        return [s for s in self.sectors if s.status == SectorStatus.GOOD]
+
+    @property
+    def empty(self) -> list[SectorResult]:
+        return [s for s in self.sectors if s.status == SectorStatus.EMPTY]
+
+    @property
+    def bad(self) -> list[SectorResult]:
+        return [s for s in self.sectors if s.status in (
+            SectorStatus.STUCK_ZERO, SectorStatus.STUCK_PATTERN,
+            SectorStatus.READ_ERROR,
+        )]
+
+    @property
+    def unstable(self) -> list[SectorResult]:
+        return [s for s in self.sectors if s.status == SectorStatus.UNSTABLE]
+
 
 # Max bytes per WRITE transfer before PL011 FIFO overflow on uncached DDR.
 WRITE_CHUNK_SIZE = 512
@@ -266,6 +318,132 @@ class FlashAgentClient:
         local_crc = zlib.crc32(data) & 0xFFFFFFFF
         device_crc = await self.crc32(addr, len(data))
         return local_crc == device_crc
+
+    async def scan_flash(
+        self,
+        on_progress: Callable[[int, int], None] | None = None,
+        on_sector: Callable[[SectorResult], None] | None = None,
+    ) -> ScanResult:
+        """Scan entire flash for bad/unstable sectors.
+
+        Uses CMD_SCAN for efficient agent-side scanning. Falls back to
+        per-sector CRC32 if the agent doesn't support CMD_SCAN.
+        Calls on_sector() as each result is decoded for live UI updates.
+        """
+        await self._switch_baud(DEFAULT_FAST_BAUD)
+
+        await send_packet(self._transport, CMD_SCAN)
+
+        cmd, data = await recv_response(self._transport, timeout=10.0)
+
+        # Old agents respond with ACK_CRC_ERROR for unknown commands
+        if cmd == RSP_ACK:
+            logger.info("Agent doesn't support CMD_SCAN, using CRC32 fallback")
+            return await self._scan_flash_compat(on_progress, on_sector)
+
+        if cmd != RSP_SCAN or len(data) < 4:
+            raise RuntimeError(f"Unexpected scan header: cmd=0x{cmd:02x}")
+
+        num_sectors = struct.unpack("<I", data[:4])[0]
+        sectors: list[SectorResult] = []
+
+        while len(sectors) < num_sectors:
+            cmd, data = await recv_packet(self._transport, timeout=30.0)
+            if cmd == RSP_READY:
+                continue
+            if cmd == RSP_ACK:
+                break
+            if cmd != RSP_SCAN:
+                raise RuntimeError(f"Unexpected response during scan: 0x{cmd:02x}")
+
+            offset = 0
+            while offset + 5 <= len(data) and len(sectors) < num_sectors:
+                status_byte = data[offset]
+                crc_val = struct.unpack("<I", data[offset + 1:offset + 5])[0]
+                idx = len(sectors)
+                try:
+                    status = SectorStatus(status_byte)
+                except ValueError:
+                    status = SectorStatus.READ_ERROR
+                result = SectorResult(
+                    index=idx,
+                    address=idx * self._sector_size,
+                    status=status,
+                    crc32=crc_val,
+                )
+                sectors.append(result)
+                if on_sector:
+                    on_sector(result)
+                if on_progress:
+                    on_progress(len(sectors), num_sectors)
+                offset += 5
+
+        # Consume final ACK if we haven't already
+        if cmd != RSP_ACK:
+            cmd, data = await recv_response(self._transport, timeout=5.0)
+
+        return ScanResult(
+            sectors=sectors,
+            flash_size=self._flash_size,
+            sector_size=self._sector_size,
+        )
+
+    async def _scan_flash_compat(
+        self,
+        on_progress: Callable[[int, int], None] | None = None,
+        on_sector: Callable[[SectorResult], None] | None = None,
+    ) -> ScanResult:
+        """Fallback scan using per-sector CRC32 commands."""
+        sector_sz = self._sector_size or 0x10000
+        flash_sz = self._flash_size
+        if flash_sz == 0:
+            info = await self.get_info()
+            flash_sz = int(info.get("flash_size", 0))
+        num_sectors = flash_sz // sector_sz if sector_sz else 0
+
+        # Pre-compute CRC32 of an empty sector for comparison
+        empty_crc = zlib.crc32(b"\xFF" * sector_sz) & 0xFFFFFFFF
+
+        sectors: list[SectorResult] = []
+        flash_base = 0x14000000  # FLASH_MEM
+
+        for i in range(num_sectors):
+            addr = flash_base + i * sector_sz
+
+            # Pass 1
+            try:
+                crc1 = await self.crc32(addr, sector_sz)
+            except Exception:
+                result = SectorResult(i, i * sector_sz, SectorStatus.READ_ERROR, 0)
+                sectors.append(result)
+                if on_sector:
+                    on_sector(result)
+                if on_progress:
+                    on_progress(len(sectors), num_sectors)
+                continue
+
+            if crc1 == empty_crc:
+                status = SectorStatus.EMPTY
+            else:
+                # Pass 2: stability check
+                try:
+                    crc2 = await self.crc32(addr, sector_sz)
+                except Exception:
+                    crc2 = crc1
+                status = SectorStatus.UNSTABLE if crc2 != crc1 else SectorStatus.GOOD
+
+            result = SectorResult(i, i * sector_sz, status, crc1)
+            sectors.append(result)
+            if on_sector:
+                on_sector(result)
+            if on_progress:
+                on_progress(len(sectors), num_sectors)
+
+        return ScanResult(
+            sectors=sectors,
+            flash_size=flash_sz,
+            sector_size=sector_sz,
+        )
 
     async def selfupdate(
         self,

@@ -1012,6 +1012,203 @@ async def _agent_write_async(
     await transport.close()
 
 
+@agent_app.command("scan")
+def agent_scan(
+    port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
+    output_file: str = typer.Option("", "-o", "--output", help="Save recoverable data to file (bad sectors filled with 0xFF)"),
+    output: str = typer.Option("human", "--output-mode", help="Output mode: human, json"),
+) -> None:
+    """Scan flash health sector-by-sector (flash doctor)."""
+    import asyncio
+    asyncio.run(_agent_scan_async(port, output_file, output))
+
+
+async def _agent_scan_async(port: str, output_file: str, output: str) -> None:
+    import json as json_mod
+    import time
+
+    from rich.console import Console
+    from rich.live import Live
+    from rich.text import Text
+
+    from defib.agent.client import (
+        FlashAgentClient,
+        ScanResult,
+        SectorResult,
+        SectorStatus,
+    )
+    from defib.transport.serial import SerialTransport
+
+    console = Console()
+    transport = await SerialTransport.create(port)
+    client = FlashAgentClient(transport)
+
+    if not await client.connect(timeout=5.0):
+        console.print("[red]Agent not responding[/red]")
+        await transport.close()
+        raise typer.Exit(1)
+
+    info = await client.get_info()
+    flash_size = int(info.get("flash_size", 0))
+    sector_size = int(info.get("sector_size", 0x10000))
+    num_sectors = flash_size // sector_size if sector_size else 0
+
+    if num_sectors == 0:
+        console.print("[red]Could not detect flash[/red]")
+        await transport.close()
+        raise typer.Exit(1)
+
+    # Status display mapping: (char, rich style)
+    STATUS_DISPLAY = {
+        SectorStatus.GOOD:           ("=", "green"),
+        SectorStatus.EMPTY:          (".", "dim"),
+        SectorStatus.STUCK_ZERO:     ("X", "red bold"),
+        SectorStatus.STUCK_PATTERN:  ("X", "red bold"),
+        SectorStatus.UNSTABLE:       ("?", "yellow"),
+        SectorStatus.READ_ERROR:     ("!", "red"),
+    }
+    COLS = 16  # sectors per row
+
+    sector_chars: list[tuple[str, str]] = [(" ", "dim")] * num_sectors
+    scanned_count = 0
+    t0 = time.time()
+
+    def build_map() -> Text:
+        text = Text()
+        text.append("Flash Doctor", style="bold")
+        text.append(f" — {flash_size // 1024}KB ({num_sectors} sectors x {sector_size // 1024}KB)\n\n")
+        rows = (num_sectors + COLS - 1) // COLS
+        for row in range(rows):
+            addr = row * COLS * sector_size
+            text.append(f"  0x{addr:06X} ", style="dim")
+            for col in range(COLS):
+                idx = row * COLS + col
+                if idx >= num_sectors:
+                    break
+                ch, style = sector_chars[idx]
+                text.append("[", style="dim")
+                text.append(ch, style=style)
+                text.append("]", style="dim")
+            text.append("\n")
+        text.append("\n  Legend: ")
+        text.append("[=]", style="green")
+        text.append(" Good  ")
+        text.append("[.]", style="dim")
+        text.append(" Empty  ")
+        text.append("[X]", style="red bold")
+        text.append(" Dead  ")
+        text.append("[?]", style="yellow")
+        text.append(" Unstable  ")
+        text.append("[!]", style="red")
+        text.append(" Error\n")
+
+        elapsed = time.time() - t0
+        text.append(f"  Scanned: {scanned_count}/{num_sectors}")
+        if scanned_count > 0 and scanned_count < num_sectors:
+            rate = scanned_count / elapsed
+            eta = (num_sectors - scanned_count) / rate if rate > 0 else 0
+            text.append(f"  ({elapsed:.1f}s elapsed, ~{eta:.0f}s remaining)")
+        elif scanned_count == num_sectors:
+            text.append(f"  ({elapsed:.1f}s)")
+        text.append("\n")
+        return text
+
+    def on_sector(result: SectorResult) -> None:
+        nonlocal scanned_count
+        sector_chars[result.index] = STATUS_DISPLAY.get(
+            result.status, ("?", "red"))
+        scanned_count = result.index + 1
+
+    scan_result: ScanResult
+    if output == "human":
+        console.print()
+        with Live(build_map(), console=console, refresh_per_second=8) as live:
+            def on_sector_live(r: SectorResult) -> None:
+                on_sector(r)
+                live.update(build_map())
+
+            scan_result = await client.scan_flash(on_sector=on_sector_live)
+            live.update(build_map())  # final refresh
+    else:
+        scan_result = await client.scan_flash(on_sector=on_sector)
+
+    elapsed = time.time() - t0
+
+    if output == "human":
+        console.print()
+        console.print("[bold]Scan Summary[/bold]")
+        console.print(f"  Total sectors:  {scan_result.total}")
+        console.print(f"  [green]Good:[/green]          {len(scan_result.good)}")
+        console.print(f"  [dim]Empty:[/dim]         {len(scan_result.empty)}")
+        console.print(f"  [yellow]Unstable:[/yellow]      {len(scan_result.unstable)}")
+        console.print(f"  [red]Bad/Dead:[/red]      {len(scan_result.bad)}")
+        console.print(f"  Time:           {elapsed:.1f}s")
+
+        if scan_result.bad:
+            console.print("\n[red bold]Bad sectors:[/red bold]")
+            for s in scan_result.bad:
+                console.print(f"  Sector {s.index:3d}: 0x{s.address:06X} — {s.status.name}")
+        if scan_result.unstable:
+            console.print("\n[yellow bold]Unstable sectors:[/yellow bold]")
+            for s in scan_result.unstable:
+                console.print(f"  Sector {s.index:3d}: 0x{s.address:06X} — CRC 0x{s.crc32:08X}")
+
+        if not scan_result.bad and not scan_result.unstable:
+            console.print("\n[green bold]Flash is healthy![/green bold]")
+
+    elif output == "json":
+        print(json_mod.dumps({
+            "flash_size": scan_result.flash_size,
+            "sector_size": scan_result.sector_size,
+            "total": scan_result.total,
+            "good": len(scan_result.good),
+            "empty": len(scan_result.empty),
+            "unstable": len(scan_result.unstable),
+            "bad": len(scan_result.bad),
+            "elapsed_s": round(elapsed, 1),
+            "sectors": [
+                {"index": s.index, "address": f"0x{s.address:06X}",
+                 "status": s.status.name, "crc32": f"0x{s.crc32:08X}"}
+                for s in scan_result.sectors
+            ],
+        }))
+
+    # Optional: dump recoverable data
+    if output_file:
+        if output == "human":
+            console.print(f"\nDumping recoverable data to [cyan]{output_file}[/cyan]...")
+
+        recoverable = bytearray()
+        readable_sectors = [
+            s for s in scan_result.sectors
+            if s.status in (SectorStatus.GOOD, SectorStatus.UNSTABLE)
+        ]
+
+        for i, sector in enumerate(scan_result.sectors):
+            if sector.status in (SectorStatus.GOOD, SectorStatus.UNSTABLE):
+                flash_base = 0x14000000
+                data = await client.read_memory(
+                    flash_base + sector.address, sector_size, fast=True,
+                )
+                recoverable.extend(data)
+                if output == "human":
+                    done = sum(1 for s in scan_result.sectors[:i + 1]
+                               if s.status in (SectorStatus.GOOD, SectorStatus.UNSTABLE))
+                    console.print(
+                        f"\r  Reading sector {done}/{len(readable_sectors)}...",
+                        end="",
+                    )
+            else:
+                recoverable.extend(b"\xFF" * sector_size)
+
+        from pathlib import Path
+        Path(output_file).write_bytes(recoverable)
+        if output == "human":
+            console.print(f"\n[green]Saved:[/green] {output_file} ({len(recoverable)} bytes)")
+
+    await transport.close()
+
+
 def _parse_size(s: str) -> int:
     """Parse size string like '16MB', '4096', '0x1000'."""
     s = s.strip().upper()

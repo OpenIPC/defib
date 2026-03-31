@@ -94,6 +94,11 @@ class MainScreen(Screen[None]):
         min-width: 20;
     }
 
+    #doctor-btn {
+        min-width: 20;
+        margin-left: 2;
+    }
+
     #download-btn {
         min-width: 30;
     }
@@ -152,6 +157,7 @@ class MainScreen(Screen[None]):
 
                 with Horizontal(id="button-row"):
                     yield Button("Start Recovery", variant="primary", id="start-btn")
+                    yield Button("Flash Doctor", variant="warning", id="doctor-btn")
 
         yield Footer()
 
@@ -206,6 +212,8 @@ class MainScreen(Screen[None]):
             self._start_recovery()
         elif event.button.id == "download-btn":
             self._download_firmware()
+        elif event.button.id == "doctor-btn":
+            self._start_flash_doctor()
 
     def _download_firmware(self) -> None:
         chip = self._get_chip()
@@ -288,3 +296,12 @@ class MainScreen(Screen[None]):
         app = self.app
         if isinstance(app, DefibApp):
             app.start_recovery(chip, firmware_path, port, send_break)
+
+    def _start_flash_doctor(self) -> None:
+        port_sel = self.query_one("#port-select", Select)
+        port = str(port_sel.value) if port_sel.value != Select.BLANK else ""
+
+        from defib.tui.app import DefibApp
+        app = self.app
+        if isinstance(app, DefibApp):
+            app.start_flash_doctor(port)

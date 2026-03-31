@@ -71,6 +71,96 @@ class TestProgressScreen:
             assert screen.query_one("#stage-u-boot") is not None
 
 
+class TestFlashDoctorScreen:
+    @pytest.mark.asyncio
+    async def test_flash_doctor_screen_renders(self):
+        """FlashDoctorScreen composes without crashing."""
+        from defib.tui.screens.flash_doctor import FlashDoctorScreen
+
+        app = DefibApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = FlashDoctorScreen()
+            app.push_screen(screen)
+            await pilot.pause()
+            assert screen.query_one("#doctor-banner") is not None
+            assert screen.query_one("#sector-grid") is not None
+            assert screen.query_one("#scan-stats") is not None
+            assert screen.query_one("#results-log") is not None
+            assert screen.query_one("#connect-scan-btn") is not None
+
+    @pytest.mark.asyncio
+    async def test_flash_doctor_button_on_main_screen(self):
+        """Main screen has Flash Doctor button that opens the screen."""
+        from defib.tui.screens.flash_doctor import FlashDoctorScreen
+        from defib.tui.screens.main import MainScreen
+
+        app = DefibApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            assert isinstance(app.screen, MainScreen)
+            btn = app.screen.query_one("#doctor-btn")
+            assert btn is not None
+
+            await pilot.click("#doctor-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, FlashDoctorScreen)
+
+    @pytest.mark.asyncio
+    async def test_flash_doctor_escape_goes_back(self):
+        """Pressing Escape on FlashDoctorScreen returns to main."""
+        from defib.tui.screens.flash_doctor import FlashDoctorScreen
+        from defib.tui.screens.main import MainScreen
+
+        app = DefibApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.click("#doctor-btn")
+            await pilot.pause()
+            assert isinstance(app.screen, FlashDoctorScreen)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, MainScreen)
+
+    def test_sector_grid_render(self):
+        """SectorGrid renders correct block characters for each status."""
+        from defib.tui.screens.flash_doctor import SectorGrid
+        from defib.agent.client import SectorStatus
+
+        grid = SectorGrid(num_sectors=8, cols=8)
+        grid._sector_size = 0x10000
+
+        grid.set_sector(0, SectorStatus.GOOD)
+        grid.set_sector(1, SectorStatus.EMPTY)
+        grid.set_sector(2, SectorStatus.STUCK_ZERO)
+        grid.set_sector(3, SectorStatus.UNSTABLE)
+        grid.set_sector(4, SectorStatus.READ_ERROR)
+
+        rendered = grid.render()
+        assert "█" in rendered  # GOOD
+        assert "·" in rendered  # EMPTY
+        assert "▓" in rendered  # DEAD
+        assert "✕" in rendered  # ERROR
+        assert "░" in rendered  # PENDING (sectors 5-7)
+
+    def test_build_banner_alignment(self):
+        """Banner lines have consistent visible width."""
+        from defib.tui.screens.flash_doctor import _build_banner, BOX_INNER
+
+        banner = _build_banner("test subtitle")
+        lines = banner.split("\n")
+        assert len(lines) == 4
+        # Top and bottom borders should have BOX_INNER ═ chars
+        assert "═" * BOX_INNER in lines[0]
+        assert "═" * BOX_INNER in lines[3]
+
+    def test_scan_stats_update(self):
+        """ScanStats widget doesn't crash on update."""
+        from defib.tui.screens.flash_doctor import ScanStats
+
+        stats = ScanStats()
+        # Should not raise
+        stats.update_stats(128, 256, 100, 20, 5, 3, 18.5)
+
+
 class TestTUIFromCLI:
     def test_tui_command_exists(self):
         from typer.testing import CliRunner

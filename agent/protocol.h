@@ -16,6 +16,7 @@
 #define CMD_REBOOT      0x06
 #define CMD_SELFUPDATE  0x07
 #define CMD_SET_BAUD    0x08
+#define CMD_SCAN        0x09
 
 /* Responses (device → host) */
 #define RSP_INFO    0x81
@@ -23,6 +24,7 @@
 #define RSP_ACK     0x83
 #define RSP_CRC32   0x84
 #define RSP_READY   0x85
+#define RSP_SCAN    0x86
 
 /* ACK status codes */
 #define ACK_OK          0x00
