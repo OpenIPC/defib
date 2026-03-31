@@ -313,6 +313,28 @@ static void handle_set_baud(const uint8_t *data, uint32_t len) {
 
     /* Drain any garbage from baud rate transition */
     while (uart_readable()) uart_getc();
+
+    /* Wait for host to confirm with any valid command within 3 seconds.
+     * If nothing arrives, revert to 115200 — the host may have failed
+     * to switch or the new baud rate doesn't work on this link. */
+    uint8_t pkt[MAX_PAYLOAD + 16];
+    uint32_t pkt_len = 0;
+    uint8_t cmd = proto_recv(pkt, &pkt_len, 3000);
+    if (cmd == 0) {
+        /* No valid command — revert */
+        uart_set_baud(115200);
+        while (uart_readable()) uart_getc();
+    } else {
+        /* Got a valid command at new baud — process it normally.
+         * Re-inject into main loop by handling it here. */
+        switch (cmd) {
+            case CMD_INFO:  handle_info(); break;
+            case CMD_READ:  handle_read(pkt, pkt_len); break;
+            case CMD_WRITE: handle_write(pkt, pkt_len); break;
+            case CMD_CRC32: handle_crc32_cmd(pkt, pkt_len); break;
+            default:        proto_send_ack(ACK_OK); break;
+        }
+    }
 }
 
 int main(void) {
