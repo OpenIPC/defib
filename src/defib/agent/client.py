@@ -6,37 +6,43 @@ communicates via the COBS binary protocol for fast flash operations.
 
 from __future__ import annotations
 
+import logging
 import struct
 import zlib
 from pathlib import Path
 from typing import Callable
 
 from defib.agent.protocol import (
+    ACK_OK,
     CMD_CRC32,
-    CMD_ERASE,
     CMD_INFO,
     CMD_READ,
     CMD_REBOOT,
+    CMD_SELFUPDATE,
     CMD_WRITE,
     RSP_ACK,
     RSP_CRC32,
     RSP_DATA,
     RSP_INFO,
-    ACK_OK,
+    RSP_READY,
     recv_packet,
+    recv_response,
     send_packet,
     wait_for_ready,
 )
 from defib.transport.base import Transport
 
+logger = logging.getLogger(__name__)
+
+# Max bytes per WRITE transfer before PL011 FIFO overflow on uncached DDR.
+# Agent processes COBS+CRC between packets; at 115200 baud with no D-cache,
+# cumulative FIFO overflow occurs after ~30-60KB of continuous streaming.
+WRITE_CHUNK_SIZE = 512
+WRITE_MAX_TRANSFER = 16 * 1024
+
 
 def get_agent_binary(chip: str) -> Path | None:
-    """Get the path to the pre-compiled agent binary for a chip.
-
-    Looks in the agent/ directory of the defib repo for
-    agent-{soc_family}.bin files.
-    """
-    # Map chip names to agent binary names
+    """Get the path to the pre-compiled agent binary for a chip."""
     chip_to_agent = {
         "hi3516ev300": "hi3516ev300",
         "hi3516ev200": "hi3516ev200",
@@ -54,8 +60,6 @@ def get_agent_binary(chip: str) -> Path | None:
     if not agent_name:
         return None
 
-    # Look in the agent/ directory relative to the repo root
-    # In installed package, these would be in package data
     candidates = [
         Path(__file__).parent.parent.parent.parent / "agent" / f"agent-{agent_name}.bin",
     ]
@@ -72,7 +76,8 @@ class FlashAgentClient:
         client = FlashAgentClient(transport, chip="hi3516ev300")
         if await client.connect():
             info = await client.get_info()
-            await client.read_flash("dump.bin", on_progress=callback)
+            data = await client.read_memory(0x41000000, 4096)
+            await client.dump_memory("dump.bin", 0x40000000, 256*1024)
     """
 
     def __init__(self, transport: Transport, chip: str = "") -> None:
@@ -80,17 +85,30 @@ class FlashAgentClient:
         self._chip = chip
         self._connected = False
         self._flash_size = 0
+        self._ram_base = 0
         self._sector_size = 0x10000
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    @property
+    def flash_size(self) -> int:
+        return self._flash_size
+
+    @property
+    def ram_base(self) -> int:
+        return self._ram_base
 
     async def connect(self, timeout: float = 10.0) -> bool:
         """Wait for agent READY packet."""
         self._connected = await wait_for_ready(self._transport, timeout)
         return self._connected
 
-    async def get_info(self) -> dict[str, int]:
+    async def get_info(self) -> dict[str, int | str]:
         """Request device info from the agent."""
         await send_packet(self._transport, CMD_INFO)
-        cmd, data = await recv_packet(self._transport, timeout=5.0)
+        cmd, data = await recv_response(self._transport, timeout=5.0)
         if cmd != RSP_INFO or len(data) < 16:
             return {}
 
@@ -100,6 +118,7 @@ class FlashAgentClient:
         sector_size = struct.unpack("<I", data[12:16])[0]
 
         self._flash_size = flash_size
+        self._ram_base = ram_base
         self._sector_size = sector_size
 
         return {
@@ -109,101 +128,139 @@ class FlashAgentClient:
             "sector_size": sector_size,
         }
 
-    async def read_flash(
+    async def read_memory(
         self,
-        output_path: str,
-        addr: int = 0,
-        size: int | None = None,
+        addr: int,
+        size: int,
         on_progress: Callable[[int, int], None] | None = None,
-    ) -> int:
-        """Read flash contents to a file via the agent.
-
-        Returns number of bytes read.
-        """
-        if size is None:
-            size = self._flash_size
-        if size == 0:
-            raise RuntimeError("Flash size unknown — call get_info() first")
-
+    ) -> bytes:
+        """Read a memory region from the device. Returns bytes."""
         payload = struct.pack("<II", addr, size)
         await send_packet(self._transport, CMD_READ, payload)
 
-        bytes_received = 0
-        with open(output_path, "wb") as f:
-            while bytes_received < size:
-                cmd, data = await recv_packet(self._transport, timeout=10.0)
-                if cmd == RSP_DATA and len(data) > 2:
-                    # seq(2B) + payload
-                    chunk = data[2:]
-                    f.write(chunk)
-                    bytes_received += len(chunk)
-                    if on_progress:
-                        on_progress(bytes_received, size)
-                elif cmd == RSP_ACK:
-                    # Transfer complete
-                    break
-                else:
-                    raise RuntimeError(f"Unexpected response: cmd=0x{cmd:02x}")
+        received = bytearray()
+        while True:
+            cmd, data = await recv_packet(self._transport, timeout=60.0)
+            if cmd == RSP_READY:
+                continue
+            elif cmd == RSP_DATA and len(data) > 2:
+                received.extend(data[2:])
+                if on_progress:
+                    on_progress(len(received), size)
+            elif cmd == RSP_ACK:
+                break
+            else:
+                raise RuntimeError(f"Unexpected response: cmd=0x{cmd:02x}")
 
-        return bytes_received
+        return bytes(received)
 
-    async def crc32_flash(self, addr: int, size: int) -> int:
-        """Get CRC32 of a flash region from the agent."""
-        payload = struct.pack("<II", addr, size)
-        await send_packet(self._transport, CMD_CRC32, payload)
-        cmd, data = await recv_packet(self._transport, timeout=10.0)
-        if cmd != RSP_CRC32 or len(data) < 4:
-            raise RuntimeError("CRC32 response invalid")
-        return int(struct.unpack("<I", data[:4])[0])
-
-    async def verify_dump(self, file_path: str, flash_addr: int = 0) -> bool:
-        """Verify a dump file against flash CRC32.
-
-        Reads the file, computes local CRC32, requests device CRC32,
-        compares.
-        """
-        data = Path(file_path).read_bytes()
-        local_crc = zlib.crc32(data) & 0xFFFFFFFF
-        device_crc = await self.crc32_flash(flash_addr, len(data))
-        return local_crc == device_crc
-
-    async def write_flash(
+    async def dump_memory(
         self,
+        output_path: str,
+        addr: int,
+        size: int,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> int:
+        """Read memory region and write to file. Returns bytes written."""
+        data = await self.read_memory(addr, size, on_progress)
+        Path(output_path).write_bytes(data)
+        return len(data)
+
+    async def write_memory(
+        self,
+        addr: int,
         data: bytes,
-        addr: int = 0,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> bool:
-        """Write data to flash (erase + program).
+        """Write data to device RAM in chunked transfers.
 
-        Erases sectors first, then writes page by page.
+        Splits into WRITE_MAX_TRANSFER-sized blocks to avoid PL011 FIFO
+        overflow on uncached DDR. Each block uses WRITE_CHUNK_SIZE packets.
         """
         total = len(data)
-
-        # Erase required sectors
-        erase_size = ((total + self._sector_size - 1) // self._sector_size) * self._sector_size
-        erase_payload = struct.pack("<II", addr, erase_size)
-        await send_packet(self._transport, CMD_ERASE, erase_payload)
-        cmd, resp = await recv_packet(self._transport, timeout=60.0)
-        if cmd != RSP_ACK or resp[0] != ACK_OK:
-            return False
-
-        # Write in 1KB chunks (max packet payload)
         offset = 0
-        while offset < total:
-            chunk_size = min(1020, total - offset)  # 1024 - 4 for addr
-            chunk = data[offset:offset + chunk_size]
-            payload = struct.pack("<I", addr + offset) + chunk
-            await send_packet(self._transport, CMD_WRITE, payload)
 
-            cmd, resp = await recv_packet(self._transport, timeout=10.0)
-            if cmd != RSP_ACK or resp[0] != ACK_OK:
+        while offset < total:
+            block_size = min(WRITE_MAX_TRANSFER, total - offset)
+            block = data[offset:offset + block_size]
+
+            ok = await self._write_block(addr + offset, block)
+            if not ok:
+                logger.error("WRITE failed at offset %d/%d", offset, total)
                 return False
 
-            offset += chunk_size
+            offset += block_size
             if on_progress:
                 on_progress(offset, total)
 
         return True
+
+    async def _write_block(self, addr: int, data: bytes) -> bool:
+        """Write a single block (up to WRITE_MAX_TRANSFER) to device."""
+        crc = zlib.crc32(data) & 0xFFFFFFFF
+        payload = struct.pack("<III", addr, len(data), crc)
+        await send_packet(self._transport, CMD_WRITE, payload)
+
+        cmd, resp = await recv_response(self._transport, timeout=5.0)
+        if cmd != RSP_ACK or resp[0] != ACK_OK:
+            return False
+
+        offset = 0
+        seq = 0
+        while offset < len(data):
+            chunk = min(WRITE_CHUNK_SIZE, len(data) - offset)
+            pkt = struct.pack("<H", seq) + data[offset:offset + chunk]
+            await send_packet(self._transport, RSP_DATA, pkt)
+            offset += chunk
+            seq += 1
+
+        cmd, resp = await recv_response(self._transport, timeout=60.0)
+        return cmd == RSP_ACK and resp[0] == ACK_OK
+
+    async def crc32(self, addr: int, size: int) -> int:
+        """Get CRC32 of a memory region from the device."""
+        payload = struct.pack("<II", addr, size)
+        await send_packet(self._transport, CMD_CRC32, payload)
+        cmd, data = await recv_response(self._transport, timeout=10.0)
+        if cmd != RSP_CRC32 or len(data) < 4:
+            raise RuntimeError("CRC32 response invalid")
+        return int(struct.unpack("<I", data[:4])[0])
+
+    async def verify(self, addr: int, data: bytes) -> bool:
+        """Verify device memory matches local data via CRC32."""
+        local_crc = zlib.crc32(data) & 0xFFFFFFFF
+        device_crc = await self.crc32(addr, len(data))
+        return local_crc == device_crc
+
+    async def selfupdate(
+        self,
+        firmware: bytes,
+        load_addr: int = 0x41000000,
+    ) -> bool:
+        """Update the running agent with new firmware.
+
+        Sends data to staging area, verifies CRC, agent copies via
+        trampoline and jumps to new code.
+        """
+        crc = zlib.crc32(firmware) & 0xFFFFFFFF
+        payload = struct.pack("<III", load_addr, len(firmware), crc)
+        await send_packet(self._transport, CMD_SELFUPDATE, payload)
+
+        cmd, resp = await recv_response(self._transport, timeout=5.0)
+        if cmd != RSP_ACK or resp[0] != ACK_OK:
+            return False
+
+        offset = 0
+        seq = 0
+        while offset < len(firmware):
+            chunk = min(1022, len(firmware) - offset)
+            pkt = struct.pack("<H", seq) + firmware[offset:offset + chunk]
+            await send_packet(self._transport, RSP_DATA, pkt)
+            offset += chunk
+            seq += 1
+
+        cmd, resp = await recv_response(self._transport, timeout=10.0)
+        return cmd == RSP_ACK and resp[0] == ACK_OK
 
     async def reboot(self) -> None:
         """Tell the agent to reset the device."""

@@ -713,5 +713,314 @@ def list_interfaces_cmd(
             console.print("[yellow]No network interfaces found[/yellow]")
 
 
+agent_app = typer.Typer(help="Flash agent commands (fast binary protocol)")
+app.add_typer(agent_app, name="agent")
+
+
+@agent_app.command("upload")
+def agent_upload(
+    chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
+    port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
+    output: str = typer.Option("human", "--output", help="Output mode: human, json"),
+) -> None:
+    """Upload flash agent to device via boot protocol (requires power-cycle)."""
+    import asyncio
+    asyncio.run(_agent_upload_async(chip, port, output))
+
+
+async def _agent_upload_async(chip: str, port: str, output: str) -> None:
+    import json as json_mod
+
+    from rich.console import Console
+
+    from defib.agent.client import FlashAgentClient, get_agent_binary
+    from defib.firmware import get_cached_path
+    from defib.profiles.loader import load_profile
+    from defib.protocol.hisilicon_standard import HiSiliconStandard
+    from defib.recovery.events import ProgressEvent
+    from defib.transport.serial import SerialTransport
+
+    console = Console()
+
+    # Find agent binary
+    agent_path = get_agent_binary(chip)
+    if not agent_path:
+        msg = f"No agent binary for '{chip}'"
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": msg}))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        raise typer.Exit(1)
+
+    agent_data = agent_path.read_bytes()
+
+    # Get real SPL from cached U-Boot
+    profile = load_profile(chip)
+    cached_fw = get_cached_path(chip)
+    if not cached_fw:
+        from defib.firmware import download_firmware
+        if output == "human":
+            console.print("Downloading U-Boot for SPL...")
+        cached_fw = download_firmware(chip)
+    spl_data = cached_fw.read_bytes()[:profile.spl_max_size]
+
+    if output == "human":
+        console.print(f"Agent: [cyan]{agent_path.name}[/cyan] ({len(agent_data)} bytes)")
+        console.print(f"SPL: {len(spl_data)} bytes (from OpenIPC U-Boot)")
+        console.print("\n[yellow]Power-cycle the camera now![/yellow]\n")
+
+    transport = await SerialTransport.create(port)
+    protocol = HiSiliconStandard()
+    protocol.set_profile(profile)
+
+    def on_progress(e: ProgressEvent) -> None:
+        if e.message:
+            if output == "human":
+                console.print(f"  {e.message}")
+            elif output == "json":
+                print(json_mod.dumps({"event": "progress", "message": e.message}), flush=True)
+
+    hs = await protocol.handshake(transport, on_progress)
+    if not hs.success:
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": "Handshake failed"}))
+        else:
+            console.print("[red]Handshake failed[/red]")
+        await transport.close()
+        raise typer.Exit(1)
+
+    result = await protocol.send_firmware(
+        transport, agent_data, on_progress, spl_override=spl_data,
+    )
+    if not result.success:
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": result.error or "Upload failed"}))
+        else:
+            console.print(f"[red]Upload failed:[/red] {result.error}")
+        await transport.close()
+        raise typer.Exit(1)
+
+    if output == "human":
+        console.print("[green]Agent uploaded![/green] Waiting for READY...")
+
+    # Wait for agent
+    import asyncio as aio
+    await transport.close()
+    await aio.sleep(2)
+    transport = await SerialTransport.create(port)
+
+    client = FlashAgentClient(transport, chip)
+    if await client.connect(timeout=10.0):
+        info = await client.get_info()
+        if output == "human":
+            console.print("[green bold]Agent ready![/green bold]")
+            console.print(f"  RAM: 0x{info.get('ram_base', 0):08x}")
+            console.print(f"  Flash: {int(info.get('flash_size', 0)) // 1024}KB")
+        elif output == "json":
+            print(json_mod.dumps({"event": "ready", **info}))
+    else:
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": "Agent not responding"}))
+        else:
+            console.print("[red]Agent not responding[/red]")
+        raise typer.Exit(1)
+
+    await transport.close()
+
+
+@agent_app.command("info")
+def agent_info(
+    port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
+    output: str = typer.Option("human", "--output", help="Output mode: human, json"),
+) -> None:
+    """Query info from a running flash agent."""
+    import asyncio
+    asyncio.run(_agent_info_async(port, output))
+
+
+async def _agent_info_async(port: str, output: str) -> None:
+    import json as json_mod
+
+    from rich.console import Console
+
+    from defib.agent.client import FlashAgentClient
+    from defib.transport.serial import SerialTransport
+
+    console = Console()
+    transport = await SerialTransport.create(port)
+    client = FlashAgentClient(transport)
+
+    if not await client.connect(timeout=5.0):
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": "Agent not responding"}))
+        else:
+            console.print("[red]Agent not responding.[/red] Upload agent first with 'defib agent upload'.")
+        await transport.close()
+        raise typer.Exit(1)
+
+    info = await client.get_info()
+    await transport.close()
+
+    if output == "json":
+        print(json_mod.dumps(info))
+    else:
+        console.print("[bold]Flash Agent Info[/bold]")
+        console.print(f"  JEDEC ID:    {info.get('jedec_id', 'unknown')}")
+        console.print(f"  Flash size:  {int(info.get('flash_size', 0)) // 1024} KB")
+        console.print(f"  RAM base:    0x{int(info.get('ram_base', 0)):08x}")
+        console.print(f"  Sector size: {int(info.get('sector_size', 0)) // 1024} KB")
+
+
+@agent_app.command("read")
+def agent_read(
+    port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
+    addr: str = typer.Option(..., "-a", "--addr", help="Start address (hex)"),
+    size: str = typer.Option(..., "-s", "--size", help="Size in bytes (or 1KB, 16MB, etc)"),
+    output_file: str = typer.Option(..., "-o", "--output", help="Output binary file"),
+    verify: bool = typer.Option(True, "--verify/--no-verify", help="CRC32 verify after read"),
+    output: str = typer.Option("human", "--output-mode", help="Output mode: human, json"),
+) -> None:
+    """Read memory from device via flash agent."""
+    import asyncio
+    asyncio.run(_agent_read_async(port, addr, size, output_file, verify, output))
+
+
+async def _agent_read_async(
+    port: str, addr_str: str, size_str: str, output_file: str, verify: bool, output: str,
+) -> None:
+    import json as json_mod
+    import time
+    import zlib
+
+    from rich.console import Console
+
+    from defib.agent.client import FlashAgentClient
+    from defib.transport.serial import SerialTransport
+
+    console = Console()
+    address = int(addr_str, 0)
+    size = _parse_size(size_str)
+
+    transport = await SerialTransport.create(port)
+    client = FlashAgentClient(transport)
+    if not await client.connect(timeout=5.0):
+        console.print("[red]Agent not responding[/red]")
+        await transport.close()
+        raise typer.Exit(1)
+
+    if output == "human":
+        console.print(f"Reading 0x{address:08x} + {size} bytes...")
+
+    t0 = time.time()
+    data = await client.read_memory(address, size, on_progress=lambda d, t: (
+        console.print(f"\r  {d}/{t} ({d*100//t}%)", end="") if output == "human" else None
+    ))
+    elapsed = time.time() - t0
+
+    from pathlib import Path
+    Path(output_file).write_bytes(data)
+
+    speed = len(data) / elapsed if elapsed > 0 else 0
+    if output == "human":
+        console.print(f"\n  {len(data)} bytes in {elapsed:.1f}s ({speed:.0f} B/s)")
+
+    if verify and len(data) > 0:
+        local_crc = zlib.crc32(data) & 0xFFFFFFFF
+        device_crc = await client.crc32(address, len(data))
+        match = local_crc == device_crc
+        if output == "human":
+            console.print(f"  CRC32: {'[green]OK[/green]' if match else '[red]MISMATCH[/red]'}")
+        if not match:
+            await transport.close()
+            raise typer.Exit(1)
+
+    if output == "human":
+        console.print(f"[green]Saved:[/green] {output_file}")
+    elif output == "json":
+        print(json_mod.dumps({"file": output_file, "bytes": len(data), "speed": speed}))
+
+    await transport.close()
+
+
+@agent_app.command("write")
+def agent_write(
+    port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
+    addr: str = typer.Option(..., "-a", "--addr", help="Start address (hex)"),
+    input_file: str = typer.Option(..., "-i", "--input", help="Input binary file"),
+    verify: bool = typer.Option(True, "--verify/--no-verify", help="CRC32 verify after write"),
+    output: str = typer.Option("human", "--output", help="Output mode: human, json"),
+) -> None:
+    """Write data to device memory via flash agent."""
+    import asyncio
+    asyncio.run(_agent_write_async(port, addr, input_file, verify, output))
+
+
+async def _agent_write_async(
+    port: str, addr_str: str, input_file: str, verify: bool, output: str,
+) -> None:
+    import json as json_mod
+    import time
+
+    from rich.console import Console
+
+    from defib.agent.client import FlashAgentClient
+    from defib.transport.serial import SerialTransport
+
+    console = Console()
+    address = int(addr_str, 0)
+    data = open(input_file, "rb").read()
+
+    transport = await SerialTransport.create(port)
+    client = FlashAgentClient(transport)
+    if not await client.connect(timeout=5.0):
+        console.print("[red]Agent not responding[/red]")
+        await transport.close()
+        raise typer.Exit(1)
+
+    if output == "human":
+        console.print(f"Writing {len(data)} bytes to 0x{address:08x}...")
+
+    t0 = time.time()
+    ok = await client.write_memory(address, data, on_progress=lambda d, t: (
+        console.print(f"\r  {d}/{t} ({d*100//t}%)", end="") if output == "human" else None
+    ))
+    elapsed = time.time() - t0
+
+    if not ok:
+        if output == "human":
+            console.print("\n[red]Write failed[/red]")
+        await transport.close()
+        raise typer.Exit(1)
+
+    speed = len(data) / elapsed if elapsed > 0 else 0
+    if output == "human":
+        console.print(f"\n  {len(data)} bytes in {elapsed:.1f}s ({speed:.0f} B/s)")
+
+    if verify:
+        match = await client.verify(address, data)
+        if output == "human":
+            console.print(f"  CRC32: {'[green]OK[/green]' if match else '[red]MISMATCH[/red]'}")
+        if not match:
+            await transport.close()
+            raise typer.Exit(1)
+
+    if output == "human":
+        console.print("[green]Write complete[/green]")
+    elif output == "json":
+        print(json_mod.dumps({"bytes": len(data), "speed": speed, "verified": verify}))
+
+    await transport.close()
+
+
+def _parse_size(s: str) -> int:
+    """Parse size string like '16MB', '4096', '0x1000'."""
+    s = s.strip().upper()
+    multipliers = {"KB": 1024, "MB": 1024 * 1024, "GB": 1024 * 1024 * 1024}
+    for suffix, mult in multipliers.items():
+        if s.endswith(suffix):
+            return int(s[:-len(suffix)]) * mult
+    return int(s, 0)
+
+
 def main() -> None:
     app()
