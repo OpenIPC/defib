@@ -368,9 +368,29 @@ async def dump_flash(
     resp = await send_command(transport, cmd, timeout=SF_READ_TIMEOUT, wait_for="# ")
 
     if "OK" not in resp and "ok" not in resp.lower():
-        # Try anyway — some U-Boot versions don't print OK
         if on_log:
             on_log("Warning: sf read response unclear, proceeding with dump")
+
+    # Sanity check: read first 16 bytes and verify they look like flash content.
+    # Valid SPI NOR flash starts with ARM vectors (0xEA branch opcodes) or
+    # a bootloader header — never all-zeros, all-0xFF, or all-0x55.
+    check_resp = await send_command(
+        transport, f"md.b 0x{ram_addr:x} 10", timeout=5.0, wait_for="# ",
+    )
+    check_data = parse_md_output(check_resp)
+    if len(check_data) >= 16:
+        # Detect garbage patterns
+        unique = len(set(check_data[:16]))
+        all_same = unique == 1
+        if all_same:
+            bad_byte = check_data[0]
+            raise RuntimeError(
+                f"Flash read sanity check failed: first 16 bytes are all "
+                f"0x{bad_byte:02x}. This usually means sf probe/sf read "
+                f"failed silently. Try running 'sf probe 0' manually first."
+            )
+        if on_log:
+            on_log(f"Sanity check OK: first bytes {check_data[:4].hex()}")
 
     # Detect if U-Boot has crc32 command for per-block verification
     has_crc32 = await _detect_crc32(transport)
