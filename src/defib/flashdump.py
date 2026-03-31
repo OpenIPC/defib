@@ -414,28 +414,66 @@ async def dump_flash(
         on_log(f"Dumping {size_mb:.0f}MB via md.b...")
 
     chunk_size = 0x1000  # 4KB chunks
-    max_retries = 3
+    max_retries = 5
+
+    # Resume support: if output file exists with partial data, continue
+    # from where it left off instead of starting over.
+    import os
     offset = 0
+    file_mode = "wb"
+    if os.path.exists(output_path):
+        existing = os.path.getsize(output_path)
+        # Round down to chunk boundary
+        resume_offset = (existing // chunk_size) * chunk_size
+        if 0 < resume_offset < flash_size:
+            offset = resume_offset
+            file_mode = "r+b"
+            if on_log:
+                pct = offset * 100 // flash_size
+                on_log(f"Resuming from 0x{offset:x} ({pct}% already done)")
+
     verified = 0
     errors = 0
     retries_total = 0
     start_time = time.monotonic()
 
-    with open(output_path, "wb") as f:
+    with open(output_path, file_mode) as f:
+        if offset > 0:
+            f.seek(offset)
         while offset < flash_size:
             remaining = min(chunk_size, flash_size - offset)
             addr = ram_addr + offset
+            chunk_data = b""
 
             for attempt in range(max_retries + 1):
-                cmd = f"md.b 0x{addr:x} 0x{remaining:x}"
-                resp = await send_command(transport, cmd, timeout=15.0, wait_for="# ")
-                chunk_data = parse_md_output(resp)
+                try:
+                    cmd = f"md.b 0x{addr:x} 0x{remaining:x}"
+                    resp = await send_command(transport, cmd, timeout=15.0, wait_for="# ")
+                    chunk_data = parse_md_output(resp)
+                except Exception as exc:
+                    # Transport error (serial disconnect, timeout, etc.)
+                    retries_total += 1
+                    if attempt < max_retries:
+                        if on_log:
+                            on_log(f"Transport error at 0x{offset:x}: {exc}, retry {attempt + 1}")
+                        import asyncio
+                        await asyncio.sleep(1.0)
+                        # Try to recover: send empty line to get a prompt
+                        try:
+                            await send_command(transport, "", timeout=3.0, wait_for="# ")
+                        except Exception:
+                            pass
+                        continue
+                    if on_log:
+                        on_log(f"Transport error at 0x{offset:x} after {max_retries} retries: {exc}")
+                    chunk_data = b"\x00" * remaining
+                    break
 
                 if len(chunk_data) == 0:
+                    retries_total += 1
                     if attempt < max_retries:
                         if on_log:
                             on_log(f"Retry {attempt + 1}: no data at 0x{offset:x}")
-                        retries_total += 1
                         continue
                     if on_log:
                         on_log(f"Warning: no data at offset 0x{offset:x}, writing zeros")
@@ -444,22 +482,25 @@ async def dump_flash(
 
                 # CRC32 verification if available
                 if has_crc32 and len(chunk_data) == remaining:
-                    import zlib
-                    local_crc = zlib.crc32(chunk_data) & 0xFFFFFFFF
-                    device_crc = await _get_device_crc32(
-                        transport, addr, remaining
-                    )
+                    try:
+                        import zlib
+                        local_crc = zlib.crc32(chunk_data) & 0xFFFFFFFF
+                        device_crc = await _get_device_crc32(
+                            transport, addr, remaining
+                        )
+                    except Exception:
+                        # CRC check failed due to transport — still have data, use it
+                        break
                     if device_crc is not None and device_crc != local_crc:
                         errors += 1
                         if attempt < max_retries:
+                            retries_total += 1
                             if on_log:
-                                retries_total += 1
-                                if on_log is not None:
-                                    on_log(
-                                        f"CRC mismatch at 0x{offset:x} "
-                                        f"(local={local_crc:08x} device={device_crc:08x}), "
-                                        f"retry {attempt + 1}"
-                                    )
+                                on_log(
+                                    f"CRC mismatch at 0x{offset:x} "
+                                    f"(local={local_crc:08x} device={device_crc:08x}), "
+                                    f"retry {attempt + 1}"
+                                )
                             continue
                         if on_log:
                             on_log(f"CRC mismatch at 0x{offset:x} after {max_retries} retries")
