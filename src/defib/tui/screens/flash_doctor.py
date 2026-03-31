@@ -13,7 +13,6 @@ from datetime import datetime
 from textual.app import ComposeResult
 from textual.containers import Vertical, Horizontal, Center
 from textual.screen import Screen
-from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
     Header,
@@ -21,7 +20,6 @@ from textual.widgets import (
     Static,
     Button,
     Select,
-    ProgressBar,
     RichLog,
 )
 from textual.reactive import reactive
