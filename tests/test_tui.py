@@ -79,9 +79,10 @@ class TestFlashDoctorScreen:
 
         app = DefibApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            screen = FlashDoctorScreen()
-            app.push_screen(screen)
+            app.start_flash_doctor(chip="hi3516ev300", port="/dev/ttyUSB0")
             await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, FlashDoctorScreen)
             assert screen.query_one("#doctor-banner") is not None
             assert screen.query_one("#sector-grid") is not None
             assert screen.query_one("#scan-stats") is not None
@@ -89,18 +90,26 @@ class TestFlashDoctorScreen:
             assert screen.query_one("#connect-scan-btn") is not None
 
     @pytest.mark.asyncio
-    async def test_flash_doctor_button_on_main_screen(self):
-        """Main screen has Flash Doctor button that opens the screen."""
-        from defib.tui.screens.flash_doctor import FlashDoctorScreen
+    async def test_flash_doctor_blocked_without_chip(self):
+        """Flash Doctor button requires chip and port selection."""
         from defib.tui.screens.main import MainScreen
 
         app = DefibApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            assert isinstance(app.screen, MainScreen)
-            btn = app.screen.query_one("#doctor-btn")
-            assert btn is not None
-
             await pilot.click("#doctor-btn")
+            await pilot.pause()
+            # Should stay on MainScreen — no chip selected
+            assert isinstance(app.screen, MainScreen)
+
+    @pytest.mark.asyncio
+    async def test_flash_doctor_opens_with_chip_and_port(self):
+        """Flash Doctor opens when chip and port are selected."""
+        from defib.tui.screens.flash_doctor import FlashDoctorScreen
+
+        app = DefibApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            # Bypass UI selection — push screen directly
+            app.start_flash_doctor(chip="hi3516ev300", port="/dev/ttyUSB0")
             await pilot.pause()
             assert isinstance(app.screen, FlashDoctorScreen)
 
@@ -112,7 +121,7 @@ class TestFlashDoctorScreen:
 
         app = DefibApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.click("#doctor-btn")
+            app.start_flash_doctor(chip="hi3516ev300", port="/dev/ttyUSB0")
             await pilot.pause()
             assert isinstance(app.screen, FlashDoctorScreen)
 
