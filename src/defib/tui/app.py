@@ -37,9 +37,9 @@ class DefibApp(App[None]):
         screen = ProgressScreen(chip, firmware_path, port, send_break)
         self.push_screen(screen)
 
-    def start_flash_doctor(self, port: str = "") -> None:
+    def start_flash_doctor(self, chip: str = "", port: str = "") -> None:
         """Switch to Flash Doctor screen."""
-        screen = FlashDoctorScreen(port=port)
+        screen = FlashDoctorScreen(chip=chip, port=port)
         self.push_screen(screen)
 
 

@@ -163,7 +163,7 @@ class MainScreen(Screen[None]):
 
     def _get_chip(self) -> str:
         sel = self.query_one("#chip-select", Select)
-        return str(sel.value) if sel.value != Select.BLANK else ""
+        return str(sel.value) if isinstance(sel.value, str) else ""
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "chip-select":
@@ -298,10 +298,20 @@ class MainScreen(Screen[None]):
             app.start_recovery(chip, firmware_path, port, send_break)
 
     def _start_flash_doctor(self) -> None:
+        chip = self._get_chip()
         port_sel = self.query_one("#port-select", Select)
-        port = str(port_sel.value) if port_sel.value != Select.BLANK else ""
+        port = str(port_sel.value) if isinstance(port_sel.value, str) else ""
+
+        errors: list[str] = []
+        if not chip:
+            errors.append("Select a chip model")
+        if not port:
+            errors.append("Select a serial port")
+        if errors:
+            self.notify("\n".join(errors), severity="error", title="Flash Doctor")
+            return
 
         from defib.tui.app import DefibApp
         app = self.app
         if isinstance(app, DefibApp):
-            app.start_flash_doctor(port)
+            app.start_flash_doctor(chip=chip, port=port)
