@@ -376,9 +376,10 @@ class FlashDoctorScreen(Screen[None]):
                 id="doctor-banner",
             )
 
+            chip_info = f"  [bold]Chip:[/] {self._chip}  " if self._chip else "  "
             yield Static(
-                f"  [bold]Chip:[/] {self._chip}  [bold]Port:[/] {self._port}\n"
-                "  [bold yellow]Power-cycle the camera, then press Start[/]",
+                f"{chip_info}[bold]Port:[/] {self._port}\n"
+                "  [dim]Connects to running agent, or uploads if needed[/]",
                 id="setup-panel",
             )
             yield Button(
@@ -463,28 +464,51 @@ class FlashDoctorScreen(Screen[None]):
         self.run_worker(self._do_upload_and_connect(), exclusive=True)
 
     async def _do_upload_and_connect(self) -> None:
-        """Upload agent via boot protocol, then connect and scan."""
+        """Try connecting to running agent first, upload if needed."""
         import asyncio as aio
 
         from defib.agent.client import FlashAgentClient, get_agent_binary
-        from defib.firmware import get_cached_path, download_firmware, has_firmware
-        from defib.profiles.loader import load_profile
-        from defib.protocol.hisilicon_standard import HiSiliconStandard
-        from defib.recovery.events import ProgressEvent
         from defib.transport.serial import SerialTransport
 
         chip = self._chip
         port = self._port
 
-        # Find agent binary
+        # Try connecting to a running agent first
+        try:
+            transport = await SerialTransport.create(port)
+        except Exception as e:
+            self._log(f"[red]Port error:[/] {e}")
+            return
+
+        self._log("Checking for running agent...")
+        client = FlashAgentClient(transport, chip)
+        if await client.connect(timeout=3.0):
+            info = await client.get_info()
+            if info:
+                self._log("[green]Agent already running![/]")
+                await self._connected(transport, client, info)
+                return
+
+        # No agent running — upload
+        await transport.close()
+        if not chip:
+            self._log("[red]No agent running and no chip selected — "
+                       "go back and select a chip to upload[/]")
+            return
+
+        self._log("No agent found. Uploading...")
+
         agent_path = get_agent_binary(chip)
         if not agent_path:
             self._log(f"[red]No agent binary for '{chip}'[/]")
             return
-
         agent_data = agent_path.read_bytes()
 
-        # Get SPL from cached U-Boot (download if needed)
+        from defib.firmware import get_cached_path, download_firmware, has_firmware
+        from defib.profiles.loader import load_profile
+        from defib.protocol.hisilicon_standard import HiSiliconStandard
+        from defib.recovery.events import ProgressEvent
+
         try:
             profile = load_profile(chip)
         except Exception as e:
@@ -510,14 +534,8 @@ class FlashDoctorScreen(Screen[None]):
             f"SPL: {len(spl_data)} bytes"
         )
 
-        # Open serial port
-        try:
-            transport = await SerialTransport.create(port)
-        except Exception as e:
-            self._log(f"[red]Port error:[/] {e}")
-            return
+        transport = await SerialTransport.create(port)
 
-        # Handshake + upload via boot protocol
         protocol = HiSiliconStandard()
         protocol.set_profile(profile)
 
@@ -525,6 +543,7 @@ class FlashDoctorScreen(Screen[None]):
             if e.message:
                 self._log(f"  {e.message}")
 
+        self._log("[yellow]Waiting for bootrom — power-cycle now![/]")
         hs = await protocol.handshake(transport, on_progress)
         if not hs.success:
             self._log("[red]Handshake failed[/]")
@@ -541,7 +560,6 @@ class FlashDoctorScreen(Screen[None]):
 
         self._log("[green]Agent uploaded![/] Waiting for READY...")
 
-        # Reconnect and wait for agent
         await transport.close()
         await aio.sleep(2)
         transport = await SerialTransport.create(port)
@@ -553,8 +571,17 @@ class FlashDoctorScreen(Screen[None]):
             return
 
         info = await client.get_info()
+        await self._connected(transport, client, info)
+
+    async def _connected(
+        self, transport: object, client: object, info: dict,  # type: ignore[type-arg]
+    ) -> None:
+        """Set up state after successful agent connection and start scan."""
+        from defib.agent.client import FlashAgentClient
+
+        c: FlashAgentClient = client  # type: ignore[assignment]
         self._transport = transport
-        self._client = client
+        self._client = c
         self._flash_size = int(info.get("flash_size", 0))
         self._sector_size = int(info.get("sector_size", 0x10000))
         self._num_sectors = self._flash_size // self._sector_size if self._sector_size else 0

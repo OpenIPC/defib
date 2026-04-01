@@ -299,13 +299,8 @@ class MainScreen(Screen[None]):
         port_sel = self.query_one("#port-select", Select)
         port = str(port_sel.value) if isinstance(port_sel.value, str) else ""
 
-        errors: list[str] = []
-        if not chip:
-            errors.append("Select a chip model")
         if not port:
-            errors.append("Select a serial port")
-        if errors:
-            self.notify("\n".join(errors), severity="error", title="Flash Doctor")
+            self.notify("Select a serial port", severity="error", title="Flash Doctor")
             return
 
         from defib.tui.app import DefibApp
