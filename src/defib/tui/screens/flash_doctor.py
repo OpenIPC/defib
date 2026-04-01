@@ -471,7 +471,11 @@ class FlashDoctorScreen(Screen[None]):
         elif event.button.id == "scan-btn":
             self._start_rescan()
         elif event.button.id == "save-btn":
-            self.run_worker(self._save_recoverable_data(), exclusive=True, thread=True)
+            import threading
+            threading.Thread(
+                target=lambda: asyncio.run(self._save_recoverable_data()),
+                daemon=True,
+            ).start()
         elif event.button.id == "back-btn-doctor":
             self.action_go_back()
 
@@ -552,7 +556,9 @@ class FlashDoctorScreen(Screen[None]):
         self._launch_scan()
 
     def _launch_scan(self) -> None:
-        """Prepare UI and start scan in a background thread."""
+        """Prepare UI and start scan in a plain background thread."""
+        import threading
+
         from defib.agent.client import SectorResult
 
         self._scanning = True
@@ -575,14 +581,17 @@ class FlashDoctorScreen(Screen[None]):
 
         self._log("[bright_cyan]Scanning flash...[/]")
 
-        # Timer polls for results from the worker thread at ~12fps
+        # Timer polls for results from the scan thread at ~12fps
         self._scan_timer = self.set_interval(1 / 12, self._poll_scan_results)
 
-        # Run the blocking scan in a background thread
-        self.run_worker(self._run_scan_thread(), exclusive=True, thread=True)
+        # Plain thread — no Textual worker, no event loop interference
+        thread = threading.Thread(target=self._scan_thread_fn, daemon=True)
+        thread.start()
 
-    async def _run_scan_thread(self) -> None:
-        """Run scan_flash in a worker thread (has its own event loop)."""
+    def _scan_thread_fn(self) -> None:
+        """Run scan_flash in a plain thread (blocking serial I/O happens here)."""
+        import asyncio as _aio
+
         from defib.agent.client import FlashAgentClient, SectorResult
 
         client: FlashAgentClient = self._client  # type: ignore[assignment]
@@ -591,7 +600,7 @@ class FlashDoctorScreen(Screen[None]):
             self._pending_sectors.append(result)
 
         try:
-            scan_result = await client.scan_flash(on_sector=on_sector)
+            scan_result = _aio.run(client.scan_flash(on_sector=on_sector))
             self._scan_result = scan_result
         except Exception as e:
             self.app.call_from_thread(self._scan_error, str(e))
