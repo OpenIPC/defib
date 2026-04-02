@@ -1,6 +1,7 @@
 """Tests for the Textual TUI."""
 
 import pytest
+from types import SimpleNamespace
 
 from defib.tui.app import DefibApp
 
@@ -31,6 +32,23 @@ class TestTUIApp:
             assert screen.query_one("#file-input") is not None
             assert screen.query_one("#port-select") is not None
             assert screen.query_one("#start-btn") is not None
+
+    def test_serial_port_options_prefer_alias_when_present(self, monkeypatch):
+        from defib.tui.screens.main import _get_serial_ports
+
+        fake_port = SimpleNamespace(
+            display_name="/dev/uart-orangepi5plus -> /dev/ttyUSB1 | FTDI FT232R USB UART | loc 5-2 | ser A50285BI",
+            open_path="/dev/uart-orangepi5plus",
+        )
+        monkeypatch.setattr("defib.tui.screens.main.list_serial_ports", lambda: [fake_port])
+
+        options = _get_serial_ports()
+        assert options == [
+            (
+                "/dev/uart-orangepi5plus -> /dev/ttyUSB1 | FTDI FT232R USB UART | loc 5-2 | ser A50285BI",
+                "/dev/uart-orangepi5plus",
+            )
+        ]
 
     @pytest.mark.asyncio
     async def test_start_without_input_shows_error(self):

@@ -28,8 +28,11 @@ defib list-chips
 # List available serial ports
 defib ports
 
-# Recover a device via UART
+# Recover a device via UART using a raw device path
 defib burn -c hi3516ev300 -f u-boot.bin -p /dev/ttyUSB0
+
+# Recover a device via UART using a stable alias
+defib burn -c hi3516ev300 -f u-boot.bin -p /dev/uart-orangepi5plus
 
 # Interactive TUI
 defib tui
@@ -49,6 +52,7 @@ defib burn -c gk7205v200 -f u-boot.bin --output json
 - Multiple interfaces: CLI, TUI, Web UI, JSON for automation
 - Network recovery (async TFTP server, broadcast discovery)
 - UART session capture/replay (.dcap format)
+- Friendly serial-port discovery for multi-UART setups
 - macOS serial workaround (ACK byte correction)
 - Cross-platform: Linux, macOS, Windows
 

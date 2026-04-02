@@ -1,6 +1,7 @@
 """Tests for the CLI interface."""
 
 import re
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
@@ -54,6 +55,56 @@ class TestPortsCommand:
         assert result.exit_code == 0
         data = json.loads(result.stdout)
         assert "ports" in data
+
+    def test_ports_json_includes_rich_metadata(self, monkeypatch):
+        import json
+
+        fake_port = SimpleNamespace(
+            device="/dev/ttyUSB1",
+            description="FT232R USB UART - FT232R USB UART",
+            hwid="USB VID:PID=0403:6001 SER=A50285BI LOCATION=5-2",
+            alias_device="/dev/uart-orangepi5plus",
+            open_path="/dev/uart-orangepi5plus",
+            display_name="/dev/uart-orangepi5plus -> /dev/ttyUSB1 | FTDI FT232R USB UART | loc 5-2 | ser A50285BI",
+            manufacturer="FTDI",
+            product="FT232R USB UART",
+            serial_number="A50285BI",
+            location="5-2",
+            vid=0x0403,
+            pid=0x6001,
+        )
+        monkeypatch.setattr("defib.serial_ports.list_serial_ports", lambda: [fake_port])
+
+        result = runner.invoke(app, ["ports", "--output", "json"])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["ports"][0]["device"] == "/dev/ttyUSB1"
+        assert data["ports"][0]["alias_device"] == "/dev/uart-orangepi5plus"
+        assert data["ports"][0]["display_name"].startswith("/dev/uart-orangepi5plus -> /dev/ttyUSB1")
+
+    def test_ports_human_shows_alias_and_location(self, monkeypatch):
+        fake_port = SimpleNamespace(
+            device="/dev/ttyUSB1",
+            description="FT232R USB UART - FT232R USB UART",
+            hwid="USB VID:PID=0403:6001 SER=A50285BI LOCATION=5-2",
+            alias_device="/dev/uart-orangepi5plus",
+            open_path="/dev/uart-orangepi5plus",
+            display_name="/dev/uart-orangepi5plus -> /dev/ttyUSB1 | FTDI FT232R USB UART | loc 5-2 | ser A50285BI",
+            manufacturer="FTDI",
+            product="FT232R USB UART",
+            serial_number="A50285BI",
+            location="5-2",
+            vid=0x0403,
+            pid=0x6001,
+        )
+        monkeypatch.setattr("defib.serial_ports.list_serial_ports", lambda: [fake_port])
+
+        result = runner.invoke(app, ["ports"])
+        assert result.exit_code == 0
+        output = _strip_ansi(result.stdout)
+        assert "/dev/uart-" in output
+        assert "/dev/ttyUSB1" in output
+        assert "5-2" in output
 
 
 class TestDetectHelp:

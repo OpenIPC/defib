@@ -226,18 +226,27 @@ def ports(
     import json as json_mod
     from rich.console import Console
     from rich.table import Table
-    from serial.tools.list_ports import comports
+    from defib.serial_ports import list_serial_ports
 
-    # Filter out ghost/placeholder ports (no USB vendor ID = not a real adapter)
-    port_list = sorted(
-        [p for p in comports() if p.vid is not None],
-        key=lambda p: p.device,
-    )
+    port_list = list_serial_ports()
 
     if output == "json":
         print(json_mod.dumps({
             "ports": [
-                {"device": p.device, "description": p.description, "hwid": p.hwid}
+                {
+                    "device": p.device,
+                    "description": p.description,
+                    "hwid": p.hwid,
+                    "alias_device": p.alias_device,
+                    "open_path": p.open_path,
+                    "display_name": p.display_name,
+                    "manufacturer": p.manufacturer,
+                    "product": p.product,
+                    "serial_number": p.serial_number,
+                    "location": p.location,
+                    "vid": p.vid,
+                    "pid": p.pid,
+                }
                 for p in port_list
             ]
         }))
@@ -248,11 +257,20 @@ def ports(
             return
 
         table = Table(title="Serial Ports")
+        table.add_column("Alias", style="green")
         table.add_column("Device", style="cyan")
-        table.add_column("Description")
-        table.add_column("Hardware ID", style="dim")
+        table.add_column("Identity")
+        table.add_column("Location", style="magenta")
+        table.add_column("Serial", style="yellow")
         for p in port_list:
-            table.add_row(p.device, p.description, p.hwid)
+            identity = " ".join(part for part in (p.manufacturer, p.product) if part) or p.description
+            table.add_row(
+                p.alias_device or "",
+                p.device,
+                identity,
+                p.location or "",
+                p.serial_number or "",
+            )
         console.print(table)
 
 
