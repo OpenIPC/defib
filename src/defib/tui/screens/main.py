@@ -20,18 +20,15 @@ from textual.widgets import (
 
 from defib.firmware import has_firmware, download_firmware, get_cached_path
 from defib.profiles.loader import list_all_chips
+from defib.serial_ports import list_serial_ports
 
 
 def _get_serial_ports() -> list[tuple[str, str]]:
     """Get available serial ports as (label, value) tuples."""
     try:
-        from serial.tools.list_ports import comports
-        ports = sorted(
-            [p for p in comports() if p.vid is not None],
-            key=lambda p: p.device,
-        )
+        ports = list_serial_ports()
         if ports:
-            return [(f"{p.device} - {p.description}", p.device) for p in ports]
+            return [(p.display_name, p.open_path) for p in ports]
     except Exception:
         pass
     return [("No ports found", "")]
