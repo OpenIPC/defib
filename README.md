@@ -56,6 +56,31 @@ defib burn -c gk7205v200 -f u-boot.bin --output json
 - macOS serial workaround (ACK byte correction)
 - Cross-platform: Linux, macOS, Windows
 
+## Automated Power Cycling (PoE)
+
+Defib can automatically power-cycle devices via a MikroTik PoE switch,
+eliminating manual intervention for recovery loops and research workflows.
+
+```bash
+export DEFIB_POE_HOST=192.168.88.1
+export DEFIB_POE_USER=admin
+export DEFIB_POE_PASS=
+
+defib burn -c hi3516ev300 -p /dev/uart-IVG85HG50PYA-S --power-cycle -b
+```
+
+The `--power-cycle` flag connects to the RouterOS API, auto-discovers the PoE
+port by matching the serial device name against switch interface comments, and
+power-cycles the device before recovery. A continuous ACK mechanism ensures the
+bootrom is caught even on fast-booting devices where the bootrom window is <100ms.
+
+Tested on real hardware with CRS112-8P-4S:
+
+| Camera | SoC | Serial Port |
+|--------|-----|-------------|
+| IVGHP203Y-AF | hi3516cv300 | `/dev/uart-IVGHP203Y-AF` |
+| IVG85HG50PYA-S | hi3516ev300 | `/dev/uart-IVG85HG50PYA-S` |
+
 ## Testing with QEMU
 
 Defib can be tested end-to-end against the
