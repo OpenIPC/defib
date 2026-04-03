@@ -151,9 +151,9 @@ class HiSiliconStandard(BootProtocol):
     ) -> bool:
         """Send a frame and wait for ACK, retrying on failure."""
         for _ in range(retries):
+            await transport.flush_input()
             await transport.flush_output()
             await transport.write(frame_data)
-            await transport.flush_input()
             try:
                 ack = await transport.read(1, timeout=timeout)
                 if ack == ACK_BYTE:
