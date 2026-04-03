@@ -44,13 +44,37 @@ defib network -f firmware.bin --nic eth0
 defib burn -c gk7205v200 -f u-boot.bin --output json
 ```
 
+## Full Firmware Install (UART + TFTP)
+
+Flash a complete OpenIPC release (U-Boot + kernel + rootfs) in one command:
+
+```bash
+defib install -c hi3516ev300 \
+  --firmware openipc.hi3516ev300-nor-lite.tgz \
+  -p /dev/uart-IVG85HG50PYA-S \
+  --power-cycle --nor-size 8
+```
+
+The install command orchestrates the entire process:
+1. Extracts and verifies the firmware tarball (MD5 checksums)
+2. Downloads U-Boot from OpenIPC (or uses cached copy)
+3. Burns U-Boot to RAM via boot ROM protocol
+4. Breaks into U-Boot console
+5. Starts a multi-file TFTP server and configures U-Boot networking
+6. Flashes each partition (U-Boot, kernel, rootfs) with CRC32 verification
+7. Saves the boot environment and resets
+
+Requires root for TFTP port 69 and NIC IP assignment. Supports both 8MB and
+16MB NOR flash layouts (`--nor-size 8` or `--nor-size 16`).
+
 ## Features
 
 - All 3 HiSilicon/Goke UART protocols (Standard, V500, CV6xx)
 - 120+ supported SoC chips
+- Full firmware install via UART + TFTP with CRC32 verification
 - Plugin architecture for future vendor protocols
 - Multiple interfaces: CLI, TUI, Web UI, JSON for automation
-- Network recovery (async TFTP server, broadcast discovery)
+- Multi-file TFTP server with filename-based routing
 - UART session capture/replay (.dcap format)
 - Friendly serial-port discovery for multi-UART setups
 - macOS serial workaround (ACK byte correction)

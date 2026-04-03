@@ -67,21 +67,28 @@ class TFTPServerStats:
 class TFTPServerProtocol(asyncio.DatagramProtocol):
     """Async TFTP server protocol.
 
-    Serves a single file to any client that requests it via RRQ.
+    Serves files to clients via RRQ. Supports multi-file mode (route by
+    requested filename) and single-file mode (serve same data regardless
+    of requested filename).
     """
 
     def __init__(
         self,
-        file_data: bytes,
+        file_data: bytes | None = None,
         filename: str = "firmware.bin",
         on_progress: Callable[[int, int], None] | None = None,
+        *,
+        files: dict[str, bytes] | None = None,
+        done_count: int = 1,
     ) -> None:
-        self._file_data = file_data
+        self._files = files or {}
+        self._default_data = file_data
         self._filename = filename
         self._on_progress = on_progress
         self._transfers: dict[tuple[str, int], TFTPTransfer] = {}
         self._transport: asyncio.DatagramTransport | None = None
         self.stats = TFTPServerStats()
+        self._done_count = done_count
         self._done_event = asyncio.Event()
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
@@ -117,6 +124,12 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
 
         logger.info("TFTP RRQ from %s:%d for '%s' (mode=%s)", addr[0], addr[1], filename, mode)
 
+        # Resolve file data: try exact match, then basename, then default
+        serve_data = self._resolve_file(filename)
+        if serve_data is None:
+            self._send_error(addr, ERR_FILE_NOT_FOUND, f"File not found: {filename}")
+            return
+
         # Parse options (RFC 2347)
         blocksize = DEFAULT_BLOCKSIZE
         options = {}
@@ -134,7 +147,7 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
             except ValueError:
                 pass
 
-        transfer = TFTPTransfer(addr=addr, data=self._file_data, blocksize=blocksize)
+        transfer = TFTPTransfer(addr=addr, data=serve_data, blocksize=blocksize)
         self._transfers[addr] = transfer
 
         # Send OACK if options were negotiated
@@ -175,11 +188,33 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
                 self.stats.bytes_sent += len(transfer.data)
                 logger.info("Transfer complete to %s:%d (%d bytes)", addr[0], addr[1], len(transfer.data))
                 del self._transfers[addr]
-                self._done_event.set()
+                if self.stats.transfers_complete >= self._done_count:
+                    self._done_event.set()
                 return
 
             # Send next block
             self._send_data_block(transfer)
+
+    def _resolve_file(self, filename: str) -> bytes | None:
+        """Look up file data for a requested filename.
+
+        Tries exact match in files dict, then basename-only match,
+        then falls back to default data (single-file mode).
+        """
+        if self._files:
+            if filename in self._files:
+                return self._files[filename]
+            # Try basename (U-Boot may prepend path)
+            import posixpath
+            basename = posixpath.basename(filename)
+            if basename in self._files:
+                return self._files[basename]
+            # Try case-insensitive
+            for key, data in self._files.items():
+                if key.lower() == filename.lower() or key.lower() == basename.lower():
+                    return data
+        # Fallback: default data (single-file / backward-compat mode)
+        return self._default_data
 
     def _handle_error(self, data: bytes, addr: tuple[str, int]) -> None:
         """Handle error from client."""
@@ -224,32 +259,45 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
 
 
 async def start_tftp_server(
-    file_data: bytes,
+    file_data: bytes | None = None,
     bind_addr: str = "0.0.0.0",
     port: int = DEFAULT_PORT,
     filename: str = "firmware.bin",
     on_progress: Callable[[int, int], None] | None = None,
+    *,
+    files: dict[str, bytes] | None = None,
+    done_count: int = 1,
 ) -> tuple[asyncio.DatagramTransport, TFTPServerProtocol]:
     """Start an async TFTP server.
 
     Args:
-        file_data: The firmware data to serve.
+        file_data: Single firmware data to serve (backward compat).
         bind_addr: Address to bind to.
         port: UDP port (default 69, needs root on Linux).
         filename: Filename to advertise (metadata only).
         on_progress: Callback(bytes_sent, bytes_total) for progress.
+        files: Dict mapping filenames to data for multi-file mode.
+        done_count: Number of completed transfers before done_event fires.
 
     Returns:
         Tuple of (transport, protocol) for the running server.
     """
     loop = asyncio.get_running_loop()
-    protocol = TFTPServerProtocol(file_data, filename, on_progress)
+    protocol = TFTPServerProtocol(
+        file_data, filename, on_progress,
+        files=files, done_count=done_count,
+    )
 
     transport, _ = await loop.create_datagram_endpoint(
         lambda: protocol,
         local_addr=(bind_addr, port),
     )
 
-    logger.info("TFTP server listening on %s:%d (serving %d bytes)", bind_addr, port, len(file_data))
+    total = len(file_data) if file_data else sum(len(v) for v in (files or {}).values())
+    if files:
+        logger.info("TFTP server listening on %s:%d (serving %d files, %d bytes total)",
+                     bind_addr, port, len(files), total)
+    else:
+        logger.info("TFTP server listening on %s:%d (serving %d bytes)", bind_addr, port, total)
     assert isinstance(transport, asyncio.DatagramTransport)
     return transport, protocol

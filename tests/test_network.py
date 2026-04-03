@@ -146,6 +146,80 @@ class TestTFTPServerProtocol:
         protocol.datagram_received(err, addr)
         assert protocol.stats.errors == 1
 
+    def test_multi_file_by_name(self):
+        """Multi-file mode serves different data based on requested filename."""
+        files = {
+            "uImage": b"KERNEL" * 100,
+            "rootfs.squashfs": b"ROOTFS" * 200,
+        }
+        protocol = TFTPServerProtocol(files=files)
+        transport = MockDatagramTransport()
+        protocol.connection_made(transport)
+
+        # Request uImage
+        addr1 = ("10.0.0.1", 1111)
+        rrq1 = struct.pack("!H", OPCODE_RRQ) + b"uImage\x00octet\x00"
+        protocol.datagram_received(rrq1, addr1)
+        pkt1 = transport.sent[0][0]
+        assert pkt1[4:4+6] == b"KERNEL"
+
+        # Request rootfs from different client
+        addr2 = ("10.0.0.1", 2222)
+        rrq2 = struct.pack("!H", OPCODE_RRQ) + b"rootfs.squashfs\x00octet\x00"
+        protocol.datagram_received(rrq2, addr2)
+        pkt2 = transport.sent[1][0]
+        assert pkt2[4:4+6] == b"ROOTFS"
+
+    def test_multi_file_not_found(self):
+        """Multi-file mode with no default returns FILE_NOT_FOUND for unknown names."""
+        files = {"kernel.bin": b"data"}
+        protocol = TFTPServerProtocol(files=files)
+        transport = MockDatagramTransport()
+        protocol.connection_made(transport)
+
+        addr = ("10.0.0.1", 3333)
+        rrq = struct.pack("!H", OPCODE_RRQ) + b"unknown.bin\x00octet\x00"
+        protocol.datagram_received(rrq, addr)
+        pkt = transport.sent[0][0]
+        opcode = struct.unpack("!H", pkt[:2])[0]
+        assert opcode == OPCODE_ERROR
+
+    def test_multi_file_with_default_fallback(self):
+        """Multi-file mode with default data falls back for unknown filenames."""
+        files = {"kernel.bin": b"KERNEL"}
+        protocol = TFTPServerProtocol(file_data=b"DEFAULT", files=files)
+        transport = MockDatagramTransport()
+        protocol.connection_made(transport)
+
+        addr = ("10.0.0.1", 4444)
+        rrq = struct.pack("!H", OPCODE_RRQ) + b"anything.bin\x00octet\x00"
+        protocol.datagram_received(rrq, addr)
+        pkt = transport.sent[0][0]
+        assert pkt[4:4+7] == b"DEFAULT"
+
+    def test_done_count(self):
+        """done_event fires only after done_count transfers complete."""
+        files = {"a.bin": b"A" * 100, "b.bin": b"B" * 100}
+        protocol = TFTPServerProtocol(files=files, done_count=2)
+        transport = MockDatagramTransport()
+        protocol.connection_made(transport)
+
+        # Complete first transfer
+        addr1 = ("10.0.0.1", 1111)
+        rrq1 = struct.pack("!H", OPCODE_RRQ) + b"a.bin\x00octet\x00"
+        protocol.datagram_received(rrq1, addr1)
+        protocol.datagram_received(struct.pack("!HH", OPCODE_ACK, 1), addr1)
+        assert protocol.stats.transfers_complete == 1
+        assert not protocol._done_event.is_set()
+
+        # Complete second transfer
+        addr2 = ("10.0.0.1", 2222)
+        rrq2 = struct.pack("!H", OPCODE_RRQ) + b"b.bin\x00octet\x00"
+        protocol.datagram_received(rrq2, addr2)
+        protocol.datagram_received(struct.pack("!HH", OPCODE_ACK, 1), addr2)
+        assert protocol.stats.transfers_complete == 2
+        assert protocol._done_event.is_set()
+
     def test_progress_callback(self):
         """Progress callback should be called during transfer."""
         progress_calls: list[tuple[int, int]] = []
