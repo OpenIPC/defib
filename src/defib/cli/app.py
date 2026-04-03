@@ -1341,7 +1341,6 @@ async def _install_async(
     import logging
     import re as re_mod
     import tarfile
-    import tempfile
     import zlib
     from pathlib import Path
 
@@ -1480,7 +1479,7 @@ async def _install_async(
     )
 
     if output == "human":
-        console.print(f"\n[bold yellow]Phase 1: Burning U-Boot to RAM[/bold yellow]")
+        console.print("\n[bold yellow]Phase 1: Burning U-Boot to RAM[/bold yellow]")
         if not power_cycle:
             console.print("  [yellow]Power-cycle the camera now![/yellow]")
 
@@ -1514,7 +1513,7 @@ async def _install_async(
 
     # --- Step 4: U-Boot console — probe flash ---
     if output == "human":
-        console.print(f"\n[bold yellow]Phase 2: Flash via TFTP[/bold yellow]")
+        console.print("\n[bold yellow]Phase 2: Flash via TFTP[/bold yellow]")
 
     ram_addr = get_ram_staging_addr(chip)
 
