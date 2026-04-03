@@ -57,7 +57,7 @@ class HiSiliconStandard(BootProtocol):
 
     def __init__(self) -> None:
         self._profile: SoCProfile | None = None
-        self._continuous_ack = True
+        self._continuous_ack = False
 
     @classmethod
     def name(cls) -> str:
@@ -87,37 +87,52 @@ class HiSiliconStandard(BootProtocol):
     ) -> HandshakeResult:
         """Wait for bootrom 0x20 pattern and send 0xAA acknowledgment.
 
-        When continuous_ack is enabled (via set_continuous_ack), sends 0xAA
-        every ~50ms while waiting. This ensures the bootrom sees 0xAA
-        immediately on startup, critical for fast-booting devices where the
-        bootrom window is <100ms.
+        Two modes controlled by set_continuous_ack():
+
+        continuous_ack=True (automated power cycling):
+            Floods 0xAA every ~50ms from the start. Safe because the device
+            is guaranteed to be off/rebooting — no running OS to echo back.
+
+        continuous_ack=False (manual power cycling, default):
+            Waits silently until the device stops responding (power-off
+            detected via timeout after receiving data), then floods 0xAA
+            so the bootrom sees it immediately on next boot.
         """
         _emit(on_progress, ProgressEvent(
             stage=Stage.HANDSHAKE, bytes_sent=0, bytes_total=1,
             message="Waiting for bootrom... power-cycle the device now!",
         ))
 
-        continuous = self._continuous_ack
+        flooding = self._continuous_ack
+        ever_saw_data = False
         counter = 0
+
         while True:
-            if continuous:
+            if flooding:
                 await transport.write(BOOTMODE_ACK)
 
             try:
-                byte = await transport.read(1, timeout=0.05 if continuous else 1.0)
+                byte = await transport.read(1, timeout=0.05 if flooding else 1.0)
             except TransportTimeout:
+                if not flooding and ever_saw_data:
+                    # Was getting data, now silence — device powered off.
+                    # Start flooding 0xAA so bootrom sees it on next boot.
+                    logger.debug("Device went silent, flooding 0xAA")
+                    flooding = True
                 continue
 
             if byte == b"\x00":
                 continue
+
+            ever_saw_data = True
+
             if byte == BOOTMODE_MARKER:
                 counter += 1
             else:
                 counter = 0
 
             if counter >= BOOTMODE_COUNT:
-                if not continuous:
-                    await transport.flush_output()
+                if not flooding:
                     await transport.write(BOOTMODE_ACK)
                 await transport.flush_input()
 
