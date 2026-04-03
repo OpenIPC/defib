@@ -1279,5 +1279,404 @@ def _parse_size(s: str) -> int:
     return int(s, 0)
 
 
+@app.command()
+def install(
+    chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
+    firmware: str = typer.Option(..., "--firmware", help="OpenIPC firmware tarball (.tgz)"),
+    port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
+    power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via PoE"),
+    nic: str = typer.Option("", "--nic", help="Network interface for TFTP (auto-detect if empty)"),
+    host_ip: str = typer.Option("192.168.1.10", "--host-ip", help="IP to assign to host NIC for TFTP"),
+    device_ip: str = typer.Option("192.168.1.20", "--device-ip", help="IP for camera in U-Boot"),
+    tftp_port: int = typer.Option(69, "--tftp-port", help="TFTP server port"),
+    nor_size: int = typer.Option(8, "--nor-size", help="NOR flash size in MB (8 or 16)"),
+    output: str = typer.Option("human", "--output", help="Output mode: human, json"),
+    debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
+) -> None:
+    """Install a full OpenIPC firmware (U-Boot + kernel + rootfs) via UART + TFTP.
+
+    Extracts the firmware tarball, burns U-Boot to RAM via boot ROM,
+    then uses TFTP to transfer kernel and rootfs to U-Boot which
+    flashes them to NOR.
+    """
+    import asyncio
+    asyncio.run(_install_async(
+        chip, firmware, port, power_cycle, nic, host_ip, device_ip,
+        tftp_port, nor_size, output, debug,
+    ))
+
+
+# 8MB NOR flash layout (matches U-Boot setnor8m / mtdpartsnor8m)
+_NOR8M_LAYOUT = {
+    "boot":        (0x000000, 0x40000),   # 256KB
+    "env":         (0x040000, 0x10000),   # 64KB
+    "kernel":      (0x050000, 0x200000),  # 2MB
+    "rootfs":      (0x250000, 0x500000),  # 5120KB
+}
+
+# 16MB NOR flash layout (matches U-Boot setnor16m / mtdpartsnor16m)
+_NOR16M_LAYOUT = {
+    "boot":        (0x000000, 0x40000),   # 256KB
+    "env":         (0x040000, 0x10000),   # 64KB
+    "kernel":      (0x050000, 0x300000),  # 3MB
+    "rootfs":      (0x350000, 0xA00000),  # 10240KB
+}
+
+
+async def _install_async(
+    chip: str,
+    firmware_path: str,
+    port: str,
+    power_cycle: bool,
+    nic: str,
+    host_ip: str,
+    device_ip: str,
+    tftp_port: int,
+    nor_size: int,
+    output: str,
+    debug: bool,
+) -> None:
+    import hashlib
+    import json as json_mod
+    import logging
+    import re as re_mod
+    import tarfile
+    import tempfile
+    import zlib
+    from pathlib import Path
+
+    from rich.console import Console
+
+    from defib.flashdump import get_ram_staging_addr, send_command
+    from defib.firmware import download_firmware, get_cached_path, has_firmware
+    from defib.network.ip_manager import list_interfaces, temporary_ip
+    from defib.network.tftp_server import start_tftp_server
+    from defib.recovery.events import LogEvent, ProgressEvent
+    from defib.recovery.session import RecoverySession
+    from defib.transport.serial_platform import create_transport, normalize_port_name
+
+    console = Console()
+
+    if debug:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+
+    layout = _NOR16M_LAYOUT if nor_size >= 16 else _NOR8M_LAYOUT
+
+    # --- Step 1: Extract firmware tarball ---
+    if output == "human":
+        console.print("[bold]OpenIPC Firmware Install[/bold]")
+        console.print(f"  Chip: [cyan]{chip}[/cyan]")
+        console.print(f"  Port: [cyan]{port}[/cyan]")
+        console.print(f"  NOR:  [cyan]{nor_size}MB[/cyan]")
+
+    kernel_data: bytes | None = None
+    rootfs_data: bytes | None = None
+    kernel_name = ""
+    rootfs_name = ""
+
+    with tarfile.open(firmware_path, "r:gz") as tf:
+        for member in tf.getmembers():
+            name = member.name
+            if name.endswith(".md5sum"):
+                continue
+            if name.startswith("uImage"):
+                kernel_name = name
+                f = tf.extractfile(member)
+                assert f is not None
+                kernel_data = f.read()
+            elif name.startswith("rootfs.squashfs"):
+                rootfs_name = name
+                f = tf.extractfile(member)
+                assert f is not None
+                rootfs_data = f.read()
+
+    if not kernel_data or not rootfs_data:
+        console.print("[red]Tarball missing uImage or rootfs.squashfs[/red]")
+        raise typer.Exit(1)
+
+    # Verify md5sums if present
+    with tarfile.open(firmware_path, "r:gz") as tf:
+        for member in tf.getmembers():
+            if not member.name.endswith(".md5sum"):
+                continue
+            f = tf.extractfile(member)
+            assert f is not None
+            expected_line = f.read().decode().strip()
+            expected_md5 = expected_line.split()[0]
+            base_name = member.name.removesuffix(".md5sum")
+            if base_name == kernel_name:
+                actual = hashlib.md5(kernel_data).hexdigest()
+                if actual != expected_md5:
+                    console.print(f"[red]MD5 mismatch for {kernel_name}[/red]")
+                    raise typer.Exit(1)
+            elif base_name == rootfs_name:
+                actual = hashlib.md5(rootfs_data).hexdigest()
+                if actual != expected_md5:
+                    console.print(f"[red]MD5 mismatch for {rootfs_name}[/red]")
+                    raise typer.Exit(1)
+
+    k_off, k_sz = layout["kernel"]
+    r_off, r_sz = layout["rootfs"]
+
+    if len(kernel_data) > k_sz:
+        console.print(f"[red]Kernel too large: {len(kernel_data)} > {k_sz}[/red]")
+        raise typer.Exit(1)
+    if len(rootfs_data) > r_sz:
+        console.print(f"[red]Rootfs too large: {len(rootfs_data)} > {r_sz}[/red]")
+        raise typer.Exit(1)
+
+    if output == "human":
+        console.print(f"  Kernel: [cyan]{kernel_name}[/cyan] ({len(kernel_data)} bytes)")
+        console.print(f"  Rootfs: [cyan]{rootfs_name}[/cyan] ({len(rootfs_data)} bytes)")
+
+    # --- Step 2: Get U-Boot ---
+    if not has_firmware(chip):
+        console.print(f"[red]No OpenIPC U-Boot for '{chip}'[/red]")
+        raise typer.Exit(1)
+
+    cached = get_cached_path(chip)
+    if not cached:
+        if output == "human":
+            console.print(f"  Downloading U-Boot for [cyan]{chip}[/cyan]...")
+        cached = download_firmware(chip)
+
+    uboot_data = cached.read_bytes()
+    b_off, b_sz = layout["boot"]
+    env_off, env_sz = layout["env"]
+    # U-Boot to flash = boot partition (pad to boot+env size so env is clean)
+    uboot_flash_size = b_sz + env_sz
+
+    if output == "human":
+        console.print(f"  U-Boot: [cyan]{cached.name}[/cyan] ({len(uboot_data)} bytes)")
+
+    # --- Step 3: Power cycle + burn U-Boot to RAM ---
+    power_controller = None
+    poe_port = None
+    if power_cycle:
+        from defib.power.routeros import RouterOSController
+        try:
+            power_controller = RouterOSController.from_env()
+        except Exception as e:
+            console.print(f"[red]Power controller error:[/red] {e}")
+            raise typer.Exit(1)
+
+        port_basename = Path(port).name
+        device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
+        try:
+            poe_port = await power_controller.find_port_by_comment(device_label)
+        except Exception as e:
+            console.print(f"[red]PoE port discovery failed:[/red] {e}")
+            await power_controller.close()
+            raise typer.Exit(1)
+
+        if output == "human":
+            console.print(f"  PoE: [cyan]{poe_port}[/cyan]")
+
+    session = RecoverySession(
+        chip=chip, firmware_path=str(cached),
+        power_controller=power_controller, poe_port=poe_port,
+    )
+
+    if output == "human":
+        console.print(f"\n[bold yellow]Phase 1: Burning U-Boot to RAM[/bold yellow]")
+        if not power_cycle:
+            console.print("  [yellow]Power-cycle the camera now![/yellow]")
+
+    transport = await create_transport(normalize_port_name(port))
+
+    def on_log(event: LogEvent) -> None:
+        if output == "human":
+            style = {"error": "red", "warn": "yellow", "info": "green"}.get(event.level, "")
+            console.print(f"  [{style}]{event.message}[/{style}]")
+
+    def on_progress(event: ProgressEvent) -> None:
+        if output == "human" and event.message:
+            console.print(f"  {event.message}")
+
+    result = await session.run(
+        transport,
+        on_progress=on_progress,
+        on_log=on_log,
+        send_break=True,
+    )
+
+    if not result.success:
+        console.print(f"[red]Burn failed:[/red] {result.error}")
+        await transport.close()
+        if power_controller:
+            await power_controller.close()
+        raise typer.Exit(1)
+
+    if output == "human":
+        console.print(f"  [green]U-Boot loaded in {result.elapsed_ms:.0f}ms[/green]")
+
+    # --- Step 4: U-Boot console — probe flash ---
+    if output == "human":
+        console.print(f"\n[bold yellow]Phase 2: Flash via TFTP[/bold yellow]")
+
+    ram_addr = get_ram_staging_addr(chip)
+
+    resp = await send_command(transport, "sf probe 0", timeout=5.0, wait_for="# ")
+    if "error" in resp.lower() or "fail" in resp.lower():
+        console.print(f"[red]sf probe failed:[/red] {resp.strip()}")
+        await transport.close()
+        raise typer.Exit(1)
+
+    if output == "human":
+        console.print("  [green]SPI flash detected[/green]")
+
+    # --- Step 5: Start TFTP server + configure U-Boot networking ---
+    if not nic:
+        interfaces = list_interfaces()
+        if interfaces:
+            nic = interfaces[0]
+        else:
+            console.print("[red]No network interfaces found. Specify --nic.[/red]")
+            await transport.close()
+            raise typer.Exit(1)
+
+    if output == "human":
+        console.print(f"  NIC: [cyan]{nic}[/cyan], Host IP: [cyan]{host_ip}[/cyan]")
+
+    # TFTP files: U-Boot, kernel, rootfs
+    tftp_files = {
+        "u-boot.bin": uboot_data,
+        kernel_name: kernel_data,
+        rootfs_name: rootfs_data,
+    }
+
+    async with temporary_ip(nic, host_ip, "255.255.255.0"):
+        if output == "human":
+            console.print("  [green]IP assigned[/green]")
+
+        tftp_transport, tftp_protocol = await start_tftp_server(
+            files=tftp_files,
+            bind_addr=host_ip,
+            port=tftp_port,
+            done_count=3,  # U-Boot + kernel + rootfs
+        )
+
+        if output == "human":
+            console.print(f"  [green]TFTP server started on {host_ip}:{tftp_port}[/green]")
+
+        try:
+            # Configure U-Boot networking
+            await send_command(transport, f"setenv ipaddr {device_ip}", timeout=3.0, wait_for="# ")
+            await send_command(transport, f"setenv serverip {host_ip}", timeout=3.0, wait_for="# ")
+
+            if output == "human":
+                console.print(f"  Device IP: [cyan]{device_ip}[/cyan]")
+
+            async def tftp_and_flash(
+                name: str, tftp_name: str, orig_data: bytes,
+                flash_off: int, erase_sz: int,
+            ) -> None:
+                """TFTP download, flash write, and CRC verify."""
+                if output == "human":
+                    console.print(f"\n  [bold]Flashing {name}[/bold] → 0x{flash_off:X} ({len(orig_data)} bytes)")
+
+                resp = await send_command(
+                    transport,
+                    f"tftpboot 0x{ram_addr:x} {tftp_name}",
+                    timeout=120.0, wait_for="# ",
+                )
+                if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
+                    console.print(f"[red]TFTP failed for {name}:[/red]\n{resp[-300:]}")
+                    raise typer.Exit(1)
+
+                # Verify TFTP transfer in RAM before writing to flash
+                expected_crc = zlib.crc32(orig_data) & 0xFFFFFFFF
+                resp = await send_command(
+                    transport,
+                    f"crc32 0x{ram_addr:x} 0x{len(orig_data):x}",
+                    timeout=10.0, wait_for="# ",
+                )
+                m = re_mod.search(r"==>\s*([0-9a-fA-F]{8})", resp)
+                if m:
+                    ram_crc = int(m.group(1), 16)
+                    if ram_crc != expected_crc:
+                        console.print(
+                            f"[red]{name} CRC mismatch after TFTP![/red] "
+                            f"expected={expected_crc:08X} got={ram_crc:08X}"
+                        )
+                        raise typer.Exit(1)
+                    if output == "human":
+                        console.print(f"    TFTP CRC verified: {ram_crc:08X}")
+
+                await send_command(
+                    transport,
+                    f"sf erase 0x{flash_off:x} 0x{erase_sz:x}",
+                    timeout=60.0, wait_for="# ",
+                )
+                await send_command(
+                    transport,
+                    f"sf write 0x{ram_addr:x} 0x{flash_off:x} 0x{len(orig_data):x}",
+                    timeout=60.0, wait_for="# ",
+                )
+
+                # Verify flash write by reading back and checking CRC
+                await send_command(
+                    transport,
+                    f"sf read 0x{ram_addr:x} 0x{flash_off:x} 0x{len(orig_data):x}",
+                    timeout=30.0, wait_for="# ",
+                )
+                resp = await send_command(
+                    transport,
+                    f"crc32 0x{ram_addr:x} 0x{len(orig_data):x}",
+                    timeout=10.0, wait_for="# ",
+                )
+                m = re_mod.search(r"==>\s*([0-9a-fA-F]{8})", resp)
+                if m:
+                    flash_crc = int(m.group(1), 16)
+                    if flash_crc != expected_crc:
+                        console.print(
+                            f"[red]{name} flash verify failed![/red] "
+                            f"expected={expected_crc:08X} got={flash_crc:08X}"
+                        )
+                        raise typer.Exit(1)
+                    if output == "human":
+                        console.print(f"    Flash verified: {flash_crc:08X}")
+
+                if output == "human":
+                    console.print(f"  [green]{name} OK[/green]")
+
+            await tftp_and_flash("U-Boot", "u-boot.bin", uboot_data, b_off, uboot_flash_size)
+            await tftp_and_flash("kernel", kernel_name, kernel_data, k_off, k_sz)
+            await tftp_and_flash("rootfs", rootfs_name, rootfs_data, r_off, r_sz)
+
+            # Set up proper boot environment for this NOR size
+            nor_cmd = "setnor8m" if nor_size < 16 else "setnor16m"
+            if output == "human":
+                console.print(f"\n  [bold]Setting boot environment[/bold] (run {nor_cmd})")
+            # setnor8m does: set mtdparts, set bootcmd, saveenv, reset
+            # We do it manually to avoid the auto-reset
+            mtdparts_var = f"mtdpartsnor{nor_size}m"
+            await send_command(transport, f"run {mtdparts_var}", timeout=3.0, wait_for="# ")
+            await send_command(transport, "setenv bootcmd ${bootcmdnor}", timeout=3.0, wait_for="# ")
+            resp = await send_command(transport, "saveenv", timeout=10.0, wait_for="# ")
+            if output == "human":
+                console.print("  [green]Environment saved[/green]")
+
+            # Reset
+            if output == "human":
+                console.print("\n  [bold]Resetting device...[/bold]")
+            await send_command(transport, "reset", timeout=3.0)
+
+        finally:
+            tftp_transport.close()
+
+    await transport.close()
+    if power_controller:
+        await power_controller.close()
+
+    if output == "human":
+        console.print("\n[green bold]Install complete![/green bold] Device is rebooting into OpenIPC.")
+    elif output == "json":
+        import json as json_mod
+        print(json_mod.dumps({"event": "done", "success": True}))
+
+
 def main() -> None:
     app()
