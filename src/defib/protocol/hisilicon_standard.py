@@ -57,6 +57,7 @@ class HiSiliconStandard(BootProtocol):
 
     def __init__(self) -> None:
         self._profile: SoCProfile | None = None
+        self._continuous_ack = False
 
     @classmethod
     def name(cls) -> str:
@@ -69,21 +70,41 @@ class HiSiliconStandard(BootProtocol):
     def set_profile(self, profile: SoCProfile) -> None:
         self._profile = profile
 
+    def set_continuous_ack(self, enabled: bool) -> None:
+        """Enable continuous 0xAA sending during handshake.
+
+        When enabled, the handshake sends 0xAA every ~50ms while waiting
+        for the bootrom 0x20 pattern. This is needed for automated power
+        cycling where the bootrom window is too short (<100ms) to detect
+        0x20 and respond in time.
+        """
+        self._continuous_ack = enabled
+
     async def handshake(
         self,
         transport: Transport,
         on_progress: Callable[[ProgressEvent], None] | None = None,
     ) -> HandshakeResult:
-        """Wait for bootrom 0x20 pattern and send 0xAA acknowledgment."""
+        """Wait for bootrom 0x20 pattern and send 0xAA acknowledgment.
+
+        When continuous_ack is enabled (via set_continuous_ack), sends 0xAA
+        every ~50ms while waiting. This ensures the bootrom sees 0xAA
+        immediately on startup, critical for fast-booting devices where the
+        bootrom window is <100ms.
+        """
         _emit(on_progress, ProgressEvent(
             stage=Stage.HANDSHAKE, bytes_sent=0, bytes_total=1,
             message="Waiting for bootrom... power-cycle the device now!",
         ))
 
+        continuous = self._continuous_ack
         counter = 0
         while True:
+            if continuous:
+                await transport.write(BOOTMODE_ACK)
+
             try:
-                byte = await transport.read(1, timeout=1.0)
+                byte = await transport.read(1, timeout=0.05 if continuous else 1.0)
             except TransportTimeout:
                 continue
 
@@ -95,8 +116,9 @@ class HiSiliconStandard(BootProtocol):
                 counter = 0
 
             if counter >= BOOTMODE_COUNT:
-                await transport.flush_output()
-                await transport.write(BOOTMODE_ACK)
+                if not continuous:
+                    await transport.flush_output()
+                    await transport.write(BOOTMODE_ACK)
                 await transport.flush_input()
 
                 _emit(on_progress, ProgressEvent(
