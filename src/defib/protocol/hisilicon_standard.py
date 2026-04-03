@@ -57,7 +57,7 @@ class HiSiliconStandard(BootProtocol):
 
     def __init__(self) -> None:
         self._profile: SoCProfile | None = None
-        self._continuous_ack = False
+        self._continuous_ack = True
 
     @classmethod
     def name(cls) -> str:
