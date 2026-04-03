@@ -185,30 +185,26 @@ async def send_command(
     await transport.write((cmd + "\r").encode())
     buf = bytearray()
     start = time.monotonic()
-    idle_count = 0
+    idle_time = 0.0
 
     while time.monotonic() - start < timeout:
         try:
-            avail = await transport.bytes_waiting()
-            if avail > 0:
-                data = await transport.read(min(avail, 4096), timeout=0.5)
+            data = await transport.read(4096, timeout=0.1)
+            if data:
                 buf.extend(data)
-                idle_count = 0
+                idle_time = 0.0
                 if wait_for:
-                    # Check only the tail for prompt to avoid false matches
-                    # (e.g., '#' appears in md.b hex ASCII column)
                     tail = buf[-64:].decode("ascii", errors="replace")
                     if wait_for in tail:
                         return buf.decode("ascii", errors="replace")
             else:
-                idle_count += 1
-                # If we have data and serial has been idle for a bit,
-                # the command is likely done (no prompt-based detection)
-                if not wait_for and len(buf) > 0 and idle_count > 10:
+                idle_time += 0.1
+                if not wait_for and len(buf) > 0 and idle_time > 0.5:
                     return buf.decode("ascii", errors="replace")
-                import asyncio
-                await asyncio.sleep(0.05)
         except TransportTimeout:
+            idle_time += 0.1
+            if not wait_for and len(buf) > 0 and idle_time > 0.5:
+                return buf.decode("ascii", errors="replace")
             continue
 
     return buf.decode("ascii", errors="replace")
