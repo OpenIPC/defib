@@ -1,5 +1,7 @@
 """Tests for the standard HiSilicon boot protocol."""
 
+import asyncio
+
 import pytest
 
 from defib.protocol.crc import ACK_BYTE
@@ -112,6 +114,63 @@ class TestFastBootRecovery:
         # DDR step fails — the echoed bytes don't match ACK_BYTE
         assert not firmware_result.success
         assert "DDR" in (firmware_result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_power_off_detection_triggers_flood(self):
+        """Manual mode: device sends data, goes silent, handshake floods 0xAA.
+
+        Regression test for TUI hang: continuous 0xAA to a running device
+        generates 0x07 (BEL) echoes that break 0x20 detection. Fix: only
+        start flooding after detecting power-off (timeout after data).
+        """
+        transport = MockTransport(flush_clears_buffer=True)
+
+        # Phase 1: Running device sends non-0x20 data (e.g. shell output)
+        transport.enqueue_rx(b"\x07\x07\x07")
+
+        protocol = HiSiliconStandard()
+        # Default: continuous_ack=False (manual/TUI mode)
+        assert not protocol._continuous_ack
+
+        # Phase 2+3 will be fed after the running-device data is consumed
+        # and a timeout triggers the power-off detection.
+        # We use a background task to simulate the reboot delay.
+        async def simulate_reboot():
+            # Wait for the handshake to consume the 0x07 bytes and hit timeouts
+            await asyncio.sleep(0.15)
+            # Device reboots: bootrom sends 0x20 pattern + ACKs for frames
+            transport.enqueue_rx(b"\x20" * 5)
+
+        reboot_task = asyncio.create_task(simulate_reboot())
+
+        result = await protocol.handshake(transport)
+        await reboot_task
+
+        assert result.success
+        # Verify 0xAA was sent (flooding started after power-off detection)
+        assert b"\xaa" in transport.all_tx_data
+
+    @pytest.mark.asyncio
+    async def test_no_flood_while_device_running(self):
+        """Manual mode: no 0xAA sent while device is active (avoids 0x07 echo).
+
+        If we flood 0xAA to a running Linux/U-Boot, it echoes 0x07 (BEL)
+        which pollutes the buffer and prevents bootrom detection.
+        """
+        transport = MockTransport(flush_clears_buffer=True)
+
+        # Running device sends shell output, then bootrom pattern
+        # (no timeout gap = device never went silent = no flooding)
+        transport.enqueue_rx(b"shell output\r\n" + b"\x20" * 5)
+
+        protocol = HiSiliconStandard()
+        result = await protocol.handshake(transport)
+
+        assert result.success
+        # 0xAA should only appear once (the final ACK after 5x 0x20),
+        # NOT during the "shell output" phase
+        tx = transport.all_tx_data
+        assert tx == b"\xaa"
 
     @pytest.mark.asyncio
     async def test_continuous_ack_sends_aa_before_bootrom(self):
