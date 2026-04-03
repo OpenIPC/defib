@@ -86,8 +86,6 @@ class RecoverySession:
         if isinstance(protocol, HiSiliconStandard):
             profile = load_profile(self.chip)
             protocol.set_profile(profile)
-            if self._power:
-                protocol.set_continuous_ack(True)
             if on_log:
                 on_log(LogEvent(level="info", message=f"Loaded profile: {profile.name}"))
 
