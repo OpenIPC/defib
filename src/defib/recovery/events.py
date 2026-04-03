@@ -7,6 +7,7 @@ from enum import Enum
 
 
 class Stage(str, Enum):
+    POWER_CYCLE = "power_cycle"
     HANDSHAKE = "handshake"
     DDR_INIT = "ddr_init"
     SPL = "spl"

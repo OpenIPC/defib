@@ -10,6 +10,7 @@ import logging
 import time
 from typing import Callable
 
+from defib.power.base import PowerController
 from defib.profiles.loader import load_profile
 from defib.protocol.hisilicon_standard import HiSiliconStandard
 from defib.protocol.registry import find_protocol
@@ -17,6 +18,7 @@ from defib.recovery.events import (
     LogEvent,
     ProgressEvent,
     RecoveryResult,
+    Stage,
 )
 from defib.transport.base import Transport
 
@@ -36,11 +38,15 @@ class RecoverySession:
         chip: str,
         firmware_path: str | None = None,
         firmware_data: bytes | None = None,
+        power_controller: PowerController | None = None,
+        poe_port: str | None = None,
     ) -> None:
         self.chip = chip.lower()
         self._firmware_path = firmware_path
         self._firmware_data = firmware_data
         self._protocol_cls = find_protocol(self.chip)
+        self._power = power_controller
+        self._poe_port = poe_port
 
     @property
     def protocol_name(self) -> str:
@@ -82,6 +88,40 @@ class RecoverySession:
             protocol.set_profile(profile)
             if on_log:
                 on_log(LogEvent(level="info", message=f"Loaded profile: {profile.name}"))
+
+        # Power cycle (if configured)
+        if self._power and self._poe_port:
+            if on_log:
+                on_log(LogEvent(
+                    level="info",
+                    message=f"Power-cycling device on {self._poe_port}...",
+                ))
+            if on_progress:
+                on_progress(ProgressEvent(
+                    stage=Stage.POWER_CYCLE, bytes_sent=0, bytes_total=1,
+                    message=f"Power-cycling {self._poe_port}...",
+                ))
+            try:
+                await self._power.power_cycle(self._poe_port)
+            except Exception as e:
+                elapsed = (time.monotonic() - start_time) * 1000
+                if on_log:
+                    on_log(LogEvent(level="error", message=f"Power cycle failed: {e}"))
+                return RecoveryResult(
+                    success=False,
+                    error=f"Power cycle failed: {e}",
+                    elapsed_ms=elapsed,
+                )
+            if on_log:
+                on_log(LogEvent(
+                    level="info",
+                    message="Power cycle complete, waiting for bootrom...",
+                ))
+            if on_progress:
+                on_progress(ProgressEvent(
+                    stage=Stage.POWER_CYCLE, bytes_sent=1, bytes_total=1,
+                    message="Power cycle complete",
+                ))
 
         # Handshake
         if on_log:

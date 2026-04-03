@@ -17,6 +17,7 @@ def burn(
     file: str = typer.Option("", "-f", "--file", help="Firmware file (auto-downloads from OpenIPC if omitted)"),
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
     send_break: bool = typer.Option(False, "-b", "--break", help="Send Ctrl-C after upload"),
+    power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via PoE (needs DEFIB_POE_* env vars)"),
     output: str = typer.Option("human", "--output", help="Output mode: human, json, quiet"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
 ) -> None:
@@ -26,11 +27,11 @@ def burn(
     the appropriate U-Boot from OpenIPC releases.
     """
     import asyncio
-    asyncio.run(_burn_async(chip, file, port, send_break, output, debug))
+    asyncio.run(_burn_async(chip, file, port, send_break, power_cycle, output, debug))
 
 
 async def _burn_async(
-    chip: str, file: str, port: str, send_break: bool, output: str, debug: bool
+    chip: str, file: str, port: str, send_break: bool, power_cycle: bool, output: str, debug: bool
 ) -> None:
     import json as json_mod
     import logging
@@ -93,13 +94,52 @@ async def _burn_async(
                     console.print(f"\n[red]Download failed:[/red] {e}")
                 raise typer.Exit(1)
 
+    # Power controller setup
+    power_controller = None
+    poe_port = None
+    if power_cycle:
+        from defib.power.routeros import RouterOSController
+
+        try:
+            power_controller = RouterOSController.from_env()
+        except Exception as e:
+            if output == "json":
+                print(json_mod.dumps({"event": "error", "message": str(e)}))
+            else:
+                console.print(f"[red]Power controller error:[/red] {e}")
+            raise typer.Exit(1)
+
+        # Extract device label from serial port name for auto-discovery
+        # e.g. /dev/uart-IVGHP203Y-AF -> IVGHP203Y-AF
+        from pathlib import Path
+        port_basename = Path(port).name
+        device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
+
+        try:
+            poe_port = await power_controller.find_port_by_comment(device_label)
+        except Exception as e:
+            if output == "json":
+                print(json_mod.dumps({"event": "error", "message": str(e)}))
+            else:
+                console.print(f"[red]PoE port discovery failed:[/red] {e}")
+            await power_controller.close()
+            raise typer.Exit(1)
+
+        if output == "human":
+            console.print(f"PoE control: [cyan]{poe_port}[/cyan] on [cyan]{power_controller._host}[/cyan]")
+
     try:
-        session = RecoverySession(chip=chip, firmware_path=firmware_path)
+        session = RecoverySession(
+            chip=chip, firmware_path=firmware_path,
+            power_controller=power_controller, poe_port=poe_port,
+        )
     except (ValueError, FileNotFoundError) as e:
         if output == "json":
             print(json_mod.dumps({"event": "error", "message": str(e)}))
         else:
             console.print(f"[red]Error:[/red] {e}")
+        if power_controller:
+            await power_controller.close()
         raise typer.Exit(1)
 
     if output == "human":
@@ -179,6 +219,8 @@ async def _burn_async(
         if progress_ctx is not None:
             progress_ctx.stop()
         await transport.close()
+        if power_controller:
+            await power_controller.close()
 
     if output == "json":
         print(json_mod.dumps({
