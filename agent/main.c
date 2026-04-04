@@ -183,19 +183,28 @@ static void handle_crc32_cmd(const uint8_t *data, uint32_t len) {
     proto_send(RSP_CRC32, resp, 4);
 }
 
+/* Forward declaration */
+static void handle_flash_write(const uint8_t *data, uint32_t len);
+
 /*
- * CMD_WRITE: receive data from host and write to RAM (or flash later).
+ * CMD_WRITE: receive data and write to RAM or flash.
  *
- * Protocol:
- *   Host sends: CMD_WRITE [addr:4LE] [size:4LE] [expected_crc:4LE]
- *   Agent ACKs ready, then receives RSP_DATA packets.
- *   After all data, verifies CRC32. ACKs OK or CRC_ERROR.
+ * If addr < flash_size, routes to flash write (erase assumed done).
+ * Otherwise, writes to RAM.
  */
 static void handle_write(const uint8_t *data, uint32_t len) {
     if (len < 12) { proto_send_ack(ACK_CRC_ERROR); return; }
 
     uint32_t addr = read_le32(&data[0]);
     uint32_t size = read_le32(&data[4]);
+
+    /* Route flash addresses to flash write handler */
+    if (flash_readable && addr < flash_info.size &&
+        (addr + size) <= flash_info.size) {
+        handle_flash_write(data, len);
+        return;
+    }
+
     uint32_t expected_crc = read_le32(&data[8]);
 
     /* Validate: must be in writable RAM, reasonable size */
@@ -234,6 +243,131 @@ static void handle_write(const uint8_t *data, uint32_t len) {
         err[0] = ACK_CRC_ERROR;
         write_le32(&err[1], actual_crc);
         write_le32(&err[5], received);
+        proto_send(RSP_ACK, err, 9);
+        return;
+    }
+
+    proto_send_ack(ACK_OK);
+}
+
+/*
+ * CMD_ERASE: erase flash sectors.
+ *   Host sends: CMD_ERASE [addr:4LE] [size:4LE]
+ *   Agent erases sectors covering the range.
+ *   Sends RSP_DATA with [sectors_done:2LE] after each sector for progress.
+ *   Final ACK_OK when all sectors erased.
+ */
+static void handle_erase(const uint8_t *data, uint32_t len) {
+    if (len < 8) { proto_send_ack(ACK_CRC_ERROR); return; }
+    if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
+
+    uint32_t addr = read_le32(&data[0]);
+    uint32_t size = read_le32(&data[4]);
+    uint32_t sector_sz = flash_info.sector_size;
+
+    /* Validate: must be within flash, sector-aligned */
+    if (size == 0 || addr + size > flash_info.size ||
+        (addr % sector_sz) != 0 || (size % sector_sz) != 0) {
+        proto_send_ack(ACK_FLASH_ERROR);
+        return;
+    }
+
+    uint32_t num_sectors = size / sector_sz;
+
+    /* Send ACK to start erasing */
+    proto_send_ack(ACK_OK);
+
+    for (uint32_t i = 0; i < num_sectors; i++) {
+        flash_erase_sector(addr + i * sector_sz);
+
+        /* Progress: [sectors_done:2LE][debug:3B] */
+        uint8_t progress[5];
+        progress[0] = ((i + 1) >> 0) & 0xFF;
+        progress[1] = ((i + 1) >> 8) & 0xFF;
+        progress[2] = flash_unlock_debug[0];  /* SR before unlock */
+        progress[3] = flash_unlock_debug[1];  /* SR after write_enable */
+        progress[4] = flash_unlock_debug[2];  /* SR after unlock */
+        proto_send(RSP_DATA, progress, 5);
+    }
+
+    proto_send_ack(ACK_OK);
+}
+
+/*
+ * CMD_FLASH_WRITE: receive data and program it to flash.
+ *   Host sends: CMD_WRITE [flash_addr:4LE] [size:4LE] [expected_crc:4LE]
+ *   with flash_addr in flash range (0 to flash_size).
+ *
+ *   Agent receives data into RAM staging area, verifies CRC,
+ *   then programs flash page-by-page. Assumes sectors already erased.
+ *
+ *   Sends ACK_OK after all pages written + verified.
+ */
+static void handle_flash_write(const uint8_t *data, uint32_t len) {
+    if (len < 12) { proto_send_ack(ACK_CRC_ERROR); return; }
+    if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
+
+    uint32_t flash_addr = read_le32(&data[0]);
+    uint32_t size = read_le32(&data[4]);
+    uint32_t expected_crc = read_le32(&data[8]);
+
+    if (size == 0 || size > flash_info.size ||
+        flash_addr + size > flash_info.size) {
+        proto_send_ack(ACK_FLASH_ERROR);
+        return;
+    }
+
+    /* Receive data into RAM staging area */
+    uint8_t *staging = (uint8_t *)(RAM_BASE + 0x200000);
+    proto_send_ack(ACK_OK);
+
+    uint32_t received = 0;
+    uint8_t pkt[MAX_PAYLOAD + 16];
+    while (received < size) {
+        uint32_t pkt_len = 0;
+        uint8_t cmd = proto_recv(pkt, &pkt_len, 10000);
+        if (cmd == RSP_DATA && pkt_len > 2) {
+            uint32_t chunk = pkt_len - 2;
+            for (uint32_t i = 0; i < chunk && received < size; i++)
+                staging[received++] = pkt[2 + i];
+        } else if (cmd == 0) {
+            uint8_t err[5];
+            err[0] = ACK_FLASH_ERROR;
+            write_le32(&err[1], received);
+            proto_send(RSP_ACK, err, 5);
+            return;
+        }
+    }
+
+    /* Verify received data CRC */
+    uint32_t actual_crc = crc32(0, staging, size);
+    if (actual_crc != expected_crc) {
+        uint8_t err[9];
+        err[0] = ACK_CRC_ERROR;
+        write_le32(&err[1], actual_crc);
+        write_le32(&err[5], received);
+        proto_send(RSP_ACK, err, 9);
+        return;
+    }
+
+    /* Program flash page-by-page */
+    uint32_t page_sz = flash_info.page_size;
+    uint32_t offset = 0;
+    while (offset < size) {
+        uint32_t chunk = size - offset;
+        if (chunk > page_sz) chunk = page_sz;
+        flash_write_page(flash_addr + offset, &staging[offset], chunk);
+        offset += chunk;
+    }
+
+    /* Verify written data by reading back from flash and comparing CRC */
+    const uint8_t *flash_ptr = (const uint8_t *)(FLASH_MEM + flash_addr);
+    uint32_t verify_crc = crc32(0, flash_ptr, size);
+    if (verify_crc != expected_crc) {
+        uint8_t err[9];
+        err[0] = ACK_CRC_ERROR;
+        write_le32(&err[1], verify_crc);
+        write_le32(&err[5], size);
         proto_send(RSP_ACK, err, 9);
         return;
     }
@@ -540,6 +674,9 @@ int main(void) {
                 break;
             case CMD_WRITE:
                 handle_write(cmd_buf, data_len);
+                break;
+            case CMD_ERASE:
+                handle_erase(cmd_buf, data_len);
                 break;
             case CMD_CRC32:
                 handle_crc32_cmd(cmd_buf, data_len);
