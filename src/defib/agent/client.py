@@ -555,8 +555,9 @@ class FlashAgentClient:
     ) -> bool:
         """Update the running agent with new firmware.
 
-        Sends data to staging area, verifies CRC, agent copies via
-        trampoline and jumps to new code.
+        Sends data to staging area with per-packet backpressure ACK,
+        verifies CRC, agent copies via trampoline and jumps to new code.
+        After jump, reconnects and verifies the binary matches.
         """
         crc = zlib.crc32(firmware) & 0xFFFFFFFF
         payload = struct.pack("<III", load_addr, len(firmware), crc)
@@ -566,17 +567,29 @@ class FlashAgentClient:
         if cmd != RSP_ACK or resp[0] != ACK_OK:
             return False
 
+        # Send data with per-packet backpressure
         offset = 0
         seq = 0
         while offset < len(firmware):
-            chunk = min(1022, len(firmware) - offset)
+            chunk = min(WRITE_CHUNK_SIZE, len(firmware) - offset)
             pkt = struct.pack("<H", seq) + firmware[offset:offset + chunk]
             await send_packet(self._transport, RSP_DATA, pkt)
             offset += chunk
             seq += 1
 
-        cmd, resp = await recv_response(self._transport, timeout=10.0)
-        return cmd == RSP_ACK and resp[0] == ACK_OK
+            # Wait for per-packet ACK
+            cmd, resp = await recv_response(self._transport, timeout=10.0)
+            if cmd != RSP_ACK or resp[0] != ACK_OK:
+                logger.error("Selfupdate packet %d failed: 0x%02x", seq, resp[0])
+                return False
+
+        # Wait for CRC verification ACK (agent verifies before jumping)
+        cmd, resp = await recv_response(self._transport, timeout=30.0)
+        if cmd != RSP_ACK or resp[0] != ACK_OK:
+            logger.error("Selfupdate CRC failed: 0x%02x", resp[0])
+            return False
+
+        return True
 
     async def set_baud(self, baud: int) -> bool:
         """Switch UART to a higher baud rate.
