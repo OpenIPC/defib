@@ -383,41 +383,32 @@ class FlashAgentClient:
     ) -> bool:
         """Write data to flash (assumes sectors already erased).
 
-        Splits into WRITE_MAX_TRANSFER blocks to avoid FIFO overflow.
-        Each block: host sends CMD_WRITE with flash address, agent
-        receives to RAM, verifies CRC, programs page-by-page, verifies.
+        Uses _write_block with per-packet backpressure for reliable
+        transfer. Agent receives to RAM staging, verifies CRC, programs
+        flash page-by-page, verifies readback.
         """
         total = len(data)
         offset = 0
+        max_retries = 3
 
         while offset < total:
             block_size = min(WRITE_MAX_TRANSFER, total - offset)
             block = data[offset:offset + block_size]
-            block_crc = zlib.crc32(block) & 0xFFFFFFFF
 
-            payload = struct.pack("<III", addr + offset, block_size, block_crc)
-            await send_packet(self._transport, CMD_WRITE, payload)
+            ok = False
+            for attempt in range(max_retries):
+                ok = await self._write_block(addr + offset, block)
+                if ok:
+                    break
+                logger.warning(
+                    "Flash write retry %d at offset %d/%d",
+                    attempt + 1, offset, total,
+                )
+                import asyncio
+                await asyncio.sleep(0.1)
 
-            cmd, resp = await recv_response(self._transport, timeout=5.0)
-            if cmd != RSP_ACK or resp[0] != ACK_OK:
-                logger.error("Flash write rejected at offset %d", offset)
-                return False
-
-            # Send data in small chunks
-            blk_off = 0
-            seq = 0
-            while blk_off < block_size:
-                chunk = min(WRITE_CHUNK_SIZE, block_size - blk_off)
-                pkt = struct.pack("<H", seq) + block[blk_off:blk_off + chunk]
-                await send_packet(self._transport, RSP_DATA, pkt)
-                blk_off += chunk
-                seq += 1
-
-            # Wait for program + verify (page programming is slow)
-            timeout = max(60.0, block_size / 500)
-            cmd, resp = await recv_response(self._transport, timeout=timeout)
-            if cmd != RSP_ACK or resp[0] != ACK_OK:
-                logger.error("Flash write failed at offset %d", offset)
+            if not ok:
+                logger.error("Flash write failed at offset %d/%d", offset, total)
                 return False
 
             offset += block_size
