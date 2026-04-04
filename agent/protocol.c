@@ -164,7 +164,8 @@ uint8_t proto_recv(uint8_t *data, uint32_t *len, uint32_t timeout_ms) {
     /* Verify CRC32 — read bytes individually to avoid unaligned access */
     uint32_t payload_len = raw_len - 4;
     volatile uint8_t *cp = &rx_raw[payload_len];
-    uint32_t expected_crc = cp[0] | (cp[1] << 8) | (cp[2] << 16) | (cp[3] << 24);
+    uint32_t expected_crc = (uint32_t)cp[0] | ((uint32_t)cp[1] << 8) |
+                           ((uint32_t)cp[2] << 16) | ((uint32_t)cp[3] << 24);
     uint32_t actual_crc = crc32(0, rx_raw, payload_len);
 
     /* Drain after CRC */

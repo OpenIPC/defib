@@ -76,7 +76,8 @@ static void watchdog_disable(void) {
 }
 
 static uint32_t read_le32(const uint8_t *p) {
-    return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 static void write_le32(uint8_t *p, uint32_t v) {
@@ -657,7 +658,7 @@ int main(void) {
              * revert to 115200. Host may have disconnected. */
             if (!at_default_baud) {
                 baud_idle++;
-                if (baud_idle >= 20) {
+                if (baud_idle >= 60) {  /* ~30 seconds */
                     uart_set_baud(115200);
                     while (uart_readable()) uart_getc();
                     at_default_baud = 1;
