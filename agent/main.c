@@ -76,7 +76,8 @@ static void watchdog_disable(void) {
 }
 
 static uint32_t read_le32(const uint8_t *p) {
-    return p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24);
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 static void write_le32(uint8_t *p, uint32_t v) {
@@ -226,7 +227,9 @@ static void handle_write(const uint8_t *data, uint32_t len) {
             uint32_t chunk = pkt_len - 2;
             for (uint32_t i = 0; i < chunk && received < size; i++)
                 dest[received++] = pkt[2 + i];
-            /* No per-packet ACK — continuous streaming for throughput */
+            /* Backpressure: COBS-framed ACK after each DATA packet.
+             * Host waits for this before sending next packet. */
+            proto_send_ack(ACK_OK);
         } else if (cmd == 0) {
             uint8_t err[5];
             err[0] = ACK_FLASH_ERROR;
@@ -439,6 +442,8 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
             uint32_t chunk = pkt_len - 2;
             for (uint32_t i = 0; i < chunk && received < size; i++)
                 dest[received++] = pkt[2 + i];
+            /* Backpressure ACK — host must wait before sending next */
+            proto_send_ack(ACK_OK);
         } else if (cmd == 0) {
             proto_send_ack(ACK_FLASH_ERROR);
             return;
@@ -448,7 +453,7 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
     uint32_t actual_crc = crc32(0, dest, size);
     if (actual_crc != expected_crc) {
         proto_send_ack(ACK_CRC_ERROR);
-        return;
+        return;  /* Stay alive — don't jump to bad code */
     }
 
     proto_send_ack(ACK_OK);
@@ -653,7 +658,7 @@ int main(void) {
              * revert to 115200. Host may have disconnected. */
             if (!at_default_baud) {
                 baud_idle++;
-                if (baud_idle >= 20) {
+                if (baud_idle >= 60) {  /* ~30 seconds */
                     uart_set_baud(115200);
                     while (uart_readable()) uart_getc();
                     at_default_baud = 1;

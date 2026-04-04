@@ -46,10 +46,8 @@ static void test_cobs_all_zeros(void) {
         ASSERT(enc[i] != 0, "cobs all-zeros: no zeros in output");
 
     uint32_t dec_len = cobs_decode(enc, enc_len, dec);
-    /* COBS strips trailing zero — [0,0,0,0] roundtrips to [0,0,0] */
-    ASSERT(dec_len == 3, "cobs all-zeros: length (trailing zero stripped)");
-    for (uint32_t i = 0; i < dec_len; i++)
-        ASSERT(dec[i] == 0, "cobs all-zeros: data");
+    ASSERT(dec_len == 4, "cobs all-zeros: length");
+    ASSERT(memcmp(in, dec, 4) == 0, "cobs all-zeros: data");
 }
 
 static void test_cobs_single_zero(void) {
@@ -57,8 +55,8 @@ static void test_cobs_single_zero(void) {
     uint8_t enc[8], dec[8];
     uint32_t enc_len = cobs_encode(in, 1, enc);
     uint32_t dec_len = cobs_decode(enc, enc_len, dec);
-    /* Single zero roundtrips to empty — trailing zero stripped */
-    ASSERT(dec_len == 0, "cobs single zero: stripped to empty");
+    ASSERT(dec_len == 1, "cobs single zero: length");
+    ASSERT(dec[0] == 0, "cobs single zero: value");
 }
 
 static void test_cobs_empty(void) {

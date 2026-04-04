@@ -47,10 +47,5 @@ uint32_t cobs_decode(const uint8_t *input, uint32_t len, uint8_t *output) {
         }
     }
 
-    /* Remove trailing zero if present */
-    if (out_idx > 0 && output[out_idx - 1] == 0x00) {
-        out_idx--;
-    }
-
     return out_idx;
 }

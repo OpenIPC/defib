@@ -15,7 +15,7 @@ Commands (host → device):
   0x06  REBOOT   — Reset device
   0x07  SELFUPDATE — Update agent: addr(4B LE) + size(4B LE) + crc32(4B LE)
   0x08  SET_BAUD   — Change baud rate: baud(4B LE)
-  0x09  SCAN       — Scan flash health sector-by-sector
+  0x09  SCAN       — Scan flash health
 
 Responses (device → host):
   0x81  INFO_RSP — chip_id(4B) + flash_size(4B) + ram_base(4B)
@@ -23,7 +23,7 @@ Responses (device → host):
   0x83  ACK      — status(1B): 0=OK, 1=CRC error, 2=flash error
   0x84  CRC32_RSP— crc32(4B LE)
   0x85  READY    — Agent is running and ready
-  0x86  SCAN_RSP — Sector scan results: [status:1B][crc32:4B] per sector
+  0x86  SCAN_RSP — scan results
 """
 
 from __future__ import annotations
@@ -53,47 +53,38 @@ RSP_CRC32 = 0x84
 RSP_READY = 0x85
 RSP_SCAN = 0x86
 
-# ACK status codes
+# ACK status
 ACK_OK = 0x00
 ACK_CRC_ERROR = 0x01
-ACK_FLASH_ERROR = 0x02
 
-FRAME_DELIMITER = b"\x00"
-MAX_PACKET_SIZE = 1100  # 1024 payload + header + CRC + COBS overhead
+FRAME_DELIMITER = 0x00
+MAX_PACKET_SIZE = 1100  # Max COBS-encoded packet size
 
 
 def build_packet(cmd: int, data: bytes = b"") -> bytes:
     """Build a COBS-framed packet with CRC32."""
-    payload = bytes([cmd]) + data
-    crc = zlib.crc32(payload) & 0xFFFFFFFF
-    payload += struct.pack("<I", crc)
-    encoded = cobs.encode(payload)
-    return encoded + FRAME_DELIMITER
+    raw = bytes([cmd]) + data
+    crc = struct.pack("<I", zlib.crc32(raw) & 0xFFFFFFFF)
+    encoded = cobs.encode(raw + crc)
+    return encoded + b"\x00"
 
 
 def parse_packet(raw: bytes) -> tuple[int, bytes]:
-    """Parse a COBS-framed packet, verify CRC32.
-
-    Returns (command_byte, data_without_crc).
-    Raises ValueError on CRC mismatch or decode error.
-    """
+    """Parse a COBS-encoded packet. Returns (cmd, data)."""
     decoded = cobs.decode(raw)
-    if len(decoded) < 5:  # 1 cmd + 4 CRC minimum
-        raise ValueError(f"Packet too short: {len(decoded)} bytes")
+    if len(decoded) < 5:
+        raise ValueError("Packet too short")
     payload = decoded[:-4]
     expected_crc = struct.unpack("<I", decoded[-4:])[0]
     actual_crc = zlib.crc32(payload) & 0xFFFFFFFF
     if actual_crc != expected_crc:
-        raise ValueError(
-            f"CRC mismatch: expected {expected_crc:08x}, got {actual_crc:08x}"
-        )
+        raise ValueError(f"CRC mismatch: {actual_crc:#x} != {expected_crc:#x}")
     return payload[0], payload[1:]
 
 
 async def send_packet(transport: Transport, cmd: int, data: bytes = b"") -> None:
     """Send a COBS-framed packet to the device."""
     packet = build_packet(cmd, data)
-    # Use direct pyserial when available for consistent timing
     port = getattr(transport, '_port', None)
     if port is not None:
         port.write(packet)
@@ -101,8 +92,6 @@ async def send_packet(transport: Transport, cmd: int, data: bytes = b"") -> None
         await transport.write(packet)
 
 
-# Per-port read buffer — survives across recv_packet calls so bytes
-# read past the first 0x00 delimiter aren't lost.
 _port_buffers: dict[int, bytearray] = {}
 
 
@@ -113,15 +102,70 @@ def _get_port_buf(port: object) -> bytearray:
     return _port_buffers[key]
 
 
-async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, bytes]:
-    """Receive and parse a COBS-framed packet from the device.
+def _recv_packet_sync(port: object, timeout: float) -> tuple[int, bytes]:
+    """Synchronous recv using pyserial directly.
 
-    Reads chunks until 0x00 delimiter found, then COBS-decodes and verifies CRC.
-    Uses direct pyserial access when available for reliable timing.
+    Uses a per-port buffer for bytes read past the current packet's
+    delimiter. Only stores complete unprocessed bytes — never partial
+    COBS frame data (which caused corruption in previous versions).
     """
     import time
+    portbuf = _get_port_buf(port)
+    frame = bytearray()
+    old_timeout = port.timeout  # type: ignore[attr-defined]
+    deadline = time.monotonic() + timeout
 
-    # Try direct pyserial access (bypasses async executor overhead)
+    try:
+        while time.monotonic() < deadline:
+            # Get next chunk of data: from portbuf first, then from port
+            if portbuf:
+                data = bytes(portbuf)
+                portbuf.clear()
+            else:
+                waiting = port.in_waiting  # type: ignore[attr-defined]
+                if waiting > 0:
+                    data = port.read(waiting)  # type: ignore[attr-defined]
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    port.timeout = min(remaining, 0.1)  # type: ignore[attr-defined]
+                    data = port.read(1)  # type: ignore[attr-defined]
+
+            if not data:
+                continue
+
+            for i, byte in enumerate(data):
+                if byte == 0x00:
+                    if frame:
+                        try:
+                            result = parse_packet(bytes(frame))
+                            # Stash ONLY bytes after this delimiter
+                            # (complete unprocessed data for next call)
+                            remaining_bytes = data[i + 1:]
+                            if remaining_bytes:
+                                portbuf.extend(remaining_bytes)
+                            frame.clear()
+                            return result
+                        except ValueError:
+                            pass
+                        frame.clear()
+                else:
+                    frame.append(byte)
+                    if len(frame) > MAX_PACKET_SIZE:
+                        frame.clear()
+    finally:
+        # Do NOT stash partial frame data — that causes corruption
+        # when the next call concatenates it with new bytes.
+        port.timeout = old_timeout  # type: ignore[attr-defined]
+
+    raise TransportTimeout(f"No packet received within {timeout}s")
+
+
+async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, bytes]:
+    """Receive and parse a COBS-framed packet from the device."""
+    import time
+
     port = getattr(transport, '_port', None)
     if port is not None:
         return _recv_packet_sync(port, timeout)
@@ -154,75 +198,12 @@ async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, 
     raise TransportTimeout(f"No packet received within {timeout}s")
 
 
-def _recv_packet_sync(port: object, timeout: float) -> tuple[int, bytes]:
-    """Synchronous recv using pyserial directly.
-
-    Uses a per-port persistent buffer so bytes read past the first
-    complete packet aren't lost between calls.
-    """
-    import time
-    portbuf = _get_port_buf(port)
-    frame = bytearray()
-    old_timeout = port.timeout  # type: ignore[attr-defined]
-    deadline = time.monotonic() + timeout
-
-    def _process_byte(b: int) -> tuple[int, bytes] | None:
-        """Process one byte. Returns parsed packet or None."""
-        if b == 0x00:
-            if frame:
-                try:
-                    result = parse_packet(bytes(frame))
-                    frame.clear()
-                    return result
-                except ValueError:
-                    pass
-                frame.clear()
-        else:
-            frame.append(b)
-            if len(frame) > MAX_PACKET_SIZE:
-                frame.clear()
-        return None
-
-    def _drain(source: bytes | bytearray) -> tuple[int, bytes] | None:
-        for i, byte in enumerate(source):
-            result = _process_byte(byte)
-            if result is not None:
-                # Stash remaining unprocessed bytes
-                portbuf.extend(source[i + 1:])
-                return result
-        return None
-
-    try:
-        # First drain any leftover bytes from previous call
-        if portbuf:
-            leftover = bytes(portbuf)
-            portbuf.clear()
-            result = _drain(leftover)
-            if result is not None:
-                return result
-
-        while time.monotonic() < deadline:
-            waiting = port.in_waiting  # type: ignore[attr-defined]
-            if waiting > 0:
-                data = port.read(waiting)  # type: ignore[attr-defined]
-            else:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                port.timeout = min(remaining, 0.1)  # type: ignore[attr-defined]
-                data = port.read(1)  # type: ignore[attr-defined]
-            if data:
-                result = _drain(data)
-                if result is not None:
-                    return result
-    finally:
-        port.timeout = old_timeout  # type: ignore[attr-defined]
-
-    raise TransportTimeout(f"No packet received within {timeout}s")
-
-
 async def recv_response(transport: Transport, timeout: float = 5.0) -> tuple[int, bytes]:
-    """Receive a response packet, skipping stale READY packets."""
+    """Receive a response packet, skipping stale READY packets.
+
+    Timeout resets after each READY skip — READY packets are expected
+    background traffic and shouldn't consume the timeout budget.
+    """
     import time
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -232,15 +213,14 @@ async def recv_response(transport: Transport, timeout: float = 5.0) -> tuple[int
         cmd, data = await recv_packet(transport, remaining)
         if cmd != RSP_READY:
             return cmd, data
+        # Reset deadline after READY — don't let background READYs
+        # consume the timeout meant for the actual response
+        deadline = time.monotonic() + timeout
     raise TransportTimeout(f"No response within {timeout}s")
 
 
 async def wait_for_ready(transport: Transport, timeout: float = 10.0) -> bool:
-    """Wait for the agent to send its READY packet after boot.
-
-    Keeps reading packets until READY is found or timeout expires.
-    After receiving READY, drains any extra buffered data.
-    """
+    """Wait for the agent to send its READY packet after boot."""
     import asyncio
     import time
     deadline = time.monotonic() + timeout
@@ -251,7 +231,6 @@ async def wait_for_ready(transport: Transport, timeout: float = 10.0) -> bool:
         try:
             cmd, data = await recv_packet(transport, remaining)
             if cmd == RSP_READY:
-                # Drain extra READY re-sends
                 await asyncio.sleep(0.1)
                 try:
                     w = await transport.bytes_waiting()
@@ -260,7 +239,6 @@ async def wait_for_ready(transport: Transport, timeout: float = 10.0) -> bool:
                 except Exception:
                     pass
                 return True
-            # Got a non-READY packet — skip it, keep waiting
         except (TransportTimeout, ValueError):
             continue
     return False

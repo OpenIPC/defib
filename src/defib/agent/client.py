@@ -87,8 +87,9 @@ class ScanResult:
         return [s for s in self.sectors if s.status == SectorStatus.UNSTABLE]
 
 
-# Max bytes per WRITE transfer before PL011 FIFO overflow on uncached DDR.
+# Packet size for WRITE data chunks
 WRITE_CHUNK_SIZE = 512
+# Max bytes per WRITE block.
 WRITE_MAX_TRANSFER = 16 * 1024
 
 # Optimal baud rate from hi3516ev300 + FT232R benchmarks.
@@ -164,6 +165,13 @@ class FlashAgentClient:
         self._connected = await wait_for_ready(self._transport, timeout)
         return self._connected
 
+    def _clear_rx_buffers(self) -> None:
+        """Clear stale parsed data from _port_buffers."""
+        from defib.agent.protocol import _port_buffers
+        port = getattr(self._transport, '_port', None)
+        if port is not None:
+            _port_buffers[id(port)] = bytearray()
+
     async def _switch_baud(self, target: int) -> bool:
         """Switch to target baud if not already there. Returns success."""
         if self._current_baud == target:
@@ -182,6 +190,7 @@ class FlashAgentClient:
 
     async def get_info(self) -> dict[str, int | str]:
         """Request device info from the agent."""
+        self._clear_rx_buffers()
         await send_packet(self._transport, CMD_INFO)
         cmd, data = await recv_response(self._transport, timeout=5.0)
         if cmd != RSP_INFO or len(data) < 16:
@@ -215,6 +224,8 @@ class FlashAgentClient:
         If fast=True and size > 4KB, switches to DEFAULT_FAST_BAUD,
         falling back to FALLBACK_BAUD if the switch fails.
         """
+        self._clear_rx_buffers()
+
         if fast and size > 4096:
             await self._switch_baud(DEFAULT_FAST_BAUD)
 
@@ -262,19 +273,36 @@ class FlashAgentClient:
         Splits into WRITE_MAX_TRANSFER-sized blocks to avoid PL011 FIFO
         overflow on uncached DDR. Each block uses WRITE_CHUNK_SIZE packets.
         """
+        self._clear_rx_buffers()
+
         if fast and len(data) > 4096:
             await self._switch_baud(DEFAULT_FAST_BAUD)
 
         total = len(data)
         offset = 0
+        max_retries = 5
 
         while offset < total:
             block_size = min(WRITE_MAX_TRANSFER, total - offset)
             block = data[offset:offset + block_size]
 
-            ok = await self._write_block(addr + offset, block)
+            ok = False
+            for attempt in range(max_retries):
+                ok = await self._write_block(addr + offset, block)
+                if ok:
+                    break
+                logger.warning(
+                    "WRITE retry %d at offset %d/%d",
+                    attempt + 1, offset, total,
+                )
+                import asyncio
+                await asyncio.sleep(0.1)
+
             if not ok:
-                logger.error("WRITE failed at offset %d/%d", offset, total)
+                logger.error(
+                    "WRITE failed at offset %d/%d after %d retries",
+                    offset, total, max_retries,
+                )
                 return False
 
             offset += block_size
@@ -285,14 +313,18 @@ class FlashAgentClient:
 
     async def _write_block(self, addr: int, data: bytes) -> bool:
         """Write a single block (up to WRITE_MAX_TRANSFER) to device."""
+        self._clear_rx_buffers()
         crc = zlib.crc32(data) & 0xFFFFFFFF
         payload = struct.pack("<III", addr, len(data), crc)
         await send_packet(self._transport, CMD_WRITE, payload)
 
-        cmd, resp = await recv_response(self._transport, timeout=5.0)
+        cmd, resp = await recv_response(self._transport, timeout=10.0)
         if cmd != RSP_ACK or resp[0] != ACK_OK:
             return False
 
+        # Send data packets with backpressure: agent sends a COBS-framed
+        # ACK after each DATA packet. Host waits for it before sending
+        # next. Guarantees zero data loss at any speed.
         offset = 0
         seq = 0
         while offset < len(data):
@@ -302,7 +334,14 @@ class FlashAgentClient:
             offset += chunk
             seq += 1
 
-        cmd, resp = await recv_response(self._transport, timeout=60.0)
+            # Wait for per-packet ACK
+            cmd, resp = await recv_response(self._transport, timeout=10.0)
+            if cmd != RSP_ACK or resp[0] != ACK_OK:
+                return False
+
+        # Final CRC verification ACK — may take seconds for large transfers
+        crc_timeout = max(60.0, len(data) / 50000)  # ~20µs/byte for CRC32
+        cmd, resp = await recv_response(self._transport, timeout=crc_timeout)
         return cmd == RSP_ACK and resp[0] == ACK_OK
 
     async def erase_flash(
@@ -389,6 +428,8 @@ class FlashAgentClient:
 
     async def crc32(self, addr: int, size: int) -> int:
         """Get CRC32 of a memory region from the device."""
+        self._clear_rx_buffers()
+
         payload = struct.pack("<II", addr, size)
         await send_packet(self._transport, CMD_CRC32, payload)
         cmd, data = await recv_response(self._transport, timeout=10.0)
@@ -413,6 +454,8 @@ class FlashAgentClient:
         per-sector CRC32 if the agent doesn't support CMD_SCAN.
         Calls on_sector() as each result is decoded for live UI updates.
         """
+        self._clear_rx_buffers()
+
         await self._switch_baud(DEFAULT_FAST_BAUD)
 
         await send_packet(self._transport, CMD_SCAN)
@@ -535,9 +578,12 @@ class FlashAgentClient:
     ) -> bool:
         """Update the running agent with new firmware.
 
-        Sends data to staging area, verifies CRC, agent copies via
-        trampoline and jumps to new code.
+        Sends data to staging area with per-packet backpressure ACK,
+        verifies CRC, agent copies via trampoline and jumps to new code.
+        After jump, reconnects and verifies the binary matches.
         """
+        self._clear_rx_buffers()
+
         crc = zlib.crc32(firmware) & 0xFFFFFFFF
         payload = struct.pack("<III", load_addr, len(firmware), crc)
         await send_packet(self._transport, CMD_SELFUPDATE, payload)
@@ -546,17 +592,29 @@ class FlashAgentClient:
         if cmd != RSP_ACK or resp[0] != ACK_OK:
             return False
 
+        # Send data with per-packet backpressure
         offset = 0
         seq = 0
         while offset < len(firmware):
-            chunk = min(1022, len(firmware) - offset)
+            chunk = min(WRITE_CHUNK_SIZE, len(firmware) - offset)
             pkt = struct.pack("<H", seq) + firmware[offset:offset + chunk]
             await send_packet(self._transport, RSP_DATA, pkt)
             offset += chunk
             seq += 1
 
-        cmd, resp = await recv_response(self._transport, timeout=10.0)
-        return cmd == RSP_ACK and resp[0] == ACK_OK
+            # Wait for per-packet ACK
+            cmd, resp = await recv_response(self._transport, timeout=10.0)
+            if cmd != RSP_ACK or resp[0] != ACK_OK:
+                logger.error("Selfupdate packet %d failed: 0x%02x", seq, resp[0])
+                return False
+
+        # Wait for CRC verification ACK (agent verifies before jumping)
+        cmd, resp = await recv_response(self._transport, timeout=30.0)
+        if cmd != RSP_ACK or resp[0] != ACK_OK:
+            logger.error("Selfupdate CRC failed: 0x%02x", resp[0])
+            return False
+
+        return True
 
     async def set_baud(self, baud: int) -> bool:
         """Switch UART to a higher baud rate.
@@ -565,6 +623,8 @@ class FlashAgentClient:
         then both sides switch. Verifies with INFO at new baud.
         Falls back to original baud on failure.
         """
+        self._clear_rx_buffers()
+
         import asyncio
 
         port = getattr(self._transport, '_port', None)

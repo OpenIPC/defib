@@ -61,10 +61,18 @@ void uart_set_baud(uint32_t baud) {
     uart_reg(UART_ICR) = 0x7FF;
 }
 
+/* Defined in protocol.c */
+void proto_drain_fifo(void);
+
 void uart_putc(uint8_t ch) {
-    /* Wait until TX FIFO has space, with timeout */
+    /* Wait until TX FIFO has space. Drain RX into software buffer
+     * while waiting — prevents FIFO overflow during sustained
+     * bidirectional traffic (backpressure ACK + incoming DATA). */
     volatile uint32_t timeout = 100000;
-    while ((uart_reg(UART_FR) & UART_FR_TXFF) && timeout > 0) { timeout--; }
+    while ((uart_reg(UART_FR) & UART_FR_TXFF) && timeout > 0) {
+        proto_drain_fifo();
+        timeout--;
+    }
     uart_reg(UART_DR) = ch;
 }
 
