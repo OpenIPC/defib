@@ -54,4 +54,7 @@ uint32_t crc32(uint32_t crc, const uint8_t *buf, uint32_t len);
  * long computations to prevent 16-byte hardware FIFO overflow. */
 void proto_drain_fifo(void);
 
+/* Reset all RX buffers (software + hardware) */
+void proto_reset_rx(void);
+
 #endif /* PROTOCOL_H */

@@ -87,9 +87,12 @@ class ScanResult:
         return [s for s in self.sectors if s.status == SectorStatus.UNSTABLE]
 
 
-# Max bytes per WRITE transfer before PL011 FIFO overflow on uncached DDR.
+# Packet size for WRITE data chunks
 WRITE_CHUNK_SIZE = 512
-WRITE_MAX_TRANSFER = 16 * 1024
+# Max bytes per WRITE block. With per-packet backpressure ACK,
+# there's no FIFO overflow risk, so we use a single large block
+# to avoid inter-block READY packet desynchronization.
+WRITE_MAX_TRANSFER = 32 * 1024 * 1024  # 32MB (effectively unlimited)
 
 # Optimal baud rate from hi3516ev300 + FT232R benchmarks.
 # 921600 is the highest rate verified for both READ and WRITE with
@@ -285,6 +288,13 @@ class FlashAgentClient:
 
     async def _write_block(self, addr: int, data: bytes) -> bool:
         """Write a single block (up to WRITE_MAX_TRANSFER) to device."""
+        # Clear stale parsed data between blocks (READY packet leftovers).
+        # Do NOT reset_input_buffer — that discards in-flight data.
+        from defib.agent.protocol import _port_buffers
+        port = getattr(self._transport, '_port', None)
+        if port is not None:
+            _port_buffers[id(port)] = bytearray()
+
         crc = zlib.crc32(data) & 0xFFFFFFFF
         payload = struct.pack("<III", addr, len(data), crc)
         await send_packet(self._transport, CMD_WRITE, payload)
@@ -293,6 +303,9 @@ class FlashAgentClient:
         if cmd != RSP_ACK or resp[0] != ACK_OK:
             return False
 
+        # Send data packets with backpressure: agent sends a COBS-framed
+        # ACK after each DATA packet. Host waits for it before sending
+        # next. Guarantees zero data loss at any speed.
         offset = 0
         seq = 0
         while offset < len(data):
@@ -302,7 +315,14 @@ class FlashAgentClient:
             offset += chunk
             seq += 1
 
-        cmd, resp = await recv_response(self._transport, timeout=60.0)
+            # Wait for per-packet ACK
+            cmd, resp = await recv_response(self._transport, timeout=10.0)
+            if cmd != RSP_ACK or resp[0] != ACK_OK:
+                return False
+
+        # Final CRC verification ACK — may take seconds for large transfers
+        crc_timeout = max(60.0, len(data) / 50000)  # ~20µs/byte for CRC32
+        cmd, resp = await recv_response(self._transport, timeout=crc_timeout)
         return cmd == RSP_ACK and resp[0] == ACK_OK
 
     async def erase_flash(

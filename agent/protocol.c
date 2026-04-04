@@ -1,9 +1,5 @@
 /*
  * Flash agent protocol — COBS framing + CRC32.
- *
- * RX data comes from the IRQ-driven ring buffer in uart.c.
- * No software FIFO polling needed — uart_getc_safe() reads from
- * the ring buffer which is filled by the UART RX interrupt.
  */
 
 #include "protocol.h"
@@ -46,6 +42,9 @@ static const uint32_t crc32_table[256] = {
     0xB3667A2E,0xC4614AB8,0x5D681B02,0x2A6F2B94,0xB40BBE37,0xC30C8EA1,0x5A05DF1B,0x2D02EF8D,
 };
 
+/* Forward declaration — defined below */
+void soft_rx_drain(void);
+
 uint32_t crc32(uint32_t crc, const uint8_t *buf, uint32_t len) {
     crc = crc ^ 0xFFFFFFFF;
     for (uint32_t i = 0; i < len; i++) {
@@ -55,60 +54,123 @@ uint32_t crc32(uint32_t crc, const uint8_t *buf, uint32_t len) {
 }
 
 /* Internal send/recv buffers */
-static uint8_t tx_raw[MAX_PAYLOAD + 16];
-static uint8_t tx_cobs[MAX_PAYLOAD + 32];
+static uint8_t tx_raw[MAX_PAYLOAD + 16];   /* cmd + data + crc */
+static uint8_t tx_cobs[MAX_PAYLOAD + 32];  /* COBS encoded */
 static uint8_t rx_cobs[MAX_PAYLOAD + 32];
 static uint8_t rx_raw[MAX_PAYLOAD + 16];
 
+/* Software RX FIFO — drains PL011 hardware FIFO (16 bytes) to prevent
+ * overflow during COBS decode + CRC32 processing on uncached DDR. */
+static uint8_t soft_rx[4096];
+static uint32_t soft_rx_head = 0;
+static uint32_t soft_rx_tail = 0;
+
+void soft_rx_drain(void) {
+    while (uart_readable()) {
+        int b = uart_getc_safe();
+        if (b >= 0) {
+            uint32_t next = (soft_rx_head + 1) % sizeof(soft_rx);
+            if (next != soft_rx_tail) {
+                soft_rx[soft_rx_head] = (uint8_t)b;
+                soft_rx_head = next;
+            }
+        } else if (b == -2) {
+            uart_clear_errors();
+        }
+    }
+}
+
+static int soft_rx_get(void) {
+    soft_rx_drain();
+    if (soft_rx_head != soft_rx_tail) {
+        uint8_t b = soft_rx[soft_rx_tail];
+        soft_rx_tail = (soft_rx_tail + 1) % sizeof(soft_rx);
+        return b;
+    }
+    return -1;
+}
+
 void proto_send(uint8_t cmd, const uint8_t *data, uint32_t len) {
+    /* Build raw packet: cmd + data + crc32 */
     tx_raw[0] = cmd;
     for (uint32_t i = 0; i < len; i++) tx_raw[1 + i] = data[i];
     uint32_t raw_len = 1 + len;
 
-    uint32_t c = crc32(0, tx_raw, raw_len);
+    uint32_t crc = crc32(0, tx_raw, raw_len);
+    /* Write CRC bytes individually — tx_raw+raw_len may not be word-aligned,
+     * and ARM32 STR to unaligned address causes data abort. */
     volatile uint8_t *p = &tx_raw[raw_len];
-    p[0] = (c >> 0) & 0xFF;
-    p[1] = (c >> 8) & 0xFF;
-    p[2] = (c >> 16) & 0xFF;
-    p[3] = (c >> 24) & 0xFF;
+    p[0] = (crc >> 0) & 0xFF;
+    p[1] = (crc >> 8) & 0xFF;
+    p[2] = (crc >> 16) & 0xFF;
+    p[3] = (crc >> 24) & 0xFF;
     raw_len += 4;
 
+    /* COBS encode */
     uint32_t cobs_len = cobs_encode(tx_raw, raw_len, tx_cobs);
+
+    /* Send COBS data + 0x00 delimiter */
     uart_write(tx_cobs, cobs_len);
     uart_putc(0x00);
 }
 
 uint8_t proto_recv(uint8_t *data, uint32_t *len, uint32_t timeout_ms) {
-    /* Read from IRQ-driven ring buffer until 0x00 delimiter */
+    /* Read until 0x00 delimiter.
+     * Uses soft_rx buffer: reads from software FIFO first (leftovers
+     * from previous drain), then from hardware FIFO. */
     uint32_t cobs_len = 0;
     uint32_t deadline = timeout_ms * 100;
 
     while (cobs_len < sizeof(rx_cobs)) {
-        int b = uart_getc_safe();
+        /* Try software buffer first, then hardware */
+        int b;
+        if (soft_rx_head != soft_rx_tail) {
+            b = soft_rx[soft_rx_tail];
+            soft_rx_tail = (soft_rx_tail + 1) % sizeof(soft_rx);
+        } else {
+            b = uart_getc_safe();
+        }
+
         if (b >= 0) {
             if (b == 0x00) {
-                if (cobs_len == 0) continue;
+                if (cobs_len == 0) continue; /* Skip empty frames */
                 break;
             }
             rx_cobs[cobs_len++] = (uint8_t)b;
             deadline = timeout_ms * 100;
+        } else if (b == -2) {
+            cobs_len = 0;
+            uart_clear_errors();
         } else {
-            if (deadline == 0) return 0;
+            if (deadline == 0) return 0; /* Timeout */
             deadline--;
             for (volatile int d = 25; d > 0; d--) {}
         }
     }
 
+    /* Drain hardware FIFO into software buffer BEFORE heavy processing.
+     * COBS decode + CRC32 on uncached DDR takes ~1-2ms, enough for
+     * the 16-byte PL011 FIFO to overflow if data keeps arriving. */
+    soft_rx_drain();
+
     /* COBS decode */
     uint32_t raw_len = cobs_decode(rx_cobs, cobs_len, rx_raw);
-    if (raw_len < 5) return 0;
 
-    /* Verify CRC32 */
+    /* Drain again after decode */
+    soft_rx_drain();
+
+    if (raw_len < 5) return 0; /* Too short: need cmd + crc32 */
+
+    /* Verify CRC32 — read bytes individually to avoid unaligned access */
     uint32_t payload_len = raw_len - 4;
     volatile uint8_t *cp = &rx_raw[payload_len];
     uint32_t expected_crc = cp[0] | (cp[1] << 8) | (cp[2] << 16) | (cp[3] << 24);
     uint32_t actual_crc = crc32(0, rx_raw, payload_len);
-    if (actual_crc != expected_crc) return 0;
+
+    /* Drain after CRC */
+    soft_rx_drain();
+
+    if (actual_crc != expected_crc) return 0; /* CRC error */
 
     /* Extract command and data */
     uint8_t cmd = rx_raw[0];
@@ -127,5 +189,12 @@ void proto_send_ack(uint8_t status) {
 }
 
 void proto_drain_fifo(void) {
-    /* No-op: IRQ handler drains the hardware FIFO automatically */
+    soft_rx_drain();
+}
+
+void proto_reset_rx(void) {
+    /* Flush everything: software FIFO + hardware FIFO */
+    soft_rx_head = 0;
+    soft_rx_tail = 0;
+    uart_drain_rx();
 }
