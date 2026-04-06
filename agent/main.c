@@ -227,9 +227,9 @@ static void handle_write(const uint8_t *data, uint32_t len) {
             uint32_t chunk = pkt_len - 2;
             for (uint32_t i = 0; i < chunk && received < size; i++)
                 dest[received++] = pkt[2 + i];
-            /* Backpressure: COBS-framed ACK after each DATA packet.
-             * Host waits for this before sending next packet. */
-            proto_send_ack(ACK_OK);
+            /* No per-packet ACK — streaming mode. COBS CRC32 per packet
+             * catches any corruption. D-cache makes processing fast
+             * enough to keep up with 921600 baud. */
         } else if (cmd == 0) {
             uint8_t err[5];
             err[0] = ACK_FLASH_ERROR;
@@ -333,8 +333,6 @@ static void handle_flash_write(const uint8_t *data, uint32_t len) {
             uint32_t chunk = pkt_len - 2;
             for (uint32_t i = 0; i < chunk && received < size; i++)
                 staging[received++] = pkt[2 + i];
-            /* Backpressure ACK */
-            proto_send_ack(ACK_OK);
         } else if (cmd == 0) {
             uint8_t err[5];
             err[0] = ACK_FLASH_ERROR;
@@ -540,8 +538,7 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
             uint32_t chunk = pkt_len - 2;
             for (uint32_t i = 0; i < chunk && received < size; i++)
                 dest[received++] = pkt[2 + i];
-            /* Backpressure ACK — host must wait before sending next */
-            proto_send_ack(ACK_OK);
+            /* Streaming mode — no per-packet ACK */
         } else if (cmd == 0) {
             proto_send_ack(ACK_FLASH_ERROR);
             return;
