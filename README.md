@@ -115,23 +115,23 @@ protocol at 921600 baud — ~5x faster than U-Boot's `md.b` hex dump.
 # 1. Upload the agent (power-cycle the camera when prompted)
 defib agent upload -c hi3516ev300 -p /dev/ttyUSB0
 
-# 2. Dump the entire flash (16MB, ~3 min, with CRC32 verification)
-defib agent read -p /dev/ttyUSB0 -a 0x14000000 -s 16MB -o flash_dump.bin
+# 2. Dump the entire flash (address and size auto-detected)
+defib agent read -p /dev/ttyUSB0 -o flash_dump.bin
 
 # Query device info (flash size, RAM base, JEDEC ID)
 defib agent info -p /dev/ttyUSB0
 
 # Write data back to flash
-defib agent write -p /dev/ttyUSB0 -a 0x14000000 -i flash_dump.bin
+defib agent write -p /dev/ttyUSB0 -i flash_dump.bin
 
 # Scan flash health (bad sectors, stuck bits)
 defib agent scan -p /dev/ttyUSB0
 ```
 
-The flash base address is `0x14000000` for all supported SoCs. Use
-`--no-verify` to skip the CRC32 check, or `--output-mode json` for
-automation. See [agent/README.md](agent/README.md) for protocol details
-and supported chips.
+Address defaults to flash base (`0x14000000`) and size is auto-detected
+from the device. Override with `-a` and `-s` if needed. Use `--no-verify`
+to skip the CRC32 check, or `--output-mode json` for automation. See
+[agent/README.md](agent/README.md) for protocol details and supported chips.
 
 ## Testing with QEMU
 

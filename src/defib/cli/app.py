@@ -935,9 +935,9 @@ async def _agent_info_async(port: str, output: str) -> None:
 @agent_app.command("read")
 def agent_read(
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
-    addr: str = typer.Option(..., "-a", "--addr", help="Start address (hex)"),
-    size: str = typer.Option(..., "-s", "--size", help="Size in bytes (or 1KB, 16MB, etc)"),
-    output_file: str = typer.Option(..., "-o", "--output", help="Output binary file"),
+    addr: str = typer.Option(None, "-a", "--addr", help="Start address (hex, default: flash base 0x14000000)"),
+    size: str = typer.Option(None, "-s", "--size", help="Size in bytes (or 1KB, 16MB, etc; default: auto-detect)"),
+    output_file: str = typer.Option("flash_dump.bin", "-o", "--output", help="Output binary file"),
     verify: bool = typer.Option(True, "--verify/--no-verify", help="CRC32 verify after read"),
     output: str = typer.Option("human", "--output-mode", help="Output mode: human, json"),
 ) -> None:
@@ -947,7 +947,7 @@ def agent_read(
 
 
 async def _agent_read_async(
-    port: str, addr_str: str, size_str: str, output_file: str, verify: bool, output: str,
+    port: str, addr_str: str | None, size_str: str | None, output_file: str, verify: bool, output: str,
 ) -> None:
     import json as json_mod
     import time
@@ -959,8 +959,6 @@ async def _agent_read_async(
     from defib.transport.serial import SerialTransport
 
     console = Console()
-    address = int(addr_str, 0)
-    size = _parse_size(size_str)
 
     transport = await SerialTransport.create(port)
     client = FlashAgentClient(transport)
@@ -968,6 +966,17 @@ async def _agent_read_async(
         console.print("[red]Agent not responding[/red]")
         await transport.close()
         raise typer.Exit(1)
+
+    # Default to full flash dump when address/size not specified
+    if addr_str is None or size_str is None:
+        info = await client.get_info()
+        if not info:
+            console.print("[red]Failed to get device info[/red]")
+            await transport.close()
+            raise typer.Exit(1)
+
+    address = int(addr_str, 0) if addr_str is not None else 0x14000000
+    size = _parse_size(size_str) if size_str is not None else info["flash_size"]
 
     if output == "human":
         console.print(f"Reading 0x{address:08x} + {size} bytes...")
@@ -1006,7 +1015,7 @@ async def _agent_read_async(
 @agent_app.command("write")
 def agent_write(
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
-    addr: str = typer.Option(..., "-a", "--addr", help="Start address (hex)"),
+    addr: str = typer.Option("0x14000000", "-a", "--addr", help="Start address (hex, default: flash base)"),
     input_file: str = typer.Option(..., "-i", "--input", help="Input binary file"),
     verify: bool = typer.Option(True, "--verify/--no-verify", help="CRC32 verify after write"),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
