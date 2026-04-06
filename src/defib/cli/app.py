@@ -976,7 +976,7 @@ async def _agent_read_async(
             raise typer.Exit(1)
 
     address = int(addr_str, 0) if addr_str is not None else 0x14000000
-    size = _parse_size(size_str) if size_str is not None else info["flash_size"]
+    size = _parse_size(size_str) if size_str is not None else int(info["flash_size"])
 
     if output == "human":
         console.print(f"Reading 0x{address:08x} + {size} bytes...")
