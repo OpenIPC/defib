@@ -323,9 +323,9 @@ class FlashAgentClient:
         if cmd != RSP_ACK or resp[0] != ACK_OK:
             return False
 
-        # Send data packets with backpressure: agent sends a COBS-framed
-        # ACK after each DATA packet. Host waits for it before sending
-        # next. Guarantees zero data loss at any speed.
+        # Stream all DATA packets without per-packet ACK.
+        # With COBS bug fixed + D-cache, the agent processes fast
+        # enough to keep up at 921600 baud.
         offset = 0
         seq = 0
         while offset < len(data):
@@ -334,11 +334,6 @@ class FlashAgentClient:
             await send_packet(self._transport, RSP_DATA, pkt)
             offset += chunk
             seq += 1
-
-            # Wait for per-packet ACK
-            cmd, resp = await recv_response(self._transport, timeout=10.0)
-            if cmd != RSP_ACK or resp[0] != ACK_OK:
-                return False
 
         # Final CRC verification ACK — may take seconds for large transfers
         crc_timeout = max(60.0, len(data) / 50000)  # ~20µs/byte for CRC32
@@ -603,7 +598,7 @@ class FlashAgentClient:
         if cmd != RSP_ACK or resp[0] != ACK_OK:
             return False
 
-        # Send data with per-packet backpressure
+        # Stream all data packets
         offset = 0
         seq = 0
         while offset < len(firmware):
@@ -612,12 +607,6 @@ class FlashAgentClient:
             await send_packet(self._transport, RSP_DATA, pkt)
             offset += chunk
             seq += 1
-
-            # Wait for per-packet ACK
-            cmd, resp = await recv_response(self._transport, timeout=10.0)
-            if cmd != RSP_ACK or resp[0] != ACK_OK:
-                logger.error("Selfupdate packet %d failed: 0x%02x", seq, resp[0])
-                return False
 
         # Wait for CRC verification ACK (agent verifies before jumping)
         cmd, resp = await recv_response(self._transport, timeout=30.0)
