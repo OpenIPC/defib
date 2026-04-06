@@ -381,6 +381,102 @@ static void handle_flash_write(const uint8_t *data, uint32_t len) {
 }
 
 /*
+ * CMD_FLASH_PROGRAM: erase + program flash from RAM.
+ *
+ * The U-Boot approach: host writes data to RAM first (via CMD_WRITE),
+ * then sends this command to erase + program flash from that RAM buffer.
+ * Agent does the entire flash operation locally, sending per-sector
+ * progress so the host knows it's alive.
+ *
+ *   Host sends: CMD_FLASH_PROGRAM [ram_addr:4LE] [flash_addr:4LE]
+ *               [size:4LE] [expected_crc:4LE]
+ *   Agent: verifies RAM CRC → erases sectors → programs pages
+ *   Progress: RSP_DATA [sectors_done:2LE] [total_sectors:2LE] per sector
+ *   Final: ACK_OK or ACK_CRC_ERROR/ACK_FLASH_ERROR
+ */
+static void handle_flash_program(const uint8_t *data, uint32_t len) {
+    if (len < 16) { proto_send_ack(ACK_CRC_ERROR); return; }
+    if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
+
+    uint32_t ram_addr = read_le32(&data[0]);
+    uint32_t flash_addr = read_le32(&data[4]);
+    uint32_t size = read_le32(&data[8]);
+    uint32_t expected_crc = read_le32(&data[12]);
+
+    /* Validate */
+    if (size == 0 || flash_addr + size > flash_info.size) {
+        proto_send_ack(ACK_FLASH_ERROR);
+        return;
+    }
+    if (!addr_readable(ram_addr, size)) {
+        proto_send_ack(ACK_FLASH_ERROR);
+        return;
+    }
+
+    const uint8_t *src = (const uint8_t *)ram_addr;
+
+    /* Verify RAM data CRC before touching flash */
+    uint32_t actual_crc = crc32(0, src, size);
+    if (actual_crc != expected_crc) {
+        uint8_t err[9];
+        err[0] = ACK_CRC_ERROR;
+        write_le32(&err[1], actual_crc);
+        write_le32(&err[5], size);
+        proto_send(RSP_ACK, err, 9);
+        return;
+    }
+
+    proto_send_ack(ACK_OK);  /* CRC verified, starting flash operation */
+
+    uint32_t sector_sz = flash_info.sector_size;
+    uint32_t page_sz = flash_info.page_size;
+
+    /* Round up to sector boundary for erase */
+    uint32_t erase_start = flash_addr & ~(sector_sz - 1);
+    uint32_t erase_end = (flash_addr + size + sector_sz - 1) & ~(sector_sz - 1);
+    uint32_t num_sectors = (erase_end - erase_start) / sector_sz;
+    uint32_t total_sectors = num_sectors;
+
+    /* Phase 1: Erase sectors */
+    for (uint32_t s = 0; s < num_sectors; s++) {
+        flash_erase_sector(erase_start + s * sector_sz);
+
+        /* Progress: [sectors_done:2LE] [total:2LE] */
+        uint8_t progress[4];
+        progress[0] = ((s + 1) >> 0) & 0xFF;
+        progress[1] = ((s + 1) >> 8) & 0xFF;
+        progress[2] = (total_sectors >> 0) & 0xFF;
+        progress[3] = (total_sectors >> 8) & 0xFF;
+        proto_send(RSP_DATA, progress, 4);
+    }
+
+    /* Phase 2: Program pages */
+    uint32_t offset = 0;
+    while (offset < size) {
+        uint32_t chunk = size - offset;
+        if (chunk > page_sz) chunk = page_sz;
+        flash_write_page(flash_addr + offset, &src[offset], chunk);
+        offset += chunk;
+
+        /* Progress every 64 pages (16KB) to keep host alive */
+        if ((offset % (page_sz * 64)) == 0 || offset >= size) {
+            uint8_t progress[4];
+            uint16_t done = (uint16_t)(total_sectors + offset / (page_sz * 64));
+            uint16_t total = (uint16_t)(total_sectors + size / (page_sz * 64));
+            progress[0] = (done >> 0) & 0xFF;
+            progress[1] = (done >> 8) & 0xFF;
+            progress[2] = (total >> 0) & 0xFF;
+            progress[3] = (total >> 8) & 0xFF;
+            proto_send(RSP_DATA, progress, 4);
+        }
+    }
+
+    /* Skip in-agent verify — the FMC memory window may have stale data
+     * after bulk programming (65536 soft resets). Host verifies separately. */
+    proto_send_ack(ACK_OK);
+}
+
+/*
  * ARM32 position-independent trampoline (machine code).
  * Copies r2 bytes from r1 to r0, then branches to r0-r2 (original dst).
  *
@@ -694,14 +790,20 @@ int main(void) {
             case CMD_SCAN:
                 handle_scan(cmd_buf, data_len);
                 break;
+            case CMD_FLASH_PROGRAM:
+                handle_flash_program(cmd_buf, data_len);
+                break;
             case CMD_SET_BAUD:
                 handle_set_baud(cmd_buf, data_len);
                 break;
             case CMD_REBOOT:
-                /* Rejected — watchdog reset re-enters bootrom on serial
-                 * boot pin, killing the agent with no recovery. Use
-                 * SELFUPDATE to reload, or physical power cycle. */
-                proto_send_ack(ACK_FLASH_ERROR);
+                /* ACK first, then system reset via sysctrl register.
+                 * This is the standard HiSilicon reset (same as Linux
+                 * hisi-reboot driver): write 0xdeadbeef to 0x12020004. */
+                proto_send_ack(ACK_OK);
+                for (volatile int i = 0; i < 100000; i++) {}
+                *(volatile uint32_t *)0x12020004 = 0xdeadbeef;
+                while (1) {}
                 break;
             default:
                 proto_send_ack(ACK_CRC_ERROR);
