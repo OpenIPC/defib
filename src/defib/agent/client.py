@@ -18,6 +18,7 @@ from defib.agent.protocol import (
     ACK_OK,
     CMD_CRC32,
     CMD_ERASE,
+    CMD_FLASH_PROGRAM,
     CMD_INFO,
     CMD_READ,
     CMD_SCAN,
@@ -381,41 +382,59 @@ class FlashAgentClient:
         data: bytes,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> bool:
-        """Write data to flash (assumes sectors already erased).
+        """Write data to flash: upload to RAM, then erase + program.
 
-        Uses _write_block with per-packet backpressure for reliable
-        transfer. Agent receives to RAM staging, verifies CRC, programs
-        flash page-by-page, verifies readback.
+        Two-phase approach (like U-Boot sf write):
+        1. Upload data to RAM via write_memory (fast, reliable)
+        2. CMD_FLASH_PROGRAM: agent erases + programs from RAM locally
         """
         total = len(data)
-        offset = 0
-        max_retries = 3
+        ram_addr = self._ram_base + 0x200000  # Staging area in DDR
 
-        while offset < total:
-            block_size = min(WRITE_MAX_TRANSFER, total - offset)
-            block = data[offset:offset + block_size]
+        # Phase 1: Upload to RAM
+        logger.info("Flash write: uploading %d bytes to RAM", total)
+        ok = await self.write_memory(
+            ram_addr, data,
+            on_progress=lambda d, t: (
+                on_progress(d // 2, total) if on_progress else None
+            ),
+        )
+        if not ok:
+            logger.error("Flash write: RAM upload failed")
+            return False
 
-            ok = False
-            for attempt in range(max_retries):
-                ok = await self._write_block(addr + offset, block)
-                if ok:
-                    break
-                logger.warning(
-                    "Flash write retry %d at offset %d/%d",
-                    attempt + 1, offset, total,
-                )
-                import asyncio
-                await asyncio.sleep(0.1)
+        # Phase 2: Tell agent to erase + program flash from RAM
+        logger.info("Flash write: programming flash from RAM")
+        self._clear_rx_buffers()
+        expected_crc = zlib.crc32(data) & 0xFFFFFFFF
+        payload = struct.pack("<IIII", ram_addr, addr, total, expected_crc)
+        await send_packet(self._transport, CMD_FLASH_PROGRAM, payload)
 
-            if not ok:
-                logger.error("Flash write failed at offset %d/%d", offset, total)
+        # Read initial ACK (CRC verified)
+        cmd, resp = await recv_response(self._transport, timeout=30.0)
+        if cmd != RSP_ACK or resp[0] != ACK_OK:
+            logger.error("Flash program rejected: 0x%02x", resp[0] if resp else -1)
+            return False
+
+        # Read progress packets until final ACK
+        while True:
+            cmd, data_pkt = await recv_packet(self._transport, timeout=60.0)
+            if cmd == RSP_READY:
+                continue
+            elif cmd == RSP_DATA and len(data_pkt) >= 4:
+                done = data_pkt[0] | (data_pkt[1] << 8)
+                total_steps = data_pkt[2] | (data_pkt[3] << 8)
+                if on_progress and total_steps > 0:
+                    on_progress(total // 2 + (total // 2) * done // total_steps, total)
+            elif cmd == RSP_ACK:
+                if data_pkt[0] == ACK_OK:
+                    return True
+                logger.error("Flash program failed: 0x%02x", data_pkt[0])
                 return False
+            else:
+                break
 
-            offset += block_size
-            if on_progress:
-                on_progress(offset, total)
-
-        return True
+        return False
 
     async def crc32(self, addr: int, size: int) -> int:
         """Get CRC32 of a memory region from the device."""
@@ -654,9 +673,12 @@ class FlashAgentClient:
         return False
 
     async def reboot(self) -> None:
-        """Reboot is disabled — watchdog reset kills the agent on serial
-        boot pin with no recovery. Use selfupdate() to reload code."""
-        raise RuntimeError(
-            "Reboot disabled: watchdog reset re-enters bootrom on serial "
-            "boot mode, requiring physical power cycle. Use selfupdate() instead."
-        )
+        """Reset the device via watchdog. Bootrom boots from flash if
+        valid firmware is present, otherwise enters serial download."""
+        self._clear_rx_buffers()
+        from defib.agent.protocol import CMD_REBOOT
+        await send_packet(self._transport, CMD_REBOOT)
+        try:
+            cmd, resp = await recv_response(self._transport, timeout=5.0)
+        except Exception:
+            pass  # Agent may reset before ACK arrives

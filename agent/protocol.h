@@ -17,6 +17,7 @@
 #define CMD_SELFUPDATE  0x07
 #define CMD_SET_BAUD    0x08
 #define CMD_SCAN        0x09
+#define CMD_FLASH_PROGRAM 0x0A
 
 /* Responses (device → host) */
 #define RSP_INFO    0x81
