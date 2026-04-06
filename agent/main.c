@@ -105,8 +105,23 @@ static int addr_readable(uint32_t addr, uint32_t size) {
     return 0;
 }
 
+/* Agent protocol version — increment on protocol changes */
+#define AGENT_VERSION       2
+
+/* Capability flags — advertise supported features */
+#define CAP_FLASH_STREAM    (1 << 0)  /* CMD_FLASH_STREAM with double-buffer */
+#define CAP_SECTOR_BITMAP   (1 << 1)  /* 0xFF sector skip in FLASH_STREAM */
+#define CAP_PAGE_SKIP       (1 << 2)  /* 0xFF page skip in programming */
+#define CAP_SET_BAUD        (1 << 3)  /* CMD_SET_BAUD for high-speed UART */
+#define CAP_REBOOT          (1 << 4)  /* CMD_REBOOT */
+#define CAP_SELFUPDATE      (1 << 5)  /* CMD_SELFUPDATE */
+#define CAP_SCAN            (1 << 6)  /* CMD_SCAN */
+
+#define AGENT_CAPS (CAP_FLASH_STREAM | CAP_SECTOR_BITMAP | CAP_PAGE_SKIP | \
+                    CAP_SET_BAUD | CAP_REBOOT | CAP_SELFUPDATE | CAP_SCAN)
+
 static void handle_info(void) {
-    uint8_t resp[16];
+    uint8_t resp[24];
     /* JEDEC ID in first 4 bytes (3 bytes + padding) */
     resp[0] = flash_info.jedec_id[0];
     resp[1] = flash_info.jedec_id[1];
@@ -115,7 +130,9 @@ static void handle_info(void) {
     write_le32(&resp[4], flash_info.size);
     write_le32(&resp[8], RAM_BASE);
     write_le32(&resp[12], 0x10000);    /* 64KB sector */
-    proto_send(RSP_INFO, resp, 16);
+    write_le32(&resp[16], AGENT_VERSION);
+    write_le32(&resp[20], AGENT_CAPS);
+    proto_send(RSP_INFO, resp, 24);
 }
 
 static void handle_read(const uint8_t *data, uint32_t len) {

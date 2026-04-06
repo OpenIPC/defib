@@ -930,6 +930,20 @@ async def _agent_info_async(port: str, output: str) -> None:
         console.print(f"  Flash size:  {int(info.get('flash_size', 0)) // 1024} KB")
         console.print(f"  RAM base:    0x{int(info.get('ram_base', 0)):08x}")
         console.print(f"  Sector size: {int(info.get('sector_size', 0)) // 1024} KB")
+        if "agent_version" in info:
+            caps = int(info.get("capabilities", 0))
+            cap_names = []
+            cap_map = [
+                (1 << 0, "flash_stream"), (1 << 1, "sector_bitmap"),
+                (1 << 2, "page_skip"), (1 << 3, "set_baud"),
+                (1 << 4, "reboot"), (1 << 5, "selfupdate"),
+                (1 << 6, "scan"),
+            ]
+            for bit, name in cap_map:
+                if caps & bit:
+                    cap_names.append(name)
+            console.print(f"  Agent ver:   {info['agent_version']}")
+            console.print(f"  Capabilities: {', '.join(cap_names) or 'none'}")
 
 
 @agent_app.command("read")
