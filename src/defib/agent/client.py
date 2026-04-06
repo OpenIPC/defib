@@ -92,6 +92,9 @@ class ScanResult:
 WRITE_CHUNK_SIZE = 512
 # Max bytes per WRITE block.
 WRITE_MAX_TRANSFER = 16 * 1024
+# Number of blocks sent before reading ACKs (windowed ACK).
+# Higher = less round-trip overhead, but more data at risk on failure.
+WRITE_WINDOW = 16  # 16 × 16KB = 256KB in flight
 
 # Optimal baud rate from hi3516ev300 + FT232R benchmarks.
 # 921600 is the highest rate verified for both READ and WRITE with
@@ -268,11 +271,13 @@ class FlashAgentClient:
         on_progress: Callable[[int, int], None] | None = None,
         fast: bool = True,
     ) -> bool:
-        """Write data to device RAM in chunked transfers.
+        """Write data to device RAM using windowed ACK.
 
-        If fast=True and data > 4KB, switches to DEFAULT_FAST_BAUD.
-        Splits into WRITE_MAX_TRANSFER-sized blocks to avoid PL011 FIFO
-        overflow on uncached DDR. Each block uses WRITE_CHUNK_SIZE packets.
+        Sends W blocks (CMD_WRITE + DATA stream) back-to-back without
+        waiting for ACKs, then reads all W ACKs. This pipelines the
+        round-trips, approaching line speed.
+
+        Falls back to single-block mode on failure.
         """
         self._clear_rx_buffers()
 
@@ -281,34 +286,91 @@ class FlashAgentClient:
 
         total = len(data)
         offset = 0
-        max_retries = 5
+        window = min(WRITE_WINDOW, (total + WRITE_MAX_TRANSFER - 1) // WRITE_MAX_TRANSFER)
 
         while offset < total:
-            block_size = min(WRITE_MAX_TRANSFER, total - offset)
-            block = data[offset:offset + block_size]
+            # Send a window of blocks without waiting for ACKs
+            blocks_sent = 0
+            window_start = offset
 
-            ok = False
-            for attempt in range(max_retries):
-                ok = await self._write_block(addr + offset, block)
-                if ok:
+            for _ in range(window):
+                if offset >= total:
                     break
-                logger.warning(
-                    "WRITE retry %d at offset %d/%d",
-                    attempt + 1, offset, total,
-                )
+                block_size = min(WRITE_MAX_TRANSFER, total - offset)
+                block = data[offset:offset + block_size]
+                crc = zlib.crc32(block) & 0xFFFFFFFF
+
+                # Send CMD_WRITE + all DATA packets (no wait)
+                payload = struct.pack("<III", addr + offset, block_size, crc)
+                await send_packet(self._transport, CMD_WRITE, payload)
+
+                blk_off = 0
+                seq = 0
+                while blk_off < block_size:
+                    chunk = min(WRITE_CHUNK_SIZE, block_size - blk_off)
+                    pkt = struct.pack("<H", seq) + block[blk_off:blk_off + chunk]
+                    await send_packet(self._transport, RSP_DATA, pkt)
+                    blk_off += chunk
+                    seq += 1
+
+                offset += block_size
+                blocks_sent += 1
+
+            # Now read all ACKs: initial ACK + CRC ACK per block
+            all_ok = True
+            for i in range(blocks_sent):
+                try:
+                    # Initial ACK
+                    cmd, resp = await recv_response(self._transport, timeout=10.0)
+                    if cmd != RSP_ACK or resp[0] != ACK_OK:
+                        all_ok = False
+                        break
+
+                    # CRC ACK
+                    crc_timeout = max(60.0, WRITE_MAX_TRANSFER / 50000)
+                    cmd, resp = await recv_response(self._transport, timeout=crc_timeout)
+                    if cmd != RSP_ACK or resp[0] != ACK_OK:
+                        all_ok = False
+                        break
+                except Exception:
+                    all_ok = False
+                    break
+
+                if on_progress:
+                    on_progress(window_start + (i + 1) * WRITE_MAX_TRANSFER, total)
+
+            if not all_ok:
+                # Fall back to single-block retry for the failed window
+                logger.warning("Window failed at offset %d, retrying single-block", window_start)
+                offset = window_start
+                window = 1  # Degrade to single-block mode
+                self._clear_rx_buffers()
+
+                # Drain any stale ACKs from partially-completed window
                 import asyncio
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.5)
+                port = getattr(self._transport, '_port', None)
+                if port is not None:
+                    port.reset_input_buffer()
+                    from defib.agent.protocol import _port_buffers
+                    _port_buffers[id(port)] = bytearray()
 
-            if not ok:
-                logger.error(
-                    "WRITE failed at offset %d/%d after %d retries",
-                    offset, total, max_retries,
-                )
-                return False
+                # Retry this window as single blocks
+                for _ in range(blocks_sent):
+                    if offset >= total:
+                        break
+                    block_size = min(WRITE_MAX_TRANSFER, total - offset)
+                    block = data[offset:offset + block_size]
+                    ok = await self._write_block(addr + offset, block)
+                    if not ok:
+                        logger.error("Single-block retry failed at %d/%d", offset, total)
+                        return False
+                    offset += block_size
+                    if on_progress:
+                        on_progress(offset, total)
 
-            offset += block_size
-            if on_progress:
-                on_progress(offset, total)
+                # Restore window for next iteration
+                window = min(WRITE_WINDOW, (total - offset + WRITE_MAX_TRANSFER - 1) // WRITE_MAX_TRANSFER)
 
         return True
 
