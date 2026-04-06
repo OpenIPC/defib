@@ -192,6 +192,15 @@ class FlashAgentClient:
             if ok:
                 self._current_baud = FALLBACK_BAUD
 
+    # Agent capability flags (must match agent/main.c)
+    CAP_FLASH_STREAM = 1 << 0
+    CAP_SECTOR_BITMAP = 1 << 1
+    CAP_PAGE_SKIP = 1 << 2
+    CAP_SET_BAUD = 1 << 3
+    CAP_REBOOT = 1 << 4
+    CAP_SELFUPDATE = 1 << 5
+    CAP_SCAN = 1 << 6
+
     async def get_info(self) -> dict[str, int | str]:
         """Request device info from the agent."""
         self._clear_rx_buffers()
@@ -209,12 +218,21 @@ class FlashAgentClient:
         self._ram_base = ram_base
         self._sector_size = sector_size
 
-        return {
+        result: dict[str, int | str] = {
             "jedec_id": f"{jedec[0]:02x}{jedec[1]:02x}{jedec[2]:02x}",
             "flash_size": flash_size,
             "ram_base": ram_base,
             "sector_size": sector_size,
         }
+
+        # Extended fields (agent version >= 2)
+        if len(data) >= 24:
+            version = struct.unpack("<I", data[16:20])[0]
+            caps = struct.unpack("<I", data[20:24])[0]
+            result["agent_version"] = version
+            result["capabilities"] = caps
+
+        return result
 
     async def read_memory(
         self,

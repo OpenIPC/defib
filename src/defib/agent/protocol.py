@@ -18,7 +18,7 @@ Commands (host → device):
   0x09  SCAN       — Scan flash health
 
 Responses (device → host):
-  0x81  INFO_RSP — chip_id(4B) + flash_size(4B) + ram_base(4B)
+  0x81  INFO_RSP — chip_id(4B) + flash_size(4B) + ram_base(4B) + sector_size(4B) + version(4B) + caps(4B)
   0x82  DATA     — seq(2B LE) + data(up to 1024B)
   0x83  ACK      — status(1B): 0=OK, 1=CRC error, 2=flash error
   0x84  CRC32_RSP— crc32(4B LE)
