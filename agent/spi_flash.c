@@ -110,6 +110,11 @@ static void fmc_enter_boot(void) {
     for (volatile int i = 0; i < 1000; i++) {}
     REG_FMC_CRG = crg & ~FMC_SOFT_RESET;
     for (volatile int i = 0; i < 1000; i++) {}
+
+    /* Soft reset clears FMC registers — reconfigure for proper boot mode.
+     * Without this, the memory window at FLASH_MEM wraps at 1MB. */
+    fmc_reg(FMC_SPI_TIMING_CFG) = SPI_TIMING_VAL;
+    fmc_reg(FMC_INT_CLR) = 0xFF;
 }
 
 static void fmc_wait_ready(void) {
@@ -122,6 +127,9 @@ static void spi_wait_wip(void) {
     for (int i = 0; i < 10000000; i++) {
         uint8_t sr = flash_read_status();
         if (!(sr & SPI_STATUS_WIP)) return;
+        /* Drain UART FIFO while waiting — prevents overflow during
+         * long flash operations (erase ~150ms, page program ~1-3ms) */
+        proto_drain_fifo();
     }
 }
 
@@ -226,9 +234,29 @@ int flash_init(flash_info_t *info) {
 }
 
 void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
-    const uint8_t *flash = (const uint8_t *)FLASH_MEM;
-    for (uint32_t i = 0; i < len; i++)
-        buf[i] = flash[addr + i];
+    /* Use register-based reads (normal mode) instead of memory window.
+     * The boot mode memory window wraps at 1MB on some SoCs. */
+    fmc_enter_normal();
+    volatile uint8_t *iobuf = (volatile uint8_t *)(FLASH_MEM);
+
+    while (len > 0) {
+        uint32_t chunk = len > 256 ? 256 : len;
+        fmc_reg(FMC_CMD) = 0x03;  /* SPI READ */
+        fmc_reg(FMC_ADDRL) = addr;
+        fmc_reg(FMC_DATA_NUM) = chunk;
+        fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(3);
+        fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
+        fmc_wait_ready();
+
+        for (uint32_t i = 0; i < chunk; i++)
+            buf[i] = iobuf[i];
+
+        buf += chunk;
+        addr += chunk;
+        len -= chunk;
+    }
+
+    fmc_enter_boot();
 }
 
 uint8_t flash_unlock_debug[3];
@@ -297,6 +325,31 @@ int flash_write_page(uint32_t addr, const uint8_t *data, uint32_t len) {
 }
 
 uint32_t flash_crc32(uint32_t addr, uint32_t len) {
-    const uint8_t *flash = (const uint8_t *)FLASH_MEM;
-    return crc32(0, &flash[addr], len);
+    /* Use register-based reads to compute CRC32 over flash region.
+     * Boot mode memory window wraps at 1MB on some SoCs. */
+    fmc_enter_normal();
+    volatile uint8_t *iobuf = (volatile uint8_t *)(FLASH_MEM);
+    uint32_t c = 0;
+
+    while (len > 0) {
+        uint32_t chunk = len > 256 ? 256 : len;
+        fmc_reg(FMC_CMD) = 0x03;  /* SPI READ */
+        fmc_reg(FMC_ADDRL) = addr;
+        fmc_reg(FMC_DATA_NUM) = chunk;
+        fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(3);
+        fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
+        fmc_wait_ready();
+
+        /* CRC the I/O buffer contents in place */
+        uint8_t tmp[256];
+        for (uint32_t i = 0; i < chunk; i++)
+            tmp[i] = iobuf[i];
+        c = crc32(c, tmp, chunk);
+
+        addr += chunk;
+        len -= chunk;
+    }
+
+    fmc_enter_boot();
+    return c;
 }

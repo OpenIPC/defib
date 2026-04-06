@@ -61,7 +61,7 @@ static uint8_t rx_raw[MAX_PAYLOAD + 16];
 
 /* Software RX FIFO — drains PL011 hardware FIFO (16 bytes) to prevent
  * overflow during COBS decode + CRC32 processing on uncached DDR. */
-static uint8_t soft_rx[4096];
+static uint8_t soft_rx[72 * 1024];  /* Must hold ~1 sector during flash ops */
 static uint32_t soft_rx_head = 0;
 static uint32_t soft_rx_tail = 0;
 

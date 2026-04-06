@@ -153,6 +153,13 @@ static void handle_read(const uint8_t *data, uint32_t len) {
                 for (uint32_t j = 0; j < 4 && (i + j) < chunk; j++)
                     pkt[2 + i + j] = (val >> ((byte_off + j) * 8)) & 0xFF;
             }
+        } else if (flash_readable && addr >= FLASH_MEM &&
+                   (addr + size) <= (FLASH_MEM + flash_info.size)) {
+            /* Register-based flash read — boot mode window wraps at 1MB */
+            uint8_t tmp[MAX_PAYLOAD];
+            flash_read(addr - FLASH_MEM + offset, tmp, chunk);
+            for (uint32_t i = 0; i < chunk; i++)
+                pkt[2 + i] = tmp[i];
         } else {
             const uint8_t *ptr = (const uint8_t *)addr;
             for (uint32_t i = 0; i < chunk; i++)
@@ -177,8 +184,16 @@ static void handle_crc32_cmd(const uint8_t *data, uint32_t len) {
         return;
     }
 
-    const uint8_t *ptr = (const uint8_t *)addr;
-    uint32_t c = crc32(0, ptr, size);
+    uint32_t c;
+    /* Route flash reads through register-based path — boot mode memory
+     * window wraps at 1MB on some SoCs. */
+    if (flash_readable && addr >= FLASH_MEM &&
+        (addr + size) <= (FLASH_MEM + flash_info.size)) {
+        c = flash_crc32(addr - FLASH_MEM, size);
+    } else {
+        const uint8_t *ptr = (const uint8_t *)addr;
+        c = crc32(0, ptr, size);
+    }
     uint8_t resp[4];
     write_le32(resp, c);
     proto_send(RSP_CRC32, resp, 4);
@@ -471,6 +486,129 @@ static void handle_flash_program(const uint8_t *data, uint32_t len) {
 
     /* Skip in-agent verify — the FMC memory window may have stale data
      * after bulk programming (65536 soft resets). Host verifies separately. */
+    proto_send_ack(ACK_OK);
+}
+
+/*
+ * CMD_FLASH_STREAM: stream data from UART directly to flash.
+ *
+ * Processes one sector at a time: erase → receive → program.
+ * No separate RAM upload phase — data flows UART → RAM buffer → flash.
+ * Host streams DATA packets continuously; agent sends per-sector progress.
+ *
+ *   Host sends: CMD_FLASH_STREAM [flash_addr:4LE] [size:4LE] [crc:4LE]
+ *   Agent ACKs, then for each sector: erase, receive 64KB, program pages.
+ *   Progress: RSP_DATA [sector_done:2LE] [total:2LE] after each sector.
+ *   Final: ACK_OK or ACK_CRC_ERROR.
+ */
+static void handle_flash_stream(const uint8_t *data, uint32_t len) {
+    if (len < 12) { proto_send_ack(ACK_CRC_ERROR); return; }
+    if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
+
+    uint32_t flash_addr = read_le32(&data[0]);
+    uint32_t size = read_le32(&data[4]);
+    uint32_t expected_crc = read_le32(&data[8]);
+
+    if (size == 0 || flash_addr + size > flash_info.size) {
+        proto_send_ack(ACK_FLASH_ERROR);
+        return;
+    }
+
+    uint32_t sector_sz = flash_info.sector_size;
+    uint32_t page_sz = flash_info.page_size;
+    uint32_t num_sectors = (size + sector_sz - 1) / sector_sz;
+
+    /* Double buffer: receive into one while erasing+programming the other.
+     * Only 128KB total — works on all SoCs. */
+    uint8_t *buf[2] = {
+        (uint8_t *)(RAM_BASE + 0x200000),
+        (uint8_t *)(RAM_BASE + 0x210000),
+    };
+    int rx_buf = 0;  /* Buffer currently being filled */
+
+    proto_send_ack(ACK_OK);
+
+    uint32_t total_received = 0;
+    /* Pending sector to erase+program (from previous iteration) */
+    int pending_buf = -1;
+    uint32_t pending_addr = 0;
+    uint32_t pending_bytes = 0;
+
+    for (uint32_t s = 0; s < num_sectors; s++) {
+        uint32_t sector_offset = s * sector_sz;
+        uint32_t sector_bytes = size - sector_offset;
+        if (sector_bytes > sector_sz) sector_bytes = sector_sz;
+
+        /* Receive sector data into rx_buf.
+         * No flash operations during receive — UART stays responsive. */
+        uint32_t buf_received = 0;
+        uint8_t pkt[MAX_PAYLOAD + 16];
+        while (buf_received < sector_bytes) {
+            uint32_t pkt_len = 0;
+            uint8_t cmd = proto_recv(pkt, &pkt_len, 10000);
+            if (cmd == RSP_DATA && pkt_len > 2) {
+                uint32_t chunk = pkt_len - 2;
+                for (uint32_t i = 0; i < chunk && buf_received < sector_bytes; i++)
+                    buf[rx_buf][buf_received++] = pkt[2 + i];
+            } else if (cmd == 0) {
+                uint8_t err[5];
+                err[0] = ACK_FLASH_ERROR;
+                write_le32(&err[1], total_received + buf_received);
+                proto_send(RSP_ACK, err, 5);
+                return;
+            }
+        }
+
+        total_received += sector_bytes;
+
+        /* Tell host: "sector received, send next now!"
+         * Host starts streaming next sector immediately. */
+        {
+            uint8_t progress[4];
+            progress[0] = ((s + 1) >> 0) & 0xFF;
+            progress[1] = ((s + 1) >> 8) & 0xFF;
+            progress[2] = (num_sectors >> 0) & 0xFF;
+            progress[3] = (num_sectors >> 8) & 0xFF;
+            proto_send(RSP_DATA, progress, 4);
+        }
+
+        /* Process previous sector if pending (erase + program).
+         * Host is streaming next sector into the OTHER buffer right now. */
+        if (pending_buf >= 0) {
+            flash_erase_sector(pending_addr);
+            uint32_t offset = 0;
+            while (offset < pending_bytes) {
+                uint32_t chunk = pending_bytes - offset;
+                if (chunk > page_sz) chunk = page_sz;
+                flash_write_page(pending_addr + offset,
+                                 &buf[pending_buf][offset], chunk);
+                offset += chunk;
+                proto_drain_fifo();
+            }
+        }
+
+        /* This sector's buffer becomes the pending one */
+        pending_buf = rx_buf;
+        pending_addr = flash_addr + sector_offset;
+        pending_bytes = sector_bytes;
+
+        /* Swap to the other buffer for next receive */
+        rx_buf ^= 1;
+    }
+
+    /* Process the last sector (no more data to receive) */
+    if (pending_buf >= 0) {
+        flash_erase_sector(pending_addr);
+        uint32_t offset = 0;
+        while (offset < pending_bytes) {
+            uint32_t chunk = pending_bytes - offset;
+            if (chunk > page_sz) chunk = page_sz;
+            flash_write_page(pending_addr + offset,
+                             &buf[pending_buf][offset], chunk);
+            offset += chunk;
+        }
+    }
+
     proto_send_ack(ACK_OK);
 }
 
@@ -789,6 +927,9 @@ int main(void) {
                 break;
             case CMD_FLASH_PROGRAM:
                 handle_flash_program(cmd_buf, data_len);
+                break;
+            case CMD_FLASH_STREAM:
+                handle_flash_stream(cmd_buf, data_len);
                 break;
             case CMD_SET_BAUD:
                 handle_set_baud(cmd_buf, data_len);

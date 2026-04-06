@@ -18,7 +18,7 @@ from defib.agent.protocol import (
     ACK_OK,
     CMD_CRC32,
     CMD_ERASE,
-    CMD_FLASH_PROGRAM,
+    CMD_FLASH_STREAM,
     CMD_INFO,
     CMD_READ,
     CMD_SCAN,
@@ -439,55 +439,76 @@ class FlashAgentClient:
         data: bytes,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> bool:
-        """Write data to flash: upload to RAM, then erase + program.
+        """Stream data directly to flash: erase + receive + program per sector.
 
-        Two-phase approach (like U-Boot sf write):
-        1. Upload data to RAM via write_memory (fast, reliable)
-        2. CMD_FLASH_PROGRAM: agent erases + programs from RAM locally
+        Single-phase: host streams DATA, agent erases/programs each sector
+        as data arrives. No separate RAM upload. Fastest possible path.
         """
-        total = len(data)
-        ram_addr = self._ram_base + 0x200000  # Staging area in DDR
-
-        # Phase 1: Upload to RAM
-        logger.info("Flash write: uploading %d bytes to RAM", total)
-        ok = await self.write_memory(
-            ram_addr, data,
-            on_progress=lambda d, t: (
-                on_progress(d // 2, total) if on_progress else None
-            ),
-        )
-        if not ok:
-            logger.error("Flash write: RAM upload failed")
-            return False
-
-        # Phase 2: Tell agent to erase + program flash from RAM
-        logger.info("Flash write: programming flash from RAM")
         self._clear_rx_buffers()
-        expected_crc = zlib.crc32(data) & 0xFFFFFFFF
-        payload = struct.pack("<IIII", ram_addr, addr, total, expected_crc)
-        await send_packet(self._transport, CMD_FLASH_PROGRAM, payload)
 
-        # Read initial ACK (CRC verified)
-        cmd, resp = await recv_response(self._transport, timeout=30.0)
+        total = len(data)
+        expected_crc = zlib.crc32(data) & 0xFFFFFFFF
+
+        payload = struct.pack("<III", addr, total, expected_crc)
+        await send_packet(self._transport, CMD_FLASH_STREAM, payload)
+
+        cmd, resp = await recv_response(self._transport, timeout=10.0)
         if cmd != RSP_ACK or resp[0] != ACK_OK:
-            logger.error("Flash program rejected: 0x%02x", resp[0] if resp else -1)
+            logger.error("Flash stream rejected: 0x%02x", resp[0] if resp else -1)
             return False
 
-        # Read progress packets until final ACK
+        # Double-buffer pipeline: send sector N, get "received" signal,
+        # immediately send sector N+1 while agent erases+programs N.
+        # Agent sends progress RSP_DATA after RECEIVING (not after programming),
+        # so the host can keep streaming without waiting for flash ops.
+        sector_sz = self._sector_size or 0x10000
+        num_sectors = (total + sector_sz - 1) // sector_sz
+        offset = 0
+
+        for s in range(num_sectors):
+            sector_bytes = min(sector_sz, total - offset)
+
+            # Send one sector of DATA packets
+            sent = 0
+            seq = offset // WRITE_CHUNK_SIZE
+            while sent < sector_bytes:
+                chunk = min(WRITE_CHUNK_SIZE, sector_bytes - sent)
+                pkt = struct.pack("<H", seq) + data[offset + sent:offset + sent + chunk]
+                await send_packet(self._transport, RSP_DATA, pkt)
+                sent += chunk
+                seq += 1
+
+            offset += sector_bytes
+
+            # Wait for "sector received" progress — agent sends this BEFORE
+            # erase+program, so we can start sending next sector immediately.
+            while True:
+                cmd, data_pkt = await recv_packet(self._transport, timeout=120.0)
+                if cmd == RSP_READY:
+                    continue
+                elif cmd == RSP_DATA:
+                    done = data_pkt[0] | (data_pkt[1] << 8)
+                    total_steps = data_pkt[2] | (data_pkt[3] << 8)
+                    if on_progress and total_steps > 0:
+                        on_progress(total * done // total_steps, total)
+                    break
+                elif cmd == RSP_ACK:
+                    if data_pkt[0] == ACK_OK:
+                        return True
+                    logger.error("Flash stream failed: 0x%02x", data_pkt[0])
+                    return False
+                else:
+                    return False
+
+        # Wait for final ACK (agent finishes programming last sector)
         while True:
-            cmd, data_pkt = await recv_packet(self._transport, timeout=60.0)
+            cmd, data_pkt = await recv_packet(self._transport, timeout=120.0)
             if cmd == RSP_READY:
                 continue
-            elif cmd == RSP_DATA and len(data_pkt) >= 4:
-                done = data_pkt[0] | (data_pkt[1] << 8)
-                total_steps = data_pkt[2] | (data_pkt[3] << 8)
-                if on_progress and total_steps > 0:
-                    on_progress(total // 2 + (total // 2) * done // total_steps, total)
             elif cmd == RSP_ACK:
-                if data_pkt[0] == ACK_OK:
-                    return True
-                logger.error("Flash program failed: 0x%02x", data_pkt[0])
-                return False
+                return data_pkt[0] == ACK_OK
+            elif cmd == RSP_DATA:
+                continue  # Late progress packet
             else:
                 break
 
