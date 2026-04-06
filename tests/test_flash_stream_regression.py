@@ -24,10 +24,8 @@ from defib.agent.protocol import (
     build_packet,
     parse_packet,
     _recv_packet_sync,
-    recv_response,
     _port_buffers,
 )
-from defib.transport.base import TransportTimeout
 
 
 # ---------------------------------------------------------------------------
@@ -384,8 +382,7 @@ class TestCobsCrossCompat:
             raw = bytes([0x82]) + bytes([(i >> j) & 0xFF for j in range(8)])
             crc = zlib.crc32(raw) & 0xFFFFFFFF
             if (crc >> 24) == 0x00:
-                # This is the dangerous pattern
-                full = raw + struct.pack("<I", crc)
+                # This is the dangerous pattern — CRC MSB is 0x00
                 pkt = build_packet(0x82, raw[1:])
                 cmd, data = parse_packet(pkt[:-1])
                 assert cmd == 0x82
