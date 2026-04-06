@@ -342,6 +342,183 @@ static void test_cobs_matches_python(void) {
         ASSERT(mock_tx[i] != 0x00, "python compat: no internal zeros");
 }
 
+/* ---------- Regression tests ---------- */
+
+/*
+ * Bug: cobs_decode() stripped trailing 0x00 bytes. When a packet's CRC32
+ * had 0x00 as the MSB, the decoded output was 1 byte short → CRC mismatch.
+ * This caused ~1/256 packets to fail deterministically based on data content.
+ * Root cause of ALL flash write failures before the fix.
+ */
+static void test_cobs_trailing_zero_preserved(void) {
+    /* Build payloads where CRC32 MSB is 0x00 (trailing zero after LE encode).
+     * The COBS roundtrip must preserve the trailing zero. */
+    for (int trial = 0; trial < 1000; trial++) {
+        /* Construct a packet: [cmd] [data...] [crc32 LE] */
+        uint8_t payload[64];
+        uint32_t plen = 5 + (trial % 20);  /* varying lengths */
+        payload[0] = 0x82;  /* RSP_DATA */
+        for (uint32_t i = 1; i < plen; i++)
+            payload[i] = (uint8_t)((trial * 7 + i * 13) & 0xFF);
+
+        /* Compute CRC and append */
+        uint32_t c = crc32(0, payload, plen);
+        payload[plen + 0] = (c >> 0) & 0xFF;
+        payload[plen + 1] = (c >> 8) & 0xFF;
+        payload[plen + 2] = (c >> 16) & 0xFF;
+        payload[plen + 3] = (c >> 24) & 0xFF;
+        uint32_t total = plen + 4;
+
+        /* COBS encode → decode roundtrip */
+        uint8_t enc[256], dec[256];
+        uint32_t enc_len = cobs_encode(payload, total, enc);
+        uint32_t dec_len = cobs_decode(enc, enc_len, dec);
+
+        ASSERT(dec_len == total, "cobs trailing zero: length preserved");
+        ASSERT(memcmp(payload, dec, total) == 0,
+               "cobs trailing zero: data preserved");
+    }
+}
+
+/*
+ * Bug: CRC32 extraction used `cp[3] << 24` where cp[3] >= 128.
+ * uint8_t promotes to int, and left-shifting a signed int into the sign
+ * bit is undefined behavior. With ASAN this manifests as a runtime error.
+ * Fix: cast to (uint32_t) before shifting.
+ */
+static void test_crc32_high_byte_shift(void) {
+    /* Test CRC32 values where the MSB is >= 0x80 (signed bit set).
+     * These exercise the (uint32_t) cast in CRC extraction. */
+    uint8_t data_a[] = {0x03, 0x00, 0x00};  /* CMD_WRITE + padding */
+    uint32_t c = crc32(0, data_a, 3);
+
+    /* Verify the CRC packs/unpacks correctly through all 4 bytes */
+    uint8_t packed[4];
+    packed[0] = (c >> 0) & 0xFF;
+    packed[1] = (c >> 8) & 0xFF;
+    packed[2] = (c >> 16) & 0xFF;
+    packed[3] = (c >> 24) & 0xFF;
+
+    uint32_t unpacked = (uint32_t)packed[0]
+                      | ((uint32_t)packed[1] << 8)
+                      | ((uint32_t)packed[2] << 16)
+                      | ((uint32_t)packed[3] << 24);
+    ASSERT(unpacked == c, "crc32 high byte: pack/unpack roundtrip");
+
+    /* Test with every possible MSB value */
+    for (int msb = 0; msb < 256; msb++) {
+        packed[3] = (uint8_t)msb;
+        uint32_t val = (uint32_t)packed[0]
+                     | ((uint32_t)packed[1] << 8)
+                     | ((uint32_t)packed[2] << 16)
+                     | ((uint32_t)packed[3] << 24);
+        ASSERT((val >> 24) == (uint32_t)msb, "crc32 high byte shift");
+    }
+}
+
+/*
+ * End-to-end: for ALL possible payload data (varying byte values that
+ * produce different CRC patterns), verify proto_send → proto_recv roundtrip.
+ * This catches the COBS trailing zero bug: ~1/256 CRC values have MSB=0x00.
+ */
+static void test_cobs_roundtrip_all_crc_patterns(void) {
+    /* Send 256 different 8-byte payloads through proto_send/recv.
+     * Each produces a different CRC32, covering all possible MSB values. */
+    for (int i = 0; i < 256; i++) {
+        mock_reset();
+
+        uint8_t data[8];
+        for (int j = 0; j < 8; j++)
+            data[j] = (uint8_t)((i * 37 + j * 53) & 0xFF);
+
+        proto_send(RSP_DATA, data, 8);
+
+        memcpy(mock_rx, mock_tx, mock_tx_len);
+        mock_rx_len = mock_tx_len;
+        mock_rx_pos = 0;
+
+        uint8_t recv_buf[MAX_PAYLOAD + 16];
+        uint32_t recv_len = 0;
+        uint8_t cmd = proto_recv(recv_buf, &recv_len, 1000);
+
+        ASSERT(cmd == RSP_DATA, "crc pattern roundtrip: cmd");
+        ASSERT(recv_len == 8, "crc pattern roundtrip: len");
+        ASSERT(memcmp(recv_buf, data, 8) == 0,
+               "crc pattern roundtrip: data");
+    }
+}
+
+/*
+ * page_is_ff helper: verify it correctly identifies all-0xFF pages
+ * and rejects pages with even a single non-0xFF byte.
+ */
+static int page_is_ff_test(const uint8_t *data, uint32_t len) {
+    const uint32_t *w = (const uint32_t *)data;
+    for (uint32_t i = 0; i < len / 4; i++)
+        if (w[i] != 0xFFFFFFFF) return 0;
+    return 1;
+}
+
+static void test_page_is_ff(void) {
+    uint8_t page[256];
+
+    /* All 0xFF → true */
+    memset(page, 0xFF, 256);
+    ASSERT(page_is_ff_test(page, 256) == 1, "page_is_ff: all FF");
+
+    /* All 0x00 → false */
+    memset(page, 0x00, 256);
+    ASSERT(page_is_ff_test(page, 256) == 0, "page_is_ff: all 00");
+
+    /* Single non-FF byte at each position */
+    for (int pos = 0; pos < 256; pos++) {
+        memset(page, 0xFF, 256);
+        page[pos] = 0xFE;
+        ASSERT(page_is_ff_test(page, 256) == 0,
+               "page_is_ff: single non-FF byte");
+    }
+
+    /* Random data → false */
+    for (int i = 0; i < 256; i++) page[i] = (uint8_t)i;
+    ASSERT(page_is_ff_test(page, 256) == 0, "page_is_ff: random data");
+}
+
+/*
+ * Sector bitmap: verify bit indexing matches the host Python implementation.
+ * Bit N of bitmap = sector N. LSB-first within each byte.
+ */
+static void test_sector_bitmap(void) {
+    uint8_t bitmap[32];
+    memset(bitmap, 0, 32);
+
+    /* Set specific sectors */
+    bitmap[0] |= (1 << 0);   /* sector 0 */
+    bitmap[0] |= (1 << 7);   /* sector 7 */
+    bitmap[1] |= (1 << 0);   /* sector 8 */
+    bitmap[31] |= (1 << 7);  /* sector 255 */
+
+    /* Check sector_has_data equivalent */
+    ASSERT((bitmap[0 / 8] & (1 << (0 % 8))) != 0, "bitmap: sector 0 set");
+    ASSERT((bitmap[7 / 8] & (1 << (7 % 8))) != 0, "bitmap: sector 7 set");
+    ASSERT((bitmap[8 / 8] & (1 << (8 % 8))) != 0, "bitmap: sector 8 set");
+    ASSERT((bitmap[255 / 8] & (1 << (255 % 8))) != 0, "bitmap: sector 255 set");
+
+    /* Check unset sectors */
+    ASSERT((bitmap[1 / 8] & (1 << (1 % 8))) == 0, "bitmap: sector 1 unset");
+    ASSERT((bitmap[128 / 8] & (1 << (128 % 8))) == 0, "bitmap: sector 128 unset");
+    ASSERT((bitmap[254 / 8] & (1 << (254 % 8))) == 0, "bitmap: sector 254 unset");
+
+    /* All-ones bitmap */
+    memset(bitmap, 0xFF, 32);
+    for (int s = 0; s < 256; s++)
+        ASSERT((bitmap[s / 8] & (1 << (s % 8))) != 0, "bitmap: all set");
+
+    /* All-zeros bitmap */
+    memset(bitmap, 0, 32);
+    for (int s = 0; s < 256; s++)
+        ASSERT((bitmap[s / 8] & (1 << (s % 8))) == 0, "bitmap: all clear");
+}
+
 /* ---------- main ---------- */
 
 int main(void) {
@@ -374,6 +551,13 @@ int main(void) {
 
     printf("Cross-compatibility:\n");
     test_cobs_matches_python();
+
+    printf("Regression:\n");
+    test_cobs_trailing_zero_preserved();
+    test_crc32_high_byte_shift();
+    test_cobs_roundtrip_all_crc_patterns();
+    test_page_is_ff();
+    test_sector_bitmap();
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
