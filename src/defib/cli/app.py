@@ -851,6 +851,7 @@ async def _agent_upload_async(chip: str, port: str, output: str) -> None:
 
     result = await protocol.send_firmware(
         transport, agent_data, on_progress, spl_override=spl_data,
+        payload_label="Agent",
     )
     if not result.success:
         if output == "json":
@@ -973,7 +974,7 @@ async def _agent_read_async(
 
     t0 = time.time()
     data = await client.read_memory(address, size, on_progress=lambda d, t: (
-        console.print(f"\r  {d}/{t} ({d*100//t}%)", end="") if output == "human" else None
+        print(f"\r  {d}/{t} ({d*100//t}%)", end="", flush=True) if output == "human" else None
     ))
     elapsed = time.time() - t0
 
@@ -1042,7 +1043,7 @@ async def _agent_write_async(
 
     t0 = time.time()
     ok = await client.write_memory(address, data, on_progress=lambda d, t: (
-        console.print(f"\r  {d}/{t} ({d*100//t}%)", end="") if output == "human" else None
+        print(f"\r  {d}/{t} ({d*100//t}%)", end="", flush=True) if output == "human" else None
     ))
     elapsed = time.time() - t0
 

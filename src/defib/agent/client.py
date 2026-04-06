@@ -423,7 +423,8 @@ class FlashAgentClient:
 
         payload = struct.pack("<II", addr, size)
         await send_packet(self._transport, CMD_CRC32, payload)
-        cmd, data = await recv_response(self._transport, timeout=10.0)
+        timeout = max(10.0, 5.0 + size / (1024 * 1024))
+        cmd, data = await recv_response(self._transport, timeout=timeout)
         if cmd != RSP_CRC32 or len(data) < 4:
             raise RuntimeError("CRC32 response invalid")
         return int(struct.unpack("<I", data[:4])[0])
