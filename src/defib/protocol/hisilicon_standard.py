@@ -262,13 +262,14 @@ class HiSiliconStandard(BootProtocol):
         firmware: bytes,
         profile: SoCProfile,
         on_progress: Callable[[ProgressEvent], None] | None = None,
+        label: str = "U-Boot",
     ) -> bool:
-        """Send U-Boot image to DDR."""
+        """Send U-Boot (or agent) image to DDR."""
         total = len(firmware)
 
         _emit(on_progress, ProgressEvent(
             stage=Stage.UBOOT, bytes_sent=0, bytes_total=total,
-            message="Sending U-Boot",
+            message=f"Sending {label}",
         ))
 
         if not await self._send_head(transport, total, profile.uboot_address):
@@ -289,7 +290,7 @@ class HiSiliconStandard(BootProtocol):
 
         _emit(on_progress, ProgressEvent(
             stage=Stage.UBOOT, bytes_sent=total, bytes_total=total,
-            message="U-Boot complete",
+            message=f"{label} complete",
         ))
         return True
 
@@ -299,6 +300,7 @@ class HiSiliconStandard(BootProtocol):
         firmware: bytes,
         on_progress: Callable[[ProgressEvent], None] | None = None,
         spl_override: bytes | None = None,
+        payload_label: str = "U-Boot",
     ) -> RecoveryResult:
         if self._profile is None:
             return RecoveryResult(success=False, error="No profile loaded")
@@ -321,7 +323,8 @@ class HiSiliconStandard(BootProtocol):
             )
         stages.append(Stage.SPL)
 
-        if not await self._send_uboot(transport, firmware, profile, on_progress):
+        if not await self._send_uboot(transport, firmware, profile, on_progress,
+                                       label=payload_label):
             return RecoveryResult(
                 success=False, stages_completed=stages,
                 error="Failed to send U-Boot",

@@ -105,6 +105,34 @@ Tested on real hardware with CRS112-8P-4S:
 | IVGHP203Y-AF | hi3516cv300 | `/dev/uart-IVGHP203Y-AF` |
 | IVG85HG50PYA-S | hi3516ev300 | `/dev/uart-IVG85HG50PYA-S` |
 
+## Flash Agent (High-Speed Flash Dump)
+
+Defib includes a bare-metal flash agent that runs directly on the SoC,
+replacing U-Boot in the boot chain. It communicates over a COBS binary
+protocol at 921600 baud — ~5x faster than U-Boot's `md.b` hex dump.
+
+```bash
+# 1. Upload the agent (power-cycle the camera when prompted)
+defib agent upload -c hi3516ev300 -p /dev/ttyUSB0
+
+# 2. Dump the entire flash (address and size auto-detected)
+defib agent read -p /dev/ttyUSB0 -o flash_dump.bin
+
+# Query device info (flash size, RAM base, JEDEC ID)
+defib agent info -p /dev/ttyUSB0
+
+# Write data back to flash
+defib agent write -p /dev/ttyUSB0 -i flash_dump.bin
+
+# Scan flash health (bad sectors, stuck bits)
+defib agent scan -p /dev/ttyUSB0
+```
+
+Address defaults to flash base (`0x14000000`) and size is auto-detected
+from the device. Override with `-a` and `-s` if needed. Use `--no-verify`
+to skip the CRC32 check, or `--output-mode json` for automation. See
+[agent/README.md](agent/README.md) for protocol details and supported chips.
+
 ## Testing with QEMU
 
 Defib can be tested end-to-end against the
