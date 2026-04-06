@@ -448,8 +448,23 @@ class FlashAgentClient:
 
         total = len(data)
         expected_crc = zlib.crc32(data) & 0xFFFFFFFF
+        sector_sz = self._sector_size or 0x10000
+        num_sectors = (total + sector_sz - 1) // sector_sz
 
-        payload = struct.pack("<III", addr, total, expected_crc)
+        # Build sector bitmap: bit=1 if sector has non-0xFF data
+        ff_sector = b'\xff' * sector_sz
+        bitmap = bytearray(32)
+        for s in range(num_sectors):
+            chunk = data[s * sector_sz : (s + 1) * sector_sz]
+            if chunk != ff_sector[:len(chunk)]:
+                bitmap[s // 8] |= 1 << (s % 8)
+
+        skip_count = num_sectors - bin(int.from_bytes(bitmap, 'little')).count('1')
+        if skip_count > 0:
+            logger.info("Flash stream: skipping %d/%d sectors (0xFF)",
+                        skip_count, num_sectors)
+
+        payload = struct.pack("<III", addr, total, expected_crc) + bytes(bitmap)
         await send_packet(self._transport, CMD_FLASH_STREAM, payload)
 
         cmd, resp = await recv_response(self._transport, timeout=10.0)
@@ -459,29 +474,29 @@ class FlashAgentClient:
 
         # Double-buffer pipeline: send sector N, get "received" signal,
         # immediately send sector N+1 while agent erases+programs N.
-        # Agent sends progress RSP_DATA after RECEIVING (not after programming),
-        # so the host can keep streaming without waiting for flash ops.
-        sector_sz = self._sector_size or 0x10000
-        num_sectors = (total + sector_sz - 1) // sector_sz
+        # Sectors with bitmap bit=0 are skipped (all 0xFF).
         offset = 0
 
         for s in range(num_sectors):
             sector_bytes = min(sector_sz, total - offset)
 
-            # Send one sector of DATA packets
-            sent = 0
-            seq = offset // WRITE_CHUNK_SIZE
-            while sent < sector_bytes:
-                chunk = min(WRITE_CHUNK_SIZE, sector_bytes - sent)
-                pkt = struct.pack("<H", seq) + data[offset + sent:offset + sent + chunk]
-                await send_packet(self._transport, RSP_DATA, pkt)
-                sent += chunk
-                seq += 1
+            if bitmap[s // 8] & (1 << (s % 8)):
+                # Send one sector of DATA packets
+                sent = 0
+                seq = offset // WRITE_CHUNK_SIZE
+                while sent < sector_bytes:
+                    chunk = min(WRITE_CHUNK_SIZE, sector_bytes - sent)
+                    pkt = struct.pack("<H", seq) + data[offset + sent:offset + sent + chunk]
+                    await send_packet(self._transport, RSP_DATA, pkt)
+                    sent += chunk
+                    seq += 1
+
+            # else: sector is all 0xFF — don't send data, agent skips it
 
             offset += sector_bytes
 
-            # Wait for "sector received" progress — agent sends this BEFORE
-            # erase+program, so we can start sending next sector immediately.
+            # Wait for progress — agent sends RSP_DATA for both data and
+            # skipped sectors (immediately for skipped, after receive for data).
             while True:
                 cmd, data_pkt = await recv_packet(self._transport, timeout=120.0)
                 if cmd == RSP_READY:

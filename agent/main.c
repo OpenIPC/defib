@@ -501,13 +501,39 @@ static void handle_flash_program(const uint8_t *data, uint32_t len) {
  *   Progress: RSP_DATA [sector_done:2LE] [total:2LE] after each sector.
  *   Final: ACK_OK or ACK_CRC_ERROR.
  */
+/* Check if a 256-byte page is all 0xFF (erased state).
+ * Uses word-aligned reads for speed (~0.1µs vs 2ms page program). */
+static int page_is_ff(const uint8_t *data, uint32_t len) {
+    const uint32_t *w = (const uint32_t *)data;
+    for (uint32_t i = 0; i < len / 4; i++)
+        if (w[i] != 0xFFFFFFFF) return 0;
+    return 1;
+}
+
+/* Erase sector + program non-0xFF pages from buffer */
+static void erase_and_program(uint32_t addr, const uint8_t *buf,
+                               uint32_t bytes, uint32_t page_sz,
+                               int drain_fifo) {
+    flash_erase_sector(addr);
+    uint32_t offset = 0;
+    while (offset < bytes) {
+        uint32_t chunk = bytes - offset;
+        if (chunk > page_sz) chunk = page_sz;
+        if (!page_is_ff(&buf[offset], chunk))
+            flash_write_page(addr + offset, &buf[offset], chunk);
+        offset += chunk;
+        if (drain_fifo) proto_drain_fifo();
+    }
+}
+
 static void handle_flash_stream(const uint8_t *data, uint32_t len) {
-    if (len < 12) { proto_send_ack(ACK_CRC_ERROR); return; }
+    if (len < 44) { proto_send_ack(ACK_CRC_ERROR); return; }
     if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
 
     uint32_t flash_addr = read_le32(&data[0]);
     uint32_t size = read_le32(&data[4]);
     uint32_t expected_crc = read_le32(&data[8]);
+    const uint8_t *bitmap = &data[12];  /* 32-byte sector bitmap */
 
     if (size == 0 || flash_addr + size > flash_info.size) {
         proto_send_ack(ACK_FLASH_ERROR);
@@ -538,6 +564,29 @@ static void handle_flash_stream(const uint8_t *data, uint32_t len) {
         uint32_t sector_offset = s * sector_sz;
         uint32_t sector_bytes = size - sector_offset;
         if (sector_bytes > sector_sz) sector_bytes = sector_sz;
+
+        /* Check bitmap: bit=0 means sector is all 0xFF, skip it */
+        if (!(bitmap[s / 8] & (1 << (s % 8)))) {
+            /* Still process pending data sector if any */
+            if (pending_buf >= 0) {
+                erase_and_program(pending_addr, buf[pending_buf],
+                                  pending_bytes, page_sz, 1);
+                pending_buf = -1;
+            }
+
+            /* Erase this sector (ensure 0xFF state) but don't program */
+            flash_erase_sector(flash_addr + sector_offset);
+
+            /* Send progress — no data to receive */
+            uint8_t progress[4];
+            progress[0] = ((s + 1) >> 0) & 0xFF;
+            progress[1] = ((s + 1) >> 8) & 0xFF;
+            progress[2] = (num_sectors >> 0) & 0xFF;
+            progress[3] = (num_sectors >> 8) & 0xFF;
+            proto_send(RSP_DATA, progress, 4);
+
+            continue;  /* Don't touch rx_buf or set new pending */
+        }
 
         /* Receive sector data into rx_buf.
          * No flash operations during receive — UART stays responsive. */
@@ -575,16 +624,8 @@ static void handle_flash_stream(const uint8_t *data, uint32_t len) {
         /* Process previous sector if pending (erase + program).
          * Host is streaming next sector into the OTHER buffer right now. */
         if (pending_buf >= 0) {
-            flash_erase_sector(pending_addr);
-            uint32_t offset = 0;
-            while (offset < pending_bytes) {
-                uint32_t chunk = pending_bytes - offset;
-                if (chunk > page_sz) chunk = page_sz;
-                flash_write_page(pending_addr + offset,
-                                 &buf[pending_buf][offset], chunk);
-                offset += chunk;
-                proto_drain_fifo();
-            }
+            erase_and_program(pending_addr, buf[pending_buf],
+                              pending_bytes, page_sz, 1);
         }
 
         /* This sector's buffer becomes the pending one */
@@ -598,15 +639,8 @@ static void handle_flash_stream(const uint8_t *data, uint32_t len) {
 
     /* Process the last sector (no more data to receive) */
     if (pending_buf >= 0) {
-        flash_erase_sector(pending_addr);
-        uint32_t offset = 0;
-        while (offset < pending_bytes) {
-            uint32_t chunk = pending_bytes - offset;
-            if (chunk > page_sz) chunk = page_sz;
-            flash_write_page(pending_addr + offset,
-                             &buf[pending_buf][offset], chunk);
-            offset += chunk;
-        }
+        erase_and_program(pending_addr, buf[pending_buf],
+                          pending_bytes, page_sz, 0);
     }
 
     proto_send_ack(ACK_OK);
