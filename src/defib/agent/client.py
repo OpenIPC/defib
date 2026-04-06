@@ -455,8 +455,8 @@ class FlashAgentClient:
         ff_sector = b'\xff' * sector_sz
         bitmap = bytearray(32)
         for s in range(num_sectors):
-            chunk = data[s * sector_sz : (s + 1) * sector_sz]
-            if chunk != ff_sector[:len(chunk)]:
+            sector_data = data[s * sector_sz : (s + 1) * sector_sz]
+            if sector_data != ff_sector[:len(sector_data)]:
                 bitmap[s // 8] |= 1 << (s % 8)
 
         skip_count = num_sectors - bin(int.from_bytes(bitmap, 'little')).count('1')
