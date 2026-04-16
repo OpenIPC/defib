@@ -164,6 +164,42 @@ class HiSiliconStandard(BootProtocol):
                 continue
         return False
 
+    @staticmethod
+    async def _rehandshake(transport: Transport) -> bool:
+        """Re-enter boot mode after SPL runs.
+
+        On some SoCs the SPL re-sends 0x20 bootmode markers after DDR init,
+        requiring a fresh 0xAA acknowledgment before it will accept HEAD
+        frames.  On SoCs that don't do this, the line stays quiet and we
+        return True immediately.
+        """
+        import time
+        marker_count = 0
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                data = await transport.read(1, timeout=0.2)
+                if data == BOOTMODE_MARKER:
+                    marker_count += 1
+                    if marker_count >= BOOTMODE_COUNT:
+                        await transport.write(BOOTMODE_ACK)
+                        logger.debug("rehandshake: sent 0xAA after %d markers", marker_count)
+                        return True
+                elif data in (b"\x0a", b"\x0d"):
+                    continue  # ignore newlines mixed into marker stream
+                else:
+                    # unexpected byte — not in marker mode
+                    logger.debug("rehandshake: got 0x%02X, no re-handshake needed", data[0])
+                    return True
+            except TransportTimeout:
+                if marker_count > 0:
+                    # saw some markers but not enough — send ACK anyway
+                    await transport.write(BOOTMODE_ACK)
+                    logger.debug("rehandshake: sent 0xAA after partial %d markers", marker_count)
+                    return True
+                return True  # silence — device is ready without re-handshake
+        return False  # deadline reached
+
     async def _send_head(
         self, transport: Transport, length: int, address: int
     ) -> bool:
@@ -272,7 +308,13 @@ class HiSiliconStandard(BootProtocol):
             message=f"Sending {label}",
         ))
 
-        if not await self._send_head(transport, total, profile.uboot_address):
+        # After SPL runs DDR init, some SoCs (e.g. hi3516av200) re-send
+        # 0x20 bootmode markers requiring a fresh 0xAA handshake.
+        await self._rehandshake(transport)
+        head = HeadFrame(length=total, address=profile.uboot_address).encode()
+        if not await self._send_frame_with_retry(
+            transport, head, retries=64, timeout=0.15,
+        ):
             return False
 
         chunks = chunk_data(firmware, MAX_DATA_LEN)
@@ -285,8 +327,11 @@ class HiSiliconStandard(BootProtocol):
                 bytes_total=total,
             ))
 
+        # Tail frame — best-effort for U-Boot stage.  Some SoCs (e.g.
+        # hi3516av200) consider the transfer complete once they've received
+        # all bytes declared in HEAD and don't ACK the TAIL.
         if not await self._send_tail(transport, len(chunks) + 1):
-            return False
+            logger.debug("U-Boot TAIL not ACKed (non-fatal, all data sent)")
 
         _emit(on_progress, ProgressEvent(
             stage=Stage.UBOOT, bytes_sent=total, bytes_total=total,
