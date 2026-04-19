@@ -67,12 +67,17 @@ class SerialTransport(Transport):
         old_timeout = self._port.timeout
         try:
             self._port.timeout = timeout
-            data = await asyncio.get_event_loop().run_in_executor(
+            coro = asyncio.get_event_loop().run_in_executor(
                 None, self._port.read, size
             )
+            # Guard against pyserial blocking despite the timeout
+            guard = timeout * 2 + 1.0 if timeout is not None else None
+            data = await asyncio.wait_for(coro, timeout=guard)
             if not data and timeout is not None:
                 raise TransportTimeout(f"Read timeout ({timeout}s)")
             return bytes(data)
+        except asyncio.TimeoutError:
+            raise TransportTimeout(f"Read timeout ({timeout}s, asyncio guard)")
         finally:
             self._port.timeout = old_timeout
 
