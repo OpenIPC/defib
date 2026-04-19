@@ -106,21 +106,9 @@ class RecoverySession:
                     stage=Stage.POWER_CYCLE, bytes_sent=0, bytes_total=1,
                     message=f"Power-cycling {self._poe_port}...",
                 ))
-            try:
-                await self._power.power_off(self._poe_port)
-                import asyncio
-                await asyncio.sleep(3.0)
-            except Exception as e:
-                elapsed = (time.monotonic() - start_time) * 1000
-                if on_log:
-                    on_log(LogEvent(level="error", message=f"Power cycle failed: {e}"))
-                return RecoveryResult(
-                    success=False,
-                    error=f"Power cycle failed: {e}",
-                    elapsed_ms=elapsed,
-                )
 
-            # Start handshake (flooding 0xAA) BEFORE powering on
+            # Start handshake (flooding 0xAA) BEFORE power cycle so the
+            # bootrom sees 0xAA immediately when power returns.
             if on_log:
                 on_log(LogEvent(
                     level="info",
@@ -130,19 +118,17 @@ class RecoverySession:
             handshake_task = asyncio.create_task(
                 protocol.handshake(transport, on_progress)
             )
-            # Give handshake time to start flooding
-            await asyncio.sleep(0.3)
 
             try:
-                await self._power.power_on(self._poe_port)
+                await self._power.power_cycle(self._poe_port)
             except Exception as e:
                 handshake_task.cancel()
                 elapsed = (time.monotonic() - start_time) * 1000
                 if on_log:
-                    on_log(LogEvent(level="error", message=f"Power-on failed: {e}"))
+                    on_log(LogEvent(level="error", message=f"Power cycle failed: {e}"))
                 return RecoveryResult(
                     success=False,
-                    error=f"Power-on failed: {e}",
+                    error=f"Power cycle failed: {e}",
                     elapsed_ms=elapsed,
                 )
 
