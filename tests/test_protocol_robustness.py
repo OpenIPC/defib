@@ -152,6 +152,8 @@ class TestRehandshakeIntegration:
         protocol = HiSiliconStandard()
         protocol.set_profile(profile)
 
+        # Phase 0: PRESTEP0 ACKs (head + data + tail = 3 ACKs, if profile has it)
+        prestep_acks = 3 if profile.prestep_data is not None else 0
         # Phase 1: DDR step ACKs (head + data + tail = 3 ACKs)
         # Phase 2: SPL ACKs (head + spl_chunks + tail)
         spl_size = profile.spl_max_size
@@ -165,7 +167,7 @@ class TestRehandshakeIntegration:
         uboot_acks = 1 + uboot_chunks + 1  # head + data + tail
 
         transport.enqueue_rx(
-            ACK_BYTE * (3 + spl_acks)       # DDR + SPL
+            ACK_BYTE * (prestep_acks + 3 + 1 + spl_acks)  # PRESTEP0 + DDR + post-DDR rehandshake + SPL
             + BOOTMODE_MARKER * 5           # rehandshake markers
             + ACK_BYTE * uboot_acks         # U-Boot
         )
@@ -217,13 +219,16 @@ class TestRehandshakeIntegration:
         protocol = HiSiliconStandard()
         protocol.set_profile(profile)
 
-        # Enough ACKs for DDR (3) + SPL head + SPL data, but NOT SPL tail
+        # Enough ACKs for PRESTEP0 + DDR (3) + SPL head + SPL data, but NOT SPL tail
         spl_size = profile.spl_max_size
         spl_chunks = (spl_size + 1023) // 1024
+        prestep_acks = 3 if profile.prestep_data is not None else 0
+        # PRESTEP0: head(1) + data(1) + tail(1) = 3 (if present)
         # DDR: head(1) + data(1) + tail(1) = 3
+        # Post-DDR rehandshake consumes 1 ACK
         # SPL: head(1) + data(spl_chunks) = 1 + spl_chunks
         # Then NO MORE ACKs — SPL tail will fail
-        transport.enqueue_rx(ACK_BYTE * (3 + 1 + spl_chunks))
+        transport.enqueue_rx(ACK_BYTE * (prestep_acks + 3 + 1 + 1 + spl_chunks))
 
         firmware = bytes(range(256)) * 100
         result = await protocol.send_firmware(transport, firmware)

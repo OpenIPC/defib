@@ -46,6 +46,18 @@ FRAME_SEND_RETRIES_SHORT = 16
 FRAME_SEND_RETRIES_LONG = 32
 
 
+def _frame_label(frame_data: bytes) -> str:
+    """Return a human-readable label for a frame based on its magic byte(s)."""
+    if len(frame_data) >= 4 and frame_data[0:4] == b"\xfe\x00\xff\x01":
+        return "HEAD"
+    if len(frame_data) >= 1:
+        if frame_data[0] == 0xDA:
+            return "DATA"
+        if frame_data[0] == 0xED:
+            return "TAIL"
+    return "UNKNOWN"
+
+
 def _emit(callback: Callable[[ProgressEvent], None] | None, event: ProgressEvent) -> None:
     if callback is not None:
         callback(event)
@@ -106,6 +118,7 @@ class HiSiliconStandard(BootProtocol):
         flooding = self._continuous_ack
         ever_saw_data = False
         counter = 0
+        total_markers = 0
 
         while True:
             if flooding:
@@ -128,10 +141,18 @@ class HiSiliconStandard(BootProtocol):
 
             if byte == BOOTMODE_MARKER:
                 counter += 1
+                total_markers += 1
+                if total_markers % 10 == 0:
+                    logger.debug("handshake: %d bootmode markers (0x20) so far", total_markers)
             else:
+                logger.debug("handshake: unexpected byte 0x%02X (counter reset)", byte[0])
                 counter = 0
 
             if counter >= BOOTMODE_COUNT:
+                logger.debug(
+                    "handshake: %d consecutive markers, entering boot mode (flooding=%s)",
+                    counter, flooding,
+                )
                 if not flooding:
                     await transport.write(BOOTMODE_ACK)
                 await transport.flush_input()
@@ -150,18 +171,34 @@ class HiSiliconStandard(BootProtocol):
         timeout: float,
     ) -> bool:
         """Send a frame and wait for ACK, retrying on failure."""
-        for _ in range(retries):
+        label = _frame_label(frame_data)
+        hex_preview = frame_data[:30].hex(" ")
+        logger.debug(
+            "TX %s (%d bytes): %s%s",
+            label, len(frame_data), hex_preview,
+            "..." if len(frame_data) > 30 else "",
+        )
+        for attempt in range(retries):
             await transport.flush_input()
             await transport.flush_output()
             await transport.write(frame_data)
             try:
                 ack = await transport.read(1, timeout=timeout)
                 if ack == ACK_BYTE:
+                    logger.debug("TX %s ACKed (attempt %d/%d)", label, attempt + 1, retries)
                     return True
+                logger.debug(
+                    "TX %s got 0x%02X instead of ACK (attempt %d/%d)",
+                    label, ack[0], attempt + 1, retries,
+                )
             except TransportTimeout:
+                if attempt < 3 or attempt == retries - 1:
+                    logger.debug("TX %s timeout (attempt %d/%d)", label, attempt + 1, retries)
                 continue
-            except Exception:
+            except Exception as e:
+                logger.debug("TX %s error: %s (attempt %d/%d)", label, e, attempt + 1, retries)
                 continue
+        logger.debug("TX %s FAILED after %d retries", label, retries)
         return False
 
     @staticmethod
@@ -174,6 +211,7 @@ class HiSiliconStandard(BootProtocol):
         return True immediately.
         """
         import time
+        logger.debug("rehandshake: waiting up to 5s for bootmode markers")
         marker_count = 0
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
@@ -203,6 +241,7 @@ class HiSiliconStandard(BootProtocol):
     async def _send_head(
         self, transport: Transport, length: int, address: int
     ) -> bool:
+        logger.debug("HEAD: length=%d address=0x%08X", length, address)
         frame = HeadFrame(length=length, address=address).encode()
         return await self._send_frame_with_retry(
             transport, frame, FRAME_SEND_RETRIES_SHORT, timeout=0.03
@@ -211,12 +250,14 @@ class HiSiliconStandard(BootProtocol):
     async def _send_data(
         self, transport: Transport, seq: int, payload: bytes
     ) -> bool:
+        logger.debug("DATA: seq=%d payload=%d bytes", seq, len(payload))
         frame = DataFrame(seq=seq, payload=payload).encode()
         return await self._send_frame_with_retry(
             transport, frame, FRAME_SEND_RETRIES_LONG, timeout=0.15
         )
 
     async def _send_tail(self, transport: Transport, seq: int) -> bool:
+        logger.debug("TAIL: seq=%d", seq)
         frame = TailFrame(seq=seq).encode()
         return await self._send_frame_with_retry(
             transport, frame, FRAME_SEND_RETRIES_SHORT, timeout=0.15
@@ -228,14 +269,39 @@ class HiSiliconStandard(BootProtocol):
         profile: SoCProfile,
         on_progress: Callable[[ProgressEvent], None] | None = None,
     ) -> bool:
-        """Send DDR initialization step (64 bytes to SRAM)."""
+        """Send DDR initialization step (64 bytes to SRAM).
+
+        If the profile has PRESTEP0 data, it is sent first.  PRESTEP0
+        prepares the DDR controller before the actual init trigger.
+        """
         _emit(on_progress, ProgressEvent(
             stage=Stage.DDR_INIT, bytes_sent=0, bytes_total=64,
             message="Sending DDR step",
         ))
 
+        addr = profile.ddr_step_address
+
+        # PRESTEP0: pre-DDR init (e.g. write "NOWD" to DDR controller)
+        prestep = profile.prestep_data
+        if prestep is not None:
+            logger.debug(
+                "=== PRESTEP0 === address=0x%08X data=%d bytes",
+                addr, len(prestep),
+            )
+            if not await self._send_head(transport, 64, addr):
+                return False
+            if not await self._send_data(transport, 1, prestep):
+                return False
+            if not await self._send_tail(transport, 2):
+                return False
+
+        # DDRSTEP0: actual DDR init trigger
+        logger.debug(
+            "=== DDR STEP === address=0x%08X data=%d bytes",
+            addr, len(profile.ddr_step_data),
+        )
         ddr_data = profile.ddr_step_data
-        if not await self._send_head(transport, 64, profile.ddr_step_address):
+        if not await self._send_head(transport, 64, addr):
             return False
 
         if not await self._send_data(transport, 1, ddr_data):
@@ -260,6 +326,11 @@ class HiSiliconStandard(BootProtocol):
     ) -> bool:
         """Send SPL (secondary program loader) to SRAM."""
         spl_size = profile.spl_max_size
+        logger.debug(
+            "=== SPL === address=0x%08X size=%d chunks=%d",
+            profile.spl_address, spl_size,
+            (spl_size + MAX_DATA_LEN - 1) // MAX_DATA_LEN,
+        )
         if spl_override is not None:
             spl_data = spl_override[:spl_size].ljust(spl_size, b"\x00")
         else:
@@ -302,6 +373,11 @@ class HiSiliconStandard(BootProtocol):
     ) -> bool:
         """Send U-Boot (or agent) image to DDR."""
         total = len(firmware)
+        logger.debug(
+            "=== %s === address=0x%08X total=%d chunks=%d",
+            label, profile.uboot_address, total,
+            (total + MAX_DATA_LEN - 1) // MAX_DATA_LEN,
+        )
 
         _emit(on_progress, ProgressEvent(
             stage=Stage.UBOOT, bytes_sent=0, bytes_total=total,
@@ -352,6 +428,10 @@ class HiSiliconStandard(BootProtocol):
 
         profile = self._profile
         stages: list[Stage] = []
+        logger.debug(
+            "send_firmware: profile=%s firmware=%d bytes spl_override=%s",
+            profile.name, len(firmware), spl_override is not None,
+        )
 
         if not await self._send_ddr_step(transport, profile, on_progress):
             return RecoveryResult(
@@ -359,6 +439,9 @@ class HiSiliconStandard(BootProtocol):
                 error="Failed to send DDR step",
             )
         stages.append(Stage.DDR_INIT)
+
+        logger.debug("send_firmware: rehandshake before SPL")
+        await self._rehandshake(transport)
 
         if not await self._send_spl(transport, firmware, profile, on_progress,
                                     spl_override=spl_override):

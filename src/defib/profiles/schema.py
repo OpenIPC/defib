@@ -12,6 +12,10 @@ class SoCProfile(BaseModel):
     """
 
     name: str = Field(description="Internal chip name")
+    prestep0: list[int] | None = Field(
+        default=None, alias="PRESTEP0",
+        description="Pre-DDR init bytecode (sent before DDRSTEP0)",
+    )
     ddrstep0: list[int] = Field(alias="DDRSTEP0", description="DDR initialization bytecode")
     addresses: list[str] = Field(
         alias="ADDRESS",
@@ -45,5 +49,11 @@ class SoCProfile(BaseModel):
     @property
     def ddr_step_data(self) -> bytes:
         return bytes(self.ddrstep0)
+
+    @property
+    def prestep_data(self) -> bytes | None:
+        if self.prestep0 is None:
+            return None
+        return bytes(self.prestep0)
 
     model_config = {"populate_by_name": True}

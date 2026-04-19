@@ -91,7 +91,10 @@ class RecoverySession:
             if on_log:
                 on_log(LogEvent(level="info", message=f"Loaded profile: {profile.name}"))
 
-        # Power cycle (if configured)
+        # Power cycle + handshake
+        # For devices with very short bootrom windows (<100ms), the
+        # handshake must start BEFORE power-on so continuous ACK mode
+        # can flood 0xAA while the bootrom is active.
         if self._power and self._poe_port:
             if on_log:
                 on_log(LogEvent(
@@ -104,7 +107,9 @@ class RecoverySession:
                     message=f"Power-cycling {self._poe_port}...",
                 ))
             try:
-                await self._power.power_cycle(self._poe_port)
+                await self._power.power_off(self._poe_port)
+                import asyncio
+                await asyncio.sleep(3.0)
             except Exception as e:
                 elapsed = (time.monotonic() - start_time) * 1000
                 if on_log:
@@ -114,25 +119,48 @@ class RecoverySession:
                     error=f"Power cycle failed: {e}",
                     elapsed_ms=elapsed,
                 )
+
+            # Start handshake (flooding 0xAA) BEFORE powering on
             if on_log:
                 on_log(LogEvent(
                     level="info",
-                    message="Power cycle complete, waiting for bootrom...",
+                    message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
                 ))
+            import asyncio
+            handshake_task = asyncio.create_task(
+                protocol.handshake(transport, on_progress)
+            )
+            # Give handshake time to start flooding
+            await asyncio.sleep(0.3)
+
+            try:
+                await self._power.power_on(self._poe_port)
+            except Exception as e:
+                handshake_task.cancel()
+                elapsed = (time.monotonic() - start_time) * 1000
+                if on_log:
+                    on_log(LogEvent(level="error", message=f"Power-on failed: {e}"))
+                return RecoveryResult(
+                    success=False,
+                    error=f"Power-on failed: {e}",
+                    elapsed_ms=elapsed,
+                )
+
             if on_progress:
                 on_progress(ProgressEvent(
                     stage=Stage.POWER_CYCLE, bytes_sent=1, bytes_total=1,
                     message="Power cycle complete",
                 ))
 
-        # Handshake
-        if on_log:
-            on_log(LogEvent(
-                level="info",
-                message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
-            ))
-
-        handshake = await protocol.handshake(transport, on_progress)
+            handshake = await handshake_task
+        else:
+            # Manual power cycling — just start handshake and wait
+            if on_log:
+                on_log(LogEvent(
+                    level="info",
+                    message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
+                ))
+            handshake = await protocol.handshake(transport, on_progress)
         if not handshake.success:
             elapsed = (time.monotonic() - start_time) * 1000
             if on_log:
