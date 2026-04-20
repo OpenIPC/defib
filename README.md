@@ -91,6 +91,9 @@ export DEFIB_POE_USER=admin
 export DEFIB_POE_PASS=
 
 defib burn -c hi3516ev300 -p /dev/uart-IVG85HG50PYA-S --power-cycle -b
+
+# Burn and open serial terminal to see boot output (Ctrl-C to exit)
+defib burn -c hi3516ev300 -p /dev/uart-IVG85HG50PYA-S --power-cycle -t
 ```
 
 The `--power-cycle` flag connects to the RouterOS API, auto-discovers the PoE

@@ -17,6 +17,7 @@ def burn(
     file: str = typer.Option("", "-f", "--file", help="Firmware file (auto-downloads from OpenIPC if omitted)"),
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
     send_break: bool = typer.Option(False, "-b", "--break", help="Send Ctrl-C after upload"),
+    terminal: bool = typer.Option(False, "-t", "--terminal", help="Open serial terminal after upload"),
     power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via PoE (needs DEFIB_POE_* env vars)"),
     output: str = typer.Option("human", "--output", help="Output mode: human, json, quiet"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
@@ -27,11 +28,12 @@ def burn(
     the appropriate U-Boot from OpenIPC releases.
     """
     import asyncio
-    asyncio.run(_burn_async(chip, file, port, send_break, power_cycle, output, debug))
+    asyncio.run(_burn_async(chip, file, port, send_break, terminal, power_cycle, output, debug))
 
 
 async def _burn_async(
-    chip: str, file: str, port: str, send_break: bool, power_cycle: bool, output: str, debug: bool
+    chip: str, file: str, port: str, send_break: bool, terminal: bool,
+    power_cycle: bool, output: str, debug: bool,
 ) -> None:
     import json as json_mod
     import logging
@@ -218,7 +220,6 @@ async def _burn_async(
     finally:
         if progress_ctx is not None:
             progress_ctx.stop()
-        await transport.close()
         if power_controller:
             await power_controller.close()
 
@@ -236,7 +237,39 @@ async def _burn_async(
             console.print(f"\n[red bold]Failed:[/red bold] {result.error}")
 
     if not result.success:
+        await transport.close()
         raise typer.Exit(1)
+
+    # Terminal mode: stream serial output until Ctrl-C
+    if terminal and result.success:
+        import signal
+        import sys as _sys
+
+        if output == "human":
+            console.print("[dim]--- Terminal mode (Ctrl-C to exit) ---[/dim]")
+
+        stop = False
+
+        def on_sigint(*_: object) -> None:
+            nonlocal stop
+            stop = True
+
+        signal.signal(signal.SIGINT, on_sigint)
+
+        try:
+            while not stop:
+                try:
+                    data = await transport.read(256, timeout=0.1)
+                    _sys.stdout.buffer.write(data)
+                    _sys.stdout.buffer.flush()
+                except Exception:
+                    pass
+        finally:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            if output == "human":
+                console.print("\n[dim]--- Terminal closed ---[/dim]")
+
+    await transport.close()
 
 
 @app.command("list-chips")
