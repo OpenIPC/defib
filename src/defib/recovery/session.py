@@ -107,22 +107,9 @@ class RecoverySession:
                     message=f"Power-cycling {self._poe_port}...",
                 ))
 
-            # Start handshake (flooding 0xAA) BEFORE power cycle so the
-            # bootrom sees 0xAA immediately when power returns.
-            if on_log:
-                on_log(LogEvent(
-                    level="info",
-                    message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
-                ))
-            import asyncio
-            handshake_task = asyncio.create_task(
-                protocol.handshake(transport, on_progress)
-            )
-
             try:
                 await self._power.power_cycle(self._poe_port)
             except Exception as e:
-                handshake_task.cancel()
                 elapsed = (time.monotonic() - start_time) * 1000
                 if on_log:
                     on_log(LogEvent(level="error", message=f"Power cycle failed: {e}"))
@@ -131,6 +118,23 @@ class RecoverySession:
                     error=f"Power cycle failed: {e}",
                     elapsed_ms=elapsed,
                 )
+
+            # Wait for power to actually be cut, then flush any warm-reboot
+            # garbage from the serial buffer before starting the handshake.
+            import asyncio
+            await asyncio.sleep(1.0)
+            await transport.flush_input()
+
+            # Now start handshake — floods 0xAA so the bootrom sees it
+            # immediately when power returns from the cycle.
+            if on_log:
+                on_log(LogEvent(
+                    level="info",
+                    message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
+                ))
+            handshake_task = asyncio.create_task(
+                protocol.handshake(transport, on_progress)
+            )
 
             if on_progress:
                 on_progress(ProgressEvent(

@@ -244,7 +244,7 @@ class HiSiliconStandard(BootProtocol):
         logger.debug("HEAD: length=%d address=0x%08X", length, address)
         frame = HeadFrame(length=length, address=address).encode()
         return await self._send_frame_with_retry(
-            transport, frame, FRAME_SEND_RETRIES_SHORT, timeout=0.03
+            transport, frame, FRAME_SEND_RETRIES_SHORT, timeout=0.15
         )
 
     async def _send_data(
@@ -293,7 +293,8 @@ class HiSiliconStandard(BootProtocol):
             if not await self._send_data(transport, 1, prestep):
                 return False
             if not await self._send_tail(transport, 2):
-                return False
+                logger.debug("PRESTEP0 TAIL not ACKed (non-fatal)")
+            await self._rehandshake(transport)
 
         # DDRSTEP0: actual DDR init trigger
         logger.debug(
@@ -308,7 +309,21 @@ class HiSiliconStandard(BootProtocol):
             return False
 
         if not await self._send_tail(transport, 2):
-            return False
+            logger.debug("DDRSTEP0 TAIL not ACKed (non-fatal)")
+
+        # PRESTEP1: DDR training verification (waits for DDR to be ready)
+        prestep1 = profile.prestep1_data
+        if prestep1 is not None:
+            logger.debug(
+                "=== PRESTEP1 === address=0x%08X data=%d bytes",
+                addr, len(prestep1),
+            )
+            if not await self._send_head(transport, len(prestep1), addr):
+                return False
+            if not await self._send_data(transport, 1, prestep1):
+                return False
+            if not await self._send_tail(transport, 2):
+                logger.debug("PRESTEP1 TAIL not ACKed (non-fatal)")
 
         _emit(on_progress, ProgressEvent(
             stage=Stage.DDR_INIT, bytes_sent=64, bytes_total=64,
