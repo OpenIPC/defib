@@ -152,8 +152,8 @@ class TestRehandshakeIntegration:
         protocol = HiSiliconStandard()
         protocol.set_profile(profile)
 
-        # Phase 0: PRESTEP0 ACKs (head + data + tail = 3 ACKs, if profile has it)
-        prestep_acks = 3 if profile.prestep_data is not None else 0
+        # Phase 0: PRESTEP0 ACKs (head + data + tail = 3, + 1 consumed by rehandshake)
+        prestep_acks = 4 if profile.prestep_data is not None else 0
         # Phase 1: DDR step ACKs (head + data + tail = 3 ACKs)
         # Phase 2: SPL ACKs (head + spl_chunks + tail)
         spl_size = profile.spl_max_size
