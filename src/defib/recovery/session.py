@@ -15,6 +15,7 @@ from defib.profiles.loader import load_profile
 from defib.protocol.hisilicon_standard import HiSiliconStandard
 from defib.protocol.registry import find_protocol
 from defib.recovery.events import (
+    HandshakeResult,
     LogEvent,
     ProgressEvent,
     RecoveryResult,
@@ -91,10 +92,12 @@ class RecoverySession:
             if on_log:
                 on_log(LogEvent(level="info", message=f"Loaded profile: {profile.name}"))
 
-        # Power cycle + handshake
-        # For devices with very short bootrom windows (<100ms), the
-        # handshake must start BEFORE power-on so continuous ACK mode
-        # can flood 0xAA while the bootrom is active.
+        # Determine if this chip uses frame-blast handshake (built into send_firmware)
+        frame_blast = (
+            isinstance(protocol, HiSiliconStandard) and protocol.uses_frame_blast_handshake
+        )
+
+        # Power cycle
         if self._power and self._poe_port:
             if on_log:
                 on_log(LogEvent(
@@ -120,21 +123,10 @@ class RecoverySession:
                 )
 
             # Wait for power to actually be cut, then flush any warm-reboot
-            # garbage from the serial buffer before starting the handshake.
+            # garbage from the serial buffer.
             import asyncio
             await asyncio.sleep(1.0)
             await transport.flush_input()
-
-            # Now start handshake — floods 0xAA so the bootrom sees it
-            # immediately when power returns from the cycle.
-            if on_log:
-                on_log(LogEvent(
-                    level="info",
-                    message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
-                ))
-            handshake_task = asyncio.create_task(
-                protocol.handshake(transport, on_progress)
-            )
 
             if on_progress:
                 on_progress(ProgressEvent(
@@ -142,6 +134,25 @@ class RecoverySession:
                     message="Power cycle complete",
                 ))
 
+        # Handshake — skip for frame-blast chips (handled inside send_firmware)
+        if frame_blast:
+            if on_log:
+                on_log(LogEvent(
+                    level="info",
+                    message=f"Using sendFrameForStart handshake for {self.chip}",
+                ))
+            handshake = HandshakeResult(success=True, message="Frame-blast (deferred)")
+        elif self._power and self._poe_port:
+            # Power-cycle mode with 0x20→0xAA handshake: flood 0xAA
+            if on_log:
+                on_log(LogEvent(
+                    level="info",
+                    message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
+                ))
+            import asyncio
+            handshake_task = asyncio.create_task(
+                protocol.handshake(transport, on_progress)
+            )
             handshake = await handshake_task
         else:
             # Manual power cycling — just start handshake and wait
