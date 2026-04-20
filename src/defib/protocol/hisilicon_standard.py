@@ -92,6 +92,15 @@ class HiSiliconStandard(BootProtocol):
         """
         self._continuous_ack = enabled
 
+    @property
+    def uses_frame_blast_handshake(self) -> bool:
+        """Whether this chip uses sendFrameForStart (HEAD blast) as handshake.
+
+        When True, the caller should skip the separate handshake() call and
+        let send_firmware() handle it internally via _send_frame_for_start().
+        """
+        return self._profile is not None and self._profile.prestep_data is not None
+
     async def handshake(
         self,
         transport: Transport,
@@ -263,16 +272,53 @@ class HiSiliconStandard(BootProtocol):
             transport, frame, FRAME_SEND_RETRIES_SHORT, timeout=0.15
         )
 
+    async def _send_frame_for_start(
+        self, transport: Transport, profile: SoCProfile
+    ) -> bool:
+        """HiTool-style handshake: blast 0xAA + HEAD(FILELEN0, ADDRESS0) until ACK.
+
+        Continuously sends 0xAA (to trigger bootrom download mode) followed
+        by the 14-byte HEAD frame for up to 30 seconds.  The bootrom enters
+        download mode on 0xAA, then ACKs the HEAD frame.
+        """
+        import time
+
+        addr = profile.ddr_step_address
+        head_frame = HeadFrame(length=64, address=addr).encode()
+        logger.debug(
+            "sendFrameForStart: blasting 0xAA+HEAD(64, 0x%08X) for 30s",
+            addr,
+        )
+
+        deadline = time.monotonic() + 30.0
+        attempt = 0
+        while time.monotonic() < deadline:
+            await transport.write(BOOTMODE_ACK + head_frame)
+            attempt += 1
+            try:
+                ack = await transport.read(1, timeout=0.05)
+                if ack == ACK_BYTE:
+                    logger.debug(
+                        "sendFrameForStart: ACK after %d blasts", attempt
+                    )
+                    await transport.flush_input()
+                    return True
+            except TransportTimeout:
+                continue
+        logger.debug("sendFrameForStart: timeout after 30s (%d blasts)", attempt)
+        return False
+
     async def _send_ddr_step(
         self,
         transport: Transport,
         profile: SoCProfile,
         on_progress: Callable[[ProgressEvent], None] | None = None,
     ) -> bool:
-        """Send DDR initialization step (64 bytes to SRAM).
+        """Send DDR initialization steps to SRAM.
 
-        If the profile has PRESTEP0 data, it is sent first.  PRESTEP0
-        prepares the DDR controller before the actual init trigger.
+        Matches HiTool's exact sequence:
+        1. sendFrameForStart: blast HEAD(64, ADDRESS0) until ACK (handshake)
+        2. For each step (PRESTEP0, DDRSTEP0, PRESTEP1): HEAD+DATA+TAIL
         """
         _emit(on_progress, ProgressEvent(
             stage=Stage.DDR_INIT, bytes_sent=0, bytes_total=64,
@@ -280,10 +326,14 @@ class HiSiliconStandard(BootProtocol):
         ))
 
         addr = profile.ddr_step_address
-
-        # PRESTEP0: pre-DDR init (e.g. write "NOWD" to DDR controller)
         prestep = profile.prestep_data
+
+        # sendFrameForStart: blast HEAD as handshake (HiTool approach)
         if prestep is not None:
+            if not await self._send_frame_for_start(transport, profile):
+                return False
+
+            # PRESTEP0: HEAD+DATA+TAIL (HEAD sent again per HiTool's loop)
             logger.debug(
                 "=== PRESTEP0 === address=0x%08X data=%d bytes",
                 addr, len(prestep),
@@ -294,7 +344,6 @@ class HiSiliconStandard(BootProtocol):
                 return False
             if not await self._send_tail(transport, 2):
                 logger.debug("PRESTEP0 TAIL not ACKed (non-fatal)")
-            await self._rehandshake(transport)
 
         # DDRSTEP0: actual DDR init trigger
         logger.debug(
@@ -372,6 +421,13 @@ class HiSiliconStandard(BootProtocol):
         if not await self._send_tail(transport, len(chunks) + 1):
             return False
 
+        # DDR training delay: HiTool sleeps 300ms after SPL transfer
+        # for files matching specific sizes (20224, 21504, 29696).
+        import asyncio as _asyncio
+        if spl_size in (20224, 21504, 29696):
+            logger.debug("DDR training delay: 300ms (spl_size=%d)", spl_size)
+            await _asyncio.sleep(0.3)
+
         _emit(on_progress, ProgressEvent(
             stage=Stage.SPL, bytes_sent=spl_size, bytes_total=spl_size,
             message="SPL complete",
@@ -399,9 +455,14 @@ class HiSiliconStandard(BootProtocol):
             message=f"Sending {label}",
         ))
 
-        # After SPL runs DDR init, some SoCs (e.g. hi3516av200) re-send
-        # 0x20 bootmode markers requiring a fresh 0xAA handshake.
-        await self._rehandshake(transport)
+        # After SPL runs DDR init, some SoCs re-send 0x20 bootmode markers.
+        # For chips with PRESTEP0 (frame-blast), use the full blast approach
+        # since simple rehandshake isn't sufficient on av200.
+        if profile.prestep_data is not None:
+            if not await self._send_frame_for_start(transport, profile):
+                return False
+        else:
+            await self._rehandshake(transport)
         head = HeadFrame(length=total, address=profile.uboot_address).encode()
         if not await self._send_frame_with_retry(
             transport, head, retries=64, timeout=0.15,
