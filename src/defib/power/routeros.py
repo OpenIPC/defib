@@ -275,7 +275,11 @@ class RouterOSController(PowerController):
         search_lower = search.lower()
         for item in items:
             comment = item.get("comment", "")
-            if search_lower in comment.lower():
+            if not comment:
+                continue
+            comment_lower = comment.lower()
+            # Match if search contains comment or comment contains search
+            if search_lower in comment_lower or comment_lower in search_lower:
                 iface_name = item.get("name", "")
                 logger.info(
                     "Matched '%s' -> interface %s (comment: %s)",
@@ -336,17 +340,42 @@ class RouterOSController(PowerController):
             return items[0].get("poe-out", "auto-on")
         return "auto-on"
 
+    async def _poe_power_cycle(
+        self, interface_name: str, duration: str = "5s"
+    ) -> None:
+        """Use RouterOS native power-cycle command."""
+        conn = await self._connect()
+        response = await conn.call(
+            "/interface/ethernet/poe/power-cycle",
+            f"=.id={interface_name}",
+            f"=duration={duration}",
+        )
+        for sentence in response:
+            if sentence[0] == "!trap":
+                msg = _extract_attr(sentence, "message") or "unknown error"
+                raise PowerControllerError(
+                    f"power-cycle failed on {interface_name}: {msg}"
+                )
+
     async def power_off(self, port: str) -> None:
-        # Save current poe-out mode so power_on can restore it
         if port not in self._saved_poe_out:
             self._saved_poe_out[port] = await self._get_poe_out(port)
         logger.info("PoE OFF: %s on %s", port, self._host)
         await self._set_poe(port, "off")
 
     async def power_on(self, port: str) -> None:
-        restore_mode = self._saved_poe_out.pop(port, "auto-on")
+        restore_mode = self._saved_poe_out.pop(port, "forced-on")
         logger.info("PoE ON: %s on %s (restoring %s)", port, self._host, restore_mode)
         await self._set_poe(port, restore_mode)
+
+    async def power_cycle(self, port: str, off_duration: float = 5.0) -> None:
+        """Power cycle using RouterOS native PoE power-cycle command.
+
+        The API call returns immediately; the switch handles the timing.
+        """
+        duration_s = max(int(off_duration), 5)
+        logger.info("PoE power-cycle: %s on %s (%ds)", port, self._host, duration_s)
+        await self._poe_power_cycle(port, f"{duration_s}s")
 
     async def close(self) -> None:
         if self._conn is not None:
