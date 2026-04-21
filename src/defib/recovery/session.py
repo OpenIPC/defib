@@ -125,7 +125,7 @@ class RecoverySession:
             # Wait for power to actually be cut, then flush any warm-reboot
             # garbage from the serial buffer.
             import asyncio
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(2.0)
             await transport.flush_input()
 
             if on_progress:

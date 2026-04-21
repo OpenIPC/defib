@@ -1690,7 +1690,7 @@ async def _install_async(
 
     from rich.console import Console
 
-    from defib.flashdump import get_ram_staging_addr, send_command
+    from defib.flashdump import get_ram_staging_addr, send_command, tftp_to_ram
     from defib.firmware import download_firmware, get_cached_path, has_firmware
     from defib.network.ip_manager import list_interfaces, temporary_ip
     from defib.network.tftp_server import start_tftp_server
@@ -1935,13 +1935,10 @@ async def _install_async(
                 if output == "human":
                     console.print(f"\n  [bold]Flashing {name}[/bold] → 0x{flash_off:X} ({len(orig_data)} bytes)")
 
-                resp = await send_command(
-                    transport,
-                    f"tftpboot 0x{ram_addr:x} {tftp_name}",
-                    timeout=120.0, wait_for="# ",
-                )
-                if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
-                    console.print(f"[red]TFTP failed for {name}:[/red]\n{resp[-300:]}")
+                try:
+                    resp = await tftp_to_ram(transport, ram_addr, tftp_name, timeout=120.0)
+                except RuntimeError as e:
+                    console.print(f"[red]TFTP failed for {name}:[/red] {e}")
                     raise typer.Exit(1)
 
                 # Verify TFTP transfer in RAM before writing to flash
@@ -2057,6 +2054,380 @@ async def _install_async(
     elif output == "json":
         import json as json_mod
         print(json_mod.dumps({"event": "done", "success": True}))
+
+
+@app.command()
+def restore(
+    chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
+    dump: str = typer.Option(..., "-i", "--input", help="Flash dump file or directory of mtdN files"),
+    port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
+    uboot: str = typer.Option("", "--uboot", help="U-Boot binary to load (auto-downloads if omitted)"),
+    flash_type: str = typer.Option("auto", "--flash-type", help="Flash type: auto, nor, nand, emmc"),
+    host_ip: str = typer.Option("", "--host-ip", help="Host IP for TFTP (auto-detect if empty)"),
+    device_ip: str = typer.Option("", "--device-ip", help="Device IP in U-Boot"),
+    nic: str = typer.Option("", "--nic", help="Network interface for TFTP"),
+    power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via PoE"),
+    output: str = typer.Option("human", "--output", help="Output mode: human, json"),
+    debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
+) -> None:
+    """Restore a flash dump to a device.
+
+    Loads U-Boot to RAM via boot protocol, then uses TFTP to transfer
+    partition data and U-Boot commands to write it to flash.
+
+    The input can be a directory of mtdN files (from a previous dump)
+    or a single binary file to write to the entire flash.
+
+    Examples:
+        defib restore -c hi3516av200 -i /path/to/dump/ -p /dev/ttyUSB0 --power-cycle
+        defib restore -c hi3516ev300 -i flash.bin -p /dev/ttyUSB0 --flash-type nor
+    """
+    import asyncio
+    asyncio.run(_restore_async(
+        chip, dump, port, uboot, flash_type, host_ip, device_ip, nic,
+        power_cycle, output, debug,
+    ))
+
+
+async def _restore_async(
+    chip: str, dump: str, port: str, uboot_path: str, flash_type: str,
+    host_ip: str, device_ip: str, nic: str, power_cycle: bool,
+    output: str, debug: bool,
+) -> None:
+    import json as json_mod
+    import logging
+    from pathlib import Path
+
+    from rich.console import Console
+
+    from defib.flashdump import send_command
+    from defib.recovery.events import LogEvent, ProgressEvent
+    from defib.recovery.session import RecoverySession
+    from defib.transport.serial_platform import create_transport, normalize_port_name
+
+    console = Console()
+
+    if debug:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.INFO)
+
+    # --- Resolve input: directory of mtdN files or single binary ---
+    dump_path = Path(dump)
+    partitions: list[tuple[str, bytes]] = []  # (name, data)
+
+    if dump_path.is_dir():
+        # Find mtdN files sorted by number
+        mtd_files = sorted(dump_path.glob("mtd*"), key=lambda p: int(''.join(c for c in p.name if c.isdigit()) or '0'))
+        if not mtd_files:
+            console.print(f"[red]No mtd files found in {dump}[/red]")
+            raise typer.Exit(1)
+        for f in mtd_files:
+            partitions.append((f.name, f.read_bytes()))
+    elif dump_path.is_file():
+        partitions.append(("flash", dump_path.read_bytes()))
+    else:
+        console.print(f"[red]Not found: {dump}[/red]")
+        raise typer.Exit(1)
+
+    total_bytes = sum(len(d) for _, d in partitions)
+    if output == "human":
+        console.print("[bold]Flash Restore[/bold]")
+        console.print(f"  Chip: [cyan]{chip}[/cyan]")
+        console.print(f"  Port: [cyan]{port}[/cyan]")
+        console.print(f"  Partitions: {len(partitions)} ({total_bytes // 1024 // 1024}MB total)")
+        for name, data in partitions:
+            console.print(f"    {name}: {len(data) // 1024}KB")
+
+    # --- Resolve U-Boot binary ---
+    if not uboot_path:
+        from defib.firmware import get_cached_path, download_firmware, has_firmware
+        if has_firmware(chip):
+            cached = get_cached_path(chip)
+            if not cached:
+                if output == "human":
+                    console.print(f"  Downloading U-Boot for [cyan]{chip}[/cyan]...")
+                cached = download_firmware(chip)
+            uboot_path = str(cached)
+        else:
+            console.print(f"[red]No U-Boot for '{chip}'. Specify --uboot.[/red]")
+            raise typer.Exit(1)
+
+    if output == "human":
+        console.print(f"  U-Boot: [cyan]{Path(uboot_path).name}[/cyan]")
+
+    # --- Resolve network ---
+    if not host_ip:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            host_ip = s.getsockname()[0]
+        except Exception:
+            host_ip = "192.168.1.10"
+        finally:
+            s.close()
+
+    if not device_ip:
+        # Use .55 on the same subnet
+        parts = host_ip.rsplit(".", 1)
+        device_ip = f"{parts[0]}.55"
+
+    if output == "human":
+        console.print(f"  Host IP: [cyan]{host_ip}[/cyan]")
+        console.print(f"  Device IP: [cyan]{device_ip}[/cyan]")
+
+    # --- Power controller ---
+    power_controller = None
+    poe_port = None
+    if power_cycle:
+        from defib.power.routeros import RouterOSController
+        try:
+            power_controller = RouterOSController.from_env()
+        except Exception as e:
+            console.print(f"[red]Power controller error:[/red] {e}")
+            raise typer.Exit(1)
+
+        port_basename = Path(port).name
+        device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
+        try:
+            poe_port = await power_controller.find_port_by_comment(device_label)
+        except Exception as e:
+            console.print(f"[red]PoE port discovery failed:[/red] {e}")
+            if power_controller:
+                await power_controller.close()
+            raise typer.Exit(1)
+
+        if output == "human":
+            console.print(f"  PoE: [cyan]{poe_port}[/cyan]")
+
+    # --- Phase 1: Burn U-Boot to RAM ---
+    if output == "human":
+        console.print("\n[bold yellow]Phase 1: Loading U-Boot to RAM[/bold yellow]")
+
+    # For restore with power-cycle: power off first (kill running OS),
+    # open serial on a quiet line, then let session handle power-on.
+    if power_controller and poe_port:
+        import asyncio as _aio
+        if output == "human":
+            console.print("  Powering off...")
+        power_controller._saved_poe_out[poe_port] = "forced-on"
+        await power_controller.power_off(poe_port)
+        await _aio.sleep(3)
+        if output == "human":
+            console.print("  Device off, opening serial...")
+
+    transport = await create_transport(normalize_port_name(port))
+    await transport.flush_input()
+
+    # Don't pass power controller to session — it would call power_cycle
+    # which doesn't work on an already-off port. We handle power-on below.
+    session = RecoverySession(
+        chip=chip, firmware_path=uboot_path,
+    )
+
+    def on_progress(e: ProgressEvent) -> None:
+        if output == "human" and e.message:
+            console.print(f"  {e.message}")
+
+    def on_log(e: LogEvent) -> None:
+        if output == "human" and e.level != "debug":
+            console.print(f"  {e.message}")
+
+    # Start session (frame-blast begins immediately for PRESTEP0 chips),
+    # then power on so the bootrom sees 0xAA+HEAD when it starts.
+    if power_controller and poe_port:
+        import asyncio as _aio
+        session_task = _aio.create_task(
+            session.run(transport, on_progress=on_progress, on_log=on_log)
+        )
+        await _aio.sleep(0.5)  # let frame-blast start
+        if output == "human":
+            console.print("  Powering on...")
+        await power_controller.power_on(poe_port)
+        result = await session_task
+    else:
+        result = await session.run(transport, on_progress=on_progress, on_log=on_log)
+
+    if not result.success:
+        console.print(f"[red]Burn failed:[/red] {result.error}")
+        await transport.close()
+        if power_controller:
+            await power_controller.close()
+        raise typer.Exit(1)
+
+    if output == "human":
+        console.print(f"  [green]U-Boot loaded ({result.elapsed_ms:.0f}ms)[/green]")
+
+    # --- Phase 2: Detect mode (download_process or shell) ---
+    if output == "human":
+        console.print("\n[bold yellow]Phase 2: Detecting U-Boot mode[/bold yellow]")
+
+    import time as _time
+    buf = bytearray()
+    start = _time.monotonic()
+    download_mode = False
+
+    while _time.monotonic() - start < 15:
+        await transport.write(b"\x03")
+        try:
+            data = await transport.read(256, timeout=0.2)
+            buf.extend(data)
+            text = buf.decode("ascii", errors="replace")
+            if "start download process" in text:
+                download_mode = True
+                break
+            if "hisilicon #" in text or "OpenIPC #" in text or "\n=> " in text:
+                break
+        except Exception:
+            pass
+
+    if download_mode:
+        if output == "human":
+            console.print("  [cyan]Download command mode[/cyan]")
+        from defib.protocol.download_cmd import DownloadCommandClient
+        client = DownloadCommandClient(transport)
+        send_cmd = client.send_command
+
+        async def _send(cmd: str, timeout: float = 60.0) -> str:
+            ok, out = await send_cmd(cmd, timeout=timeout)
+            if not ok and output == "human":
+                console.print(f"  [yellow]Warning: {cmd} → ERROR[/yellow]")
+            return out
+    else:
+        if output == "human":
+            console.print("  [cyan]U-Boot shell mode[/cyan]")
+
+        async def _send(cmd: str, timeout: float = 60.0) -> str:
+            return await send_command(transport, cmd, timeout=timeout, wait_for="# ")
+
+    # --- Phase 3: Detect flash type ---
+    if output == "human":
+        console.print("\n[bold yellow]Phase 3: Detecting flash[/bold yellow]")
+
+    detected_flash = flash_type
+    if flash_type == "auto":
+        # Try NAND first, then NOR, then eMMC
+        resp = await _send("nand info", timeout=10)
+        if "device" in resp.lower() and "error" not in resp.lower():
+            detected_flash = "nand"
+        else:
+            resp = await _send("sf probe 0", timeout=10)
+            if "error" not in resp.lower() and "fail" not in resp.lower():
+                detected_flash = "nor"
+            else:
+                resp = await _send("mmc dev 0", timeout=10)
+                if "error" not in resp.lower():
+                    detected_flash = "emmc"
+                else:
+                    console.print("[red]Could not detect flash type. Use --flash-type.[/red]")
+                    await transport.close()
+                    raise typer.Exit(1)
+
+    if output == "human":
+        console.print(f"  Flash type: [cyan]{detected_flash}[/cyan]")
+
+    # --- Phase 4: Configure networking ---
+    if output == "human":
+        console.print("\n[bold yellow]Phase 4: Network setup[/bold yellow]")
+
+    await _send(f"setenv ipaddr {device_ip}")
+    await _send(f"setenv serverip {host_ip}")
+
+    # Retry ping — PHY may need time to establish link
+    import asyncio as _asyncio
+    ping_ok = False
+    for attempt in range(5):
+        resp = await _send(f"ping {host_ip}", timeout=15)
+        if "is alive" in resp:
+            ping_ok = True
+            if output == "human":
+                console.print(f"  [green]Network OK[/green] (attempt {attempt + 1})")
+            break
+        if output == "human":
+            console.print(f"  Ping attempt {attempt + 1}/5 failed, retrying...")
+        await _asyncio.sleep(3)
+
+    if not ping_ok:
+        console.print("[red]Network not available. Check ethernet connection.[/red]")
+        await transport.close()
+        raise typer.Exit(1)
+
+    # --- Phase 5: TFTP + write each partition ---
+    if output == "human":
+        console.print("\n[bold yellow]Phase 5: Writing flash[/bold yellow]")
+
+    from defib.network.tftp_server import start_tftp_server
+
+    tftp_files = {name: data for name, data in partitions}
+    tftp_transport, _ = await start_tftp_server(
+        files=tftp_files, bind_addr=host_ip, port=69, done_count=len(partitions),
+    )
+
+    ram_addr = 0x82000000
+    offset = 0
+
+    for name, data in partitions:
+        # Pad to page alignment for NAND (2KB pages)
+        page = 2048 if detected_flash == "nand" else 1
+        write_size = ((len(data) + page - 1) // page) * page
+
+        if output == "human":
+            console.print(
+                f"\n  [bold]{name}[/bold]: {len(data) // 1024}KB → "
+                f"0x{offset:X}"
+            )
+
+        t0 = _time.monotonic()
+
+        # TFTP download to RAM (try tftpboot first, fall back to tftp)
+        resp = await _send(f"tftpboot 0x{ram_addr:x} {name}", timeout=120)
+        if "unknown command" in resp.lower():
+            resp = await _send(f"tftp 0x{ram_addr:x} {name}", timeout=120)
+        if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
+            console.print(f"  [red]TFTP failed: {resp.strip()[-100:]}[/red]")
+            offset += len(data)
+            continue
+
+        if output == "human":
+            console.print("    TFTP OK")
+
+        # Erase
+        if detected_flash == "nand":
+            erase_size = ((len(data) + 0x1FFFF) // 0x20000) * 0x20000  # 128KB block aligned
+            await _send(f"nand erase 0x{offset:x} 0x{erase_size:x}", timeout=120)
+            await _send(f"nand write 0x{ram_addr:x} 0x{offset:x} 0x{write_size:x}", timeout=120)
+        elif detected_flash == "nor":
+            erase_size = ((len(data) + 0xFFFF) // 0x10000) * 0x10000  # 64KB sector aligned
+            await _send(f"sf erase 0x{offset:x} 0x{erase_size:x}", timeout=120)
+            await _send(f"sf write 0x{ram_addr:x} 0x{offset:x} 0x{len(data):x}", timeout=120)
+        elif detected_flash == "emmc":
+            block_off = offset // 512
+            block_cnt = (len(data) + 511) // 512
+            await _send(f"mmc erase 0x{block_off:x} 0x{block_cnt:x}", timeout=120)
+            await _send(f"mmc write 0x{ram_addr:x} 0x{block_off:x} 0x{block_cnt:x}", timeout=120)
+
+        elapsed = _time.monotonic() - t0
+        if output == "human":
+            console.print(f"    Written ({elapsed:.1f}s)")
+
+        offset += len(data)
+
+    tftp_transport.close()
+
+    # --- Phase 6: Reset ---
+    if output == "human":
+        console.print("\n  Resetting device...")
+    await _send("reset", timeout=5)
+
+    await transport.close()
+    if power_controller:
+        await power_controller.close()
+
+    if output == "human":
+        console.print("\n[green bold]Restore complete![/green bold] Device is rebooting.")
+    elif output == "json":
+        print(json_mod.dumps({"event": "done", "success": True, "partitions": len(partitions)}))
 
 
 def main() -> None:
