@@ -2396,7 +2396,6 @@ async def _restore_async(
 
         if detected_flash == "nand" and is_ubifs:
             # UBI-aware write: let UBI handle bad block mapping
-            vol_name = name.replace("mtd", "vol")
             if output == "human":
                 console.print("    UBI partition detected")
 
@@ -2457,6 +2456,7 @@ async def _restore_async(
             part_idx = [i for i, (n, d) in enumerate(partitions) if n == name][0]
             if part_idx in ubi_partmap:
                 real_name, real_off, real_sz = ubi_partmap[part_idx]
+                vol_name = real_name  # kernel mounts by name (e.g. "ubi0:rootfs")
                 if real_sz == 0:
                     real_sz = 0x8000000 - real_off  # fill to end of 128MB
 
