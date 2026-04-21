@@ -380,6 +380,35 @@ class HiSiliconStandard(BootProtocol):
         ))
         return True
 
+    @staticmethod
+    def _detect_spl_size(firmware: bytes, profile_max: int) -> int:
+        """Detect actual SPL code size from firmware binary.
+
+        HiSilicon mini-boot layout: vector table + .reg + executable code +
+        LZMA-compressed U-Boot payload.  The SPL only needs the code region.
+        If the code is larger than the profile default (e.g. when SVB is
+        enabled), use the actual size so the bootrom receives all of it.
+        """
+        # Search for LZMA header (0x5D + 4-byte LE dictionary size) after
+        # the .reg region.  Common dict sizes: 64K, 128K, 256K, 512K, 1M, 8M.
+        VALID_DICT_SIZES = {
+            1 << n for n in range(16, 25)  # 64K .. 16M
+        }
+        for i in range(0x4000, min(len(firmware), 0x10000)):
+            if firmware[i] == 0x5D:
+                ds = int.from_bytes(firmware[i + 1 : i + 5], "little")
+                if ds in VALID_DICT_SIZES:
+                    # Round up to 1 KB boundary
+                    detected = (i + 0x3FF) & ~0x3FF
+                    if detected > profile_max:
+                        logger.info(
+                            "SPL code extends to 0x%X (%d bytes), "
+                            "profile default was 0x%X (%d bytes)",
+                            detected, detected, profile_max, profile_max,
+                        )
+                    return max(detected, profile_max)
+        return profile_max
+
     async def _send_spl(
         self,
         transport: Transport,
@@ -389,7 +418,7 @@ class HiSiliconStandard(BootProtocol):
         spl_override: bytes | None = None,
     ) -> bool:
         """Send SPL (secondary program loader) to SRAM."""
-        spl_size = profile.spl_max_size
+        spl_size = self._detect_spl_size(firmware, profile.spl_max_size)
         logger.debug(
             "=== SPL === address=0x%08X size=%d chunks=%d",
             profile.spl_address, spl_size,
@@ -421,12 +450,11 @@ class HiSiliconStandard(BootProtocol):
         if not await self._send_tail(transport, len(chunks) + 1):
             return False
 
-        # DDR training delay: HiTool sleeps 300ms after SPL transfer
-        # for files matching specific sizes (20224, 21504, 29696).
+        # DDR training delay: HiTool sleeps 300ms after SPL transfer.
+        # Always apply — the SPL runs DDR training which needs time.
         import asyncio as _asyncio
-        if spl_size in (20224, 21504, 29696):
-            logger.debug("DDR training delay: 300ms (spl_size=%d)", spl_size)
-            await _asyncio.sleep(0.3)
+        logger.debug("DDR training delay: 300ms (spl_size=%d)", spl_size)
+        await _asyncio.sleep(0.3)
 
         _emit(on_progress, ProgressEvent(
             stage=Stage.SPL, bytes_sent=spl_size, bytes_total=spl_size,
