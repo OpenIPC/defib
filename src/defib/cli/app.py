@@ -2392,8 +2392,45 @@ async def _restore_async(
         if output == "human":
             console.print("    TFTP OK")
 
-        # Erase
-        if detected_flash == "nand":
+        # Erase + write
+        # For NAND: detect if partition is UBI (starts with UBIFS magic 0x06101831
+        # or UBI EC header 0x55424923). UBI partitions need ubi write, not nand write.
+        is_ubi = (
+            detected_flash == "nand"
+            and len(data) >= 4
+            and (data[:4] == b"\x55\x42\x49\x23"  # UBI# EC header (raw mtd dump)
+                 or data[:4] == b"\x31\x18\x10\x06")  # UBIFS superblock (ubi volume dump)
+        )
+
+        if detected_flash == "nand" and is_ubi:
+            # UBI-aware write: let UBI handle bad block mapping
+            vol_name = name.replace("mtd", "vol")
+            if output == "human":
+                console.print(f"    UBI partition detected")
+
+            # Need mtdparts for ubi commands
+            if not hasattr(_restore_async, '_ubi_mtdparts_set'):
+                # Set mtdparts based on partition layout we're restoring
+                mtd_defs = []
+                off = 0
+                for pname, pdata in partitions:
+                    sz_mb = len(pdata) // (1024 * 1024)
+                    sz_kb = len(pdata) // 1024
+                    if sz_mb > 0 and len(pdata) % (1024 * 1024) == 0:
+                        mtd_defs.append(f"{sz_mb}M({pname})")
+                    else:
+                        mtd_defs.append(f"{sz_kb}k({pname})")
+                mtdparts_str = "hinand:" + ",".join(mtd_defs)
+                await _send("setenv mtdids nand0=hinand")
+                await _send(f"setenv mtdparts mtdparts={mtdparts_str}")
+                await _send("mtdparts")
+                _restore_async._ubi_mtdparts_set = True
+
+            await _send(f"ubi part {name}", timeout=30)
+            await _send(f"ubi create {vol_name}", timeout=30)
+            await _send(f"ubi write 0x{ram_addr:x} {vol_name} 0x{len(data):x}", timeout=300)
+
+        elif detected_flash == "nand":
             erase_size = ((len(data) + 0x1FFFF) // 0x20000) * 0x20000  # 128KB block aligned
             await _send(f"nand erase 0x{offset:x} 0x{erase_size:x}", timeout=120)
             await _send(f"nand write 0x{ram_addr:x} 0x{offset:x} 0x{write_size:x}", timeout=120)
