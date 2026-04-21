@@ -2063,6 +2063,7 @@ def restore(
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
     uboot: str = typer.Option("", "--uboot", help="U-Boot binary to load (auto-downloads if omitted)"),
     flash_type: str = typer.Option("auto", "--flash-type", help="Flash type: auto, nor, nand, emmc"),
+    mtdparts: str = typer.Option("", "--mtdparts", help="NAND partition layout (e.g. hinand:1M(boot),4M(kernel),8M(rootfs),...)"),
     host_ip: str = typer.Option("", "--host-ip", help="Host IP for TFTP (auto-detect if empty)"),
     device_ip: str = typer.Option("", "--device-ip", help="Device IP in U-Boot"),
     nic: str = typer.Option("", "--nic", help="Network interface for TFTP"),
@@ -2084,14 +2085,14 @@ def restore(
     """
     import asyncio
     asyncio.run(_restore_async(
-        chip, dump, port, uboot, flash_type, host_ip, device_ip, nic,
+        chip, dump, port, uboot, flash_type, mtdparts, host_ip, device_ip, nic,
         power_cycle, output, debug,
     ))
 
 
 async def _restore_async(
     chip: str, dump: str, port: str, uboot_path: str, flash_type: str,
-    host_ip: str, device_ip: str, nic: str, power_cycle: bool,
+    mtdparts_arg: str, host_ip: str, device_ip: str, nic: str, power_cycle: bool,
     output: str, debug: bool,
 ) -> None:
     import json as json_mod
@@ -2366,11 +2367,17 @@ async def _restore_async(
 
     ram_addr = 0x82000000
     offset = 0
+    ubi_partmap: dict[int, tuple[str, int, int]] | None = None
 
-    for name, data in partitions:
+    for part_idx, (name, data) in enumerate(partitions):
         # Pad to page alignment for NAND (2KB pages)
         page = 2048 if detected_flash == "nand" else 1
         write_size = ((len(data) + page - 1) // page) * page
+
+        # Use real partition offset if we have a partition map
+        if ubi_partmap is not None and part_idx in ubi_partmap:
+            _, real_offset, _ = ubi_partmap[part_idx]
+            offset = real_offset
 
         if output == "human":
             console.print(
@@ -2380,32 +2387,136 @@ async def _restore_async(
 
         t0 = _time.monotonic()
 
-        # TFTP download to RAM (try tftpboot first, fall back to tftp)
-        resp = await _send(f"tftpboot 0x{ram_addr:x} {name}", timeout=120)
-        if "unknown command" in resp.lower():
-            resp = await _send(f"tftp 0x{ram_addr:x} {name}", timeout=120)
-        if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
-            console.print(f"  [red]TFTP failed: {resp.strip()[-100:]}[/red]")
-            offset += len(data)
-            continue
+        # Detect partition type before TFTP
+        is_ubifs = (
+            detected_flash == "nand"
+            and len(data) >= 4
+            and data[:4] == b"\x31\x18\x10\x06"  # UBIFS superblock
+        )
 
-        if output == "human":
-            console.print("    TFTP OK")
+        if detected_flash == "nand" and is_ubifs:
+            # UBI-aware write: let UBI handle bad block mapping
+            vol_name = name.replace("mtd", "vol")
+            if output == "human":
+                console.print("    UBI partition detected")
 
-        # Erase
-        if detected_flash == "nand":
-            erase_size = ((len(data) + 0x1FFFF) // 0x20000) * 0x20000  # 128KB block aligned
-            await _send(f"nand erase 0x{offset:x} 0x{erase_size:x}", timeout=120)
-            await _send(f"nand write 0x{ram_addr:x} 0x{offset:x} 0x{write_size:x}", timeout=120)
-        elif detected_flash == "nor":
-            erase_size = ((len(data) + 0xFFFF) // 0x10000) * 0x10000  # 64KB sector aligned
-            await _send(f"sf erase 0x{offset:x} 0x{erase_size:x}", timeout=120)
-            await _send(f"sf write 0x{ram_addr:x} 0x{offset:x} 0x{len(data):x}", timeout=120)
-        elif detected_flash == "emmc":
-            block_off = offset // 512
-            block_cnt = (len(data) + 511) // 512
-            await _send(f"mmc erase 0x{block_off:x} 0x{block_cnt:x}", timeout=120)
-            await _send(f"mmc write 0x{ram_addr:x} 0x{block_off:x} 0x{block_cnt:x}", timeout=120)
+            # Need mtdids + mtdparts for ubi commands.
+            # Parse NAND partition layout from bootargs or use default.
+            if ubi_partmap is None:
+                import re as _re
+                mtdparts_val = None
+
+                # Use --mtdparts if provided
+                if mtdparts_arg:
+                    mtdparts_val = mtdparts_arg
+                else:
+                    # Try bootargs (look for NAND device like hinand)
+                    resp = await _send("printenv bootargs", timeout=5)
+                    m = _re.search(r"mtdparts=(hinand:[\S]+)", resp)
+                    if not m:
+                        resp = await _send("printenv mtdparts", timeout=5)
+                        m = _re.search(r"mtdparts=(hinand:[\S]+)", resp)
+                    if m:
+                        mtdparts_val = m.group(1)
+
+                if not mtdparts_val:
+                    if output == "human":
+                        console.print("    [red]Cannot determine NAND partition layout for UBI.[/red]")
+                        console.print("    [red]Use --mtdparts to specify it.[/red]")
+                    offset += len(data)
+                    continue
+
+                nand_name = mtdparts_val.split(":")[0]
+                await _send(f"setenv mtdids nand0={nand_name}")
+                await _send(f"setenv mtdparts mtdparts={mtdparts_val}")
+                await _send("mtdparts")
+                if output == "human":
+                    console.print(f"    mtdparts: {mtdparts_val[:70]}")
+
+                # Parse partition offsets and sizes
+                ubi_partmap = {}
+                part_str = mtdparts_val.split(":", 1)[1]
+                cur_off = 0
+                for i, pdef in enumerate(part_str.split(",")):
+                    pm = _re.match(r"([\d]+[kKmM]?)\((\w+)\)", pdef.strip().lstrip("-"))
+                    if not pm:
+                        continue
+                    sz_str, pname = pm.group(1), pm.group(2)
+                    if sz_str.upper().endswith("M"):
+                        sz = int(sz_str[:-1]) * 1024 * 1024
+                    elif sz_str.upper().endswith("K"):
+                        sz = int(sz_str[:-1]) * 1024
+                    else:
+                        sz = int(sz_str)
+                    if pdef.strip().startswith("-"):
+                        sz = 0  # fill rest
+                    ubi_partmap[i] = (pname, cur_off, sz)
+                    cur_off += sz
+
+            # Find the real NAND offset for this partition
+            part_idx = [i for i, (n, d) in enumerate(partitions) if n == name][0]
+            if part_idx in ubi_partmap:
+                real_name, real_off, real_sz = ubi_partmap[part_idx]
+                if real_sz == 0:
+                    real_sz = 0x8000000 - real_off  # fill to end of 128MB
+
+                # TFTP → erase → ubi part → ubi create → ubi write
+                # TFTP must be FIRST — ubi operations allocate memory that
+                # conflicts with TFTP's network stack on constrained U-Boot.
+                resp = await _send(f"tftpboot 0x{ram_addr:x} {name}", timeout=120)
+                if "unknown command" in resp.lower():
+                    resp = await _send(f"tftp 0x{ram_addr:x} {name}", timeout=120)
+                if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
+                    if output == "human":
+                        console.print("    [red]TFTP failed[/red]")
+                    offset += len(data)
+                    continue
+                if output == "human":
+                    console.print("    TFTP OK")
+
+                if output == "human":
+                    console.print(f"    Erasing 0x{real_off:X}+0x{real_sz:X}...")
+                await _send(f"nand erase 0x{real_off:x} 0x{real_sz:x}", timeout=120)
+                if output == "human":
+                    console.print(f"    UBI format {real_name}...")
+                await _send(f"ubi part {real_name}", timeout=120)
+                await _send(f"ubi create {vol_name} 0x{len(data):x}", timeout=60)
+                resp = await _send(f"ubi write 0x{ram_addr:x} {vol_name} 0x{len(data):x}", timeout=300)
+                if "error" in resp.lower() or "cannot" in resp.lower():
+                    if output == "human":
+                        console.print(f"    [red]ubi write failed: {resp.strip()[-80:]}[/red]")
+            else:
+                if output == "human":
+                    console.print(f"    [red]Partition {name} not in mtdparts[/red]")
+                offset += len(data)
+                continue
+
+        else:
+            # Non-UBI: TFTP first, then raw write
+            resp = await _send(f"tftpboot 0x{ram_addr:x} {name}", timeout=120)
+            if "unknown command" in resp.lower():
+                resp = await _send(f"tftp 0x{ram_addr:x} {name}", timeout=120)
+            if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
+                if output == "human":
+                    console.print("    [red]TFTP failed[/red]")
+                offset += len(data)
+                continue
+            if output == "human":
+                console.print("    TFTP OK")
+
+            if detected_flash == "nand":
+                erase_size = ((len(data) + 0x1FFFF) // 0x20000) * 0x20000
+                await _send(f"nand erase 0x{offset:x} 0x{erase_size:x}", timeout=120)
+                await _send(f"nand write 0x{ram_addr:x} 0x{offset:x} 0x{write_size:x}", timeout=120)
+            elif detected_flash == "nor":
+                erase_size = ((len(data) + 0xFFFF) // 0x10000) * 0x10000
+                await _send(f"sf erase 0x{offset:x} 0x{erase_size:x}", timeout=120)
+                await _send(f"sf write 0x{ram_addr:x} 0x{offset:x} 0x{len(data):x}", timeout=120)
+            elif detected_flash == "emmc":
+                block_off = offset // 512
+                block_cnt = (len(data) + 511) // 512
+                await _send(f"mmc erase 0x{block_off:x} 0x{block_cnt:x}", timeout=120)
+                await _send(f"mmc write 0x{ram_addr:x} 0x{block_off:x} 0x{block_cnt:x}", timeout=120)
 
         elapsed = _time.monotonic() - t0
         if output == "human":
