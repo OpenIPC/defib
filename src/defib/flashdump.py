@@ -210,6 +210,30 @@ async def send_command(
     return buf.decode("ascii", errors="replace")
 
 
+async def tftp_to_ram(
+    transport: Transport,
+    addr: int,
+    filename: str,
+    timeout: float = 120.0,
+) -> str:
+    """Download a file via TFTP into RAM.
+
+    Tries ``tftpboot`` first; falls back to ``tftp`` if the U-Boot
+    build doesn't have the ``tftpboot`` alias.
+
+    Returns the command response text.  Raises RuntimeError on failure.
+    """
+    cmd = f"tftpboot 0x{addr:x} {filename}"
+    resp = await send_command(transport, cmd, timeout=timeout, wait_for="# ")
+    if "unknown command" in resp.lower():
+        logger.debug("tftpboot not available, falling back to tftp")
+        cmd = f"tftp 0x{addr:x} {filename}"
+        resp = await send_command(transport, cmd, timeout=timeout, wait_for="# ")
+    if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
+        raise RuntimeError(f"TFTP download failed: {resp.strip()[-200:]}")
+    return resp
+
+
 def detect_flash_from_text(text: str) -> int | None:
     """Parse flash size from any U-Boot output text.
 

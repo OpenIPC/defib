@@ -67,6 +67,36 @@ The install command orchestrates the entire process:
 Requires root for TFTP port 69 and NIC IP assignment. Supports both 8MB and
 16MB NOR flash layouts (`--nor-size 8` or `--nor-size 16`).
 
+## Flash Dump Restore
+
+Restore a full flash dump (e.g., vendor firmware backup) to a device.
+Supports NOR, NAND, and eMMC — auto-detected from U-Boot.
+
+```bash
+# Restore from a directory of mtd partition files
+defib restore -c hi3516av200 -i /path/to/dump/ \
+  -p /dev/uart-hi3516av200 --power-cycle
+
+# Restore a single flash image to NOR
+defib restore -c hi3516ev300 -i flash_dump.bin \
+  -p /dev/ttyUSB0 --flash-type nor --power-cycle
+
+# Use a custom U-Boot binary (e.g., vendor or custom build)
+defib restore -c hi3516av200 -i /path/to/dump/ \
+  --uboot /path/to/u-boot.bin -p /dev/ttyUSB0 --power-cycle
+```
+
+The restore process:
+1. Burns U-Boot to RAM via boot ROM protocol
+2. Detects post-boot mode (download command protocol or U-Boot shell)
+3. Auto-detects flash type (NAND/NOR/eMMC) from U-Boot
+4. Sets up networking and starts a TFTP server
+5. Transfers each partition to RAM and writes to flash
+6. Resets the device
+
+For NAND devices, writes are automatically page-aligned (2KB).
+Handles both `tftpboot` and `tftp` U-Boot commands transparently.
+
 ## Features
 
 - All 3 HiSilicon/Goke UART protocols (Standard, V500, CV6xx)
