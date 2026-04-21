@@ -96,6 +96,20 @@ defib burn -c hi3516ev300 -p /dev/uart-IVG85HG50PYA-S --power-cycle -b
 defib burn -c hi3516ev300 -p /dev/uart-IVG85HG50PYA-S --power-cycle -t
 ```
 
+The `-t` flag auto-detects the post-boot mode:
+- **Normal U-Boot shell** (e.g. hi3516ev300): raw terminal passthrough — type commands directly
+- **Download command mode** (e.g. hi3516av200): interactive `defib>` prompt that wraps commands in HiSilicon's XHEAD/XCMD protocol, enabling flash operations on devices that enter `download_process()` after serial boot
+
+```bash
+# Interactive download command mode (hi3516av200 enters this automatically)
+defib burn -c hi3516av200 -p /dev/ttyUSB0 --power-cycle -t
+# defib> nand info
+# Device 0: nand0, sector size 128 KiB
+# [OK]
+# defib> nand erase 0x200000 0x800000
+# [OK]
+```
+
 The `--power-cycle` flag connects to the RouterOS API, auto-discovers the PoE
 port by matching the serial device name against switch interface comments, and
 power-cycles the device before recovery. A continuous ACK mechanism ensures the

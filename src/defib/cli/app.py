@@ -241,33 +241,90 @@ async def _burn_async(
         raise typer.Exit(1)
 
     # Terminal mode: stream serial output until Ctrl-C
+    # Auto-detects download_process mode and bridges XHEAD/XCMD framing.
     if terminal and result.success:
         import signal
         import sys as _sys
 
-        if output == "human":
-            console.print("[dim]--- Terminal mode (Ctrl-C to exit) ---[/dim]")
+        # Read initial output to detect which mode U-Boot entered
+        boot_buf = bytearray()
+        for _ in range(60):  # up to 6 seconds
+            try:
+                data = await transport.read(256, timeout=0.1)
+                boot_buf.extend(data)
+                _sys.stdout.buffer.write(data)
+                _sys.stdout.buffer.flush()
+            except Exception:
+                pass
+            if b"start download process" in boot_buf or b"hisilicon #" in boot_buf or b"OpenIPC #" in boot_buf:
+                break
 
-        stop = False
+        download_mode = b"start download process" in boot_buf
 
-        def on_sigint(*_: object) -> None:
-            nonlocal stop
-            stop = True
-
-        signal.signal(signal.SIGINT, on_sigint)
-
-        try:
-            while not stop:
-                try:
-                    data = await transport.read(256, timeout=0.1)
-                    _sys.stdout.buffer.write(data)
-                    _sys.stdout.buffer.flush()
-                except Exception:
-                    pass
-        finally:
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
+        if download_mode:
             if output == "human":
-                console.print("\n[dim]--- Terminal closed ---[/dim]")
+                console.print("\n[dim]--- Download command mode (type U-Boot commands, Ctrl-C to exit) ---[/dim]")
+
+            from defib.protocol.download_cmd import DownloadCommandClient
+            client = DownloadCommandClient(transport)
+
+            stop = False
+
+            def on_sigint(*_: object) -> None:
+                nonlocal stop
+                stop = True
+
+            signal.signal(signal.SIGINT, on_sigint)
+
+            import asyncio as _asyncio
+            try:
+                while not stop:
+                    try:
+                        cmd = await _asyncio.get_event_loop().run_in_executor(
+                            None, lambda: input("defib> ")
+                        )
+                    except (EOFError, OSError):
+                        break
+                    if not cmd.strip():
+                        continue
+                    ok, out = await client.send_command(cmd.strip(), timeout=120)
+                    if out.strip():
+                        print(out.strip())
+                    if ok:
+                        print("[OK]")
+                    else:
+                        print("[ERROR]")
+            except KeyboardInterrupt:
+                pass
+            finally:
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                if output == "human":
+                    console.print("[dim]--- Session closed ---[/dim]")
+        else:
+            # Normal U-Boot shell — raw terminal passthrough
+            if output == "human":
+                console.print("[dim]--- Terminal mode (Ctrl-C to exit) ---[/dim]")
+
+            stop = False
+
+            def on_sigint(*_: object) -> None:
+                nonlocal stop
+                stop = True
+
+            signal.signal(signal.SIGINT, on_sigint)
+
+            try:
+                while not stop:
+                    try:
+                        data = await transport.read(256, timeout=0.1)
+                        _sys.stdout.buffer.write(data)
+                        _sys.stdout.buffer.flush()
+                    except Exception:
+                        pass
+            finally:
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+                if output == "human":
+                    console.print("\n[dim]--- Terminal closed ---[/dim]")
 
     await transport.close()
 
