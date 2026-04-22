@@ -2369,15 +2369,32 @@ async def _restore_async(
     offset = 0
     ubi_partmap: dict[int, tuple[str, int, int]] | None = None
 
-    for part_idx, (name, data) in enumerate(partitions):
+    # Write boot partition (offset 0) LAST — setenv/network commands during
+    # restore cause U-Boot to save env to NAND within the boot area, so
+    # writing boot last overwrites any env corruption.
+    write_order = list(enumerate(partitions))
+    boot_parts = [(i, p) for i, p in write_order if i == 0 or p[0] in ("mtd0", "boot")]
+    other_parts = [(i, p) for i, p in write_order if (i, p) not in boot_parts]
+    write_order = other_parts + boot_parts
+
+    # Pre-compute partition offsets from original sequential order
+    _part_offsets: dict[int, int] = {}
+    _off = 0
+    for i, (_, pdata) in enumerate(partitions):
+        _part_offsets[i] = _off
+        _off += len(pdata)
+
+    for part_idx, (name, data) in write_order:
         # Pad to page alignment for NAND (2KB pages)
         page = 2048 if detected_flash == "nand" else 1
         write_size = ((len(data) + page - 1) // page) * page
 
-        # Use real partition offset if we have a partition map
+        # Use real partition offset from mtdparts if available, else from sequential order
         if ubi_partmap is not None and part_idx in ubi_partmap:
             _, real_offset, _ = ubi_partmap[part_idx]
             offset = real_offset
+        else:
+            offset = _part_offsets[part_idx]
 
         if output == "human":
             console.print(
@@ -2422,7 +2439,6 @@ async def _restore_async(
                     if output == "human":
                         console.print("    [red]Cannot determine NAND partition layout for UBI.[/red]")
                         console.print("    [red]Use --mtdparts to specify it.[/red]")
-                    offset += len(data)
                     continue
 
                 nand_name = mtdparts_val.split(":")[0]
@@ -2469,7 +2485,6 @@ async def _restore_async(
                 if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
                     if output == "human":
                         console.print("    [red]TFTP failed[/red]")
-                    offset += len(data)
                     continue
                 if output == "human":
                     console.print("    TFTP OK")
@@ -2488,7 +2503,6 @@ async def _restore_async(
             else:
                 if output == "human":
                     console.print(f"    [red]Partition {name} not in mtdparts[/red]")
-                offset += len(data)
                 continue
 
         else:
@@ -2499,7 +2513,6 @@ async def _restore_async(
             if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
                 if output == "human":
                     console.print("    [red]TFTP failed[/red]")
-                offset += len(data)
                 continue
             if output == "human":
                 console.print("    TFTP OK")
@@ -2521,8 +2534,6 @@ async def _restore_async(
         elapsed = _time.monotonic() - t0
         if output == "human":
             console.print(f"    Written ({elapsed:.1f}s)")
-
-        offset += len(data)
 
     tftp_transport.close()
 
