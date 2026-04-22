@@ -6,10 +6,8 @@ import zlib
 import pytest
 
 from defib.ubi import (
-    EC_HDR_SIZE,
     UBI_EC_MAGIC,
     UBIFS_MAGIC,
-    VID_HDR_SIZE,
     VID_MAGIC,
     extract_ubifs,
     is_ubi_image,
