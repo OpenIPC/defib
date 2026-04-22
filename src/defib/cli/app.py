@@ -2126,7 +2126,55 @@ async def _restore_async(
         for f in mtd_files:
             partitions.append((f.name, f.read_bytes()))
     elif dump_path.is_file():
-        partitions.append(("flash", dump_path.read_bytes()))
+        raw = dump_path.read_bytes()
+        if raw[:4] == b"---\n":
+            # ipctool backup format: YAML header + null + [4-byte LE len + data]*
+            import re as _re
+            import struct as _struct
+
+            null_pos = raw.index(b"\x00")
+            yaml_text = raw[:null_pos].decode("utf-8", errors="replace")
+
+            # Extract mtdparts from YAML if not provided via --mtdparts
+            if not mtdparts_arg:
+                # Parse partition names and sizes
+                yaml_parts = _re.findall(
+                    r"name: (\w+)\n\s+size: (0x[0-9a-fA-F]+)", yaml_text
+                )
+                if yaml_parts:
+                    mtd_defs = []
+                    for pname, size_hex in yaml_parts:
+                        sz = int(size_hex, 16)
+                        if sz % (1024 * 1024) == 0:
+                            mtd_defs.append(f"{sz // (1024 * 1024)}M({pname})")
+                        else:
+                            mtd_defs.append(f"{sz // 1024}k({pname})")
+                    # Last partition fills remainder
+                    last_name = yaml_parts[-1][0]
+                    mtd_defs[-1] = f"-({last_name})"
+                    # Detect NAND device name from YAML
+                    nand_match = _re.search(r"type: (nand|nor)", yaml_text)
+                    nand_name = "hinand" if nand_match and nand_match.group(1) == "nand" else "hi_sfc"
+                    mtdparts_arg = f"{nand_name}:{','.join(mtd_defs)}"
+                    if output == "human":
+                        console.print(f"  mtdparts from backup: [dim]{mtdparts_arg[:70]}[/dim]")
+
+            # Extract data blocks
+            pos = null_pos + 1
+            block_num = 0
+            while pos + 4 <= len(raw):
+                block_len = _struct.unpack("<I", raw[pos:pos + 4])[0]
+                pos += 4
+                if pos + block_len > len(raw):
+                    break
+                partitions.append((f"mtd{block_num}", raw[pos:pos + block_len]))
+                pos += block_len
+                block_num += 1
+
+            if output == "human":
+                console.print(f"  ipctool backup: {block_num} partitions from [cyan]{dump_path.name}[/cyan]")
+        else:
+            partitions.append(("flash", raw))
     else:
         console.print(f"[red]Not found: {dump}[/red]")
         raise typer.Exit(1)
@@ -2453,7 +2501,13 @@ async def _restore_async(
                 part_str = mtdparts_val.split(":", 1)[1]
                 cur_off = 0
                 for i, pdef in enumerate(part_str.split(",")):
-                    pm = _re.match(r"([\d]+[kKmM]?)\((\w+)\)", pdef.strip().lstrip("-"))
+                    pdef_s = pdef.strip()
+                    # Handle "-(name)" fill-remainder syntax
+                    fm = _re.match(r"-\((\w+)\)", pdef_s)
+                    if fm:
+                        ubi_partmap[i] = (fm.group(1), cur_off, 0)
+                        continue
+                    pm = _re.match(r"([\d]+[kKmM]?)\((\w+)\)", pdef_s)
                     if not pm:
                         continue
                     sz_str, pname = pm.group(1), pm.group(2)
@@ -2463,8 +2517,6 @@ async def _restore_async(
                         sz = int(sz_str[:-1]) * 1024
                     else:
                         sz = int(sz_str)
-                    if pdef.strip().startswith("-"):
-                        sz = 0  # fill rest
                     ubi_partmap[i] = (pname, cur_off, sz)
                     cur_off += sz
 
