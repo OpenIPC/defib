@@ -84,7 +84,15 @@ defib restore -c hi3516ev300 -i flash_dump.bin \
 # Use a custom U-Boot binary (e.g., vendor or custom build)
 defib restore -c hi3516av200 -i /path/to/dump/ \
   --uboot /path/to/u-boot.bin -p /dev/ttyUSB0 --power-cycle
+
+# Restore directly from an ipctool backup file
+defib restore -c hi3516av200 -i backup.bin \
+  --uboot /path/to/u-boot.bin -p /dev/ttyUSB0 --power-cycle
 ```
+
+ipctool backup files (`.bin` with YAML header) are auto-detected. Partition
+layout, names, and UBI volume metadata are extracted from the embedded YAML —
+no manual `--mtdparts` needed.
 
 The restore process:
 1. Burns U-Boot to RAM via boot ROM protocol
