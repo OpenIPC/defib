@@ -2425,12 +2425,35 @@ async def _restore_async(
     other_parts = [(i, p) for i, p in write_order if (i, p) not in boot_parts]
     write_order = other_parts + boot_parts
 
-    # Pre-compute partition offsets from original sequential order
+    # Pre-compute partition offsets from mtdparts if available, else from data sizes
     _part_offsets: dict[int, int] = {}
-    _off = 0
-    for i, (_, pdata) in enumerate(partitions):
-        _part_offsets[i] = _off
-        _off += len(pdata)
+    if mtdparts_arg and detected_flash == "nand":
+        import re as _re_off
+        _pstr = mtdparts_arg.split(":", 1)[1] if ":" in mtdparts_arg else mtdparts_arg
+        _cur = 0
+        for _i, _pd in enumerate(_pstr.split(",")):
+            _part_offsets[_i] = _cur
+            _fm = _re_off.match(r"-\(", _pd.strip())
+            if _fm:
+                break  # fill remainder — no more offsets to compute
+            _pm = _re_off.match(r"([\d]+)([kKmM]?)", _pd.strip())
+            if _pm:
+                _sz = int(_pm.group(1))
+                _u = _pm.group(2).upper()
+                if _u == "M":
+                    _sz *= 1024 * 1024
+                elif _u == "K":
+                    _sz *= 1024
+                _cur += _sz
+        # Fill remaining indices from cumulative
+        for _i in range(len(partitions)):
+            if _i not in _part_offsets:
+                _part_offsets[_i] = _cur
+    else:
+        _off = 0
+        for i, (_, pdata) in enumerate(partitions):
+            _part_offsets[i] = _off
+            _off += len(pdata)
 
     for part_idx, (name, data) in write_order:
         # Pad to page alignment for NAND (2KB pages)
