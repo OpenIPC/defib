@@ -313,12 +313,16 @@ class HiSiliconStandard(BootProtocol):
         transport: Transport,
         profile: SoCProfile,
         on_progress: Callable[[ProgressEvent], None] | None = None,
-    ) -> bool:
+    ) -> str | None:
         """Send DDR initialization steps to SRAM.
 
         Matches HiTool's exact sequence:
         1. sendFrameForStart: blast HEAD(64, ADDRESS0) until ACK (handshake)
         2. For each step (PRESTEP0, DDRSTEP0, PRESTEP1): HEAD+DATA+TAIL
+
+        Returns ``None`` on success, or a string describing which sub-step
+        failed.  Distinguishes handshake failure from frame-send failures
+        so error messages aren't misleading.
         """
         _emit(on_progress, ProgressEvent(
             stage=Stage.DDR_INIT, bytes_sent=0, bytes_total=64,
@@ -331,7 +335,7 @@ class HiSiliconStandard(BootProtocol):
         # sendFrameForStart: blast HEAD as handshake (HiTool approach)
         if prestep is not None:
             if not await self._send_frame_for_start(transport, profile):
-                return False
+                return "handshake (sendFrameForStart) timed out"
 
             # PRESTEP0: HEAD+DATA+TAIL (HEAD sent again per HiTool's loop)
             logger.debug(
@@ -339,9 +343,9 @@ class HiSiliconStandard(BootProtocol):
                 addr, len(prestep),
             )
             if not await self._send_head(transport, 64, addr):
-                return False
+                return "PRESTEP0 HEAD frame not ACKed"
             if not await self._send_data(transport, 1, prestep):
-                return False
+                return "PRESTEP0 DATA frame not ACKed"
             if not await self._send_tail(transport, 2):
                 logger.debug("PRESTEP0 TAIL not ACKed (non-fatal)")
 
@@ -352,10 +356,10 @@ class HiSiliconStandard(BootProtocol):
         )
         ddr_data = profile.ddr_step_data
         if not await self._send_head(transport, 64, addr):
-            return False
+            return "DDRSTEP0 HEAD frame not ACKed"
 
         if not await self._send_data(transport, 1, ddr_data):
-            return False
+            return "DDRSTEP0 DATA frame not ACKed"
 
         if not await self._send_tail(transport, 2):
             logger.debug("DDRSTEP0 TAIL not ACKed (non-fatal)")
@@ -368,9 +372,9 @@ class HiSiliconStandard(BootProtocol):
                 addr, len(prestep1),
             )
             if not await self._send_head(transport, len(prestep1), addr):
-                return False
+                return "PRESTEP1 HEAD frame not ACKed"
             if not await self._send_data(transport, 1, prestep1):
-                return False
+                return "PRESTEP1 DATA frame not ACKed"
             if not await self._send_tail(transport, 2):
                 logger.debug("PRESTEP1 TAIL not ACKed (non-fatal)")
 
@@ -378,7 +382,7 @@ class HiSiliconStandard(BootProtocol):
             stage=Stage.DDR_INIT, bytes_sent=64, bytes_total=64,
             message="DDR step complete",
         ))
-        return True
+        return None
 
     @staticmethod
     def _detect_spl_size(firmware: bytes, profile_max: int) -> int:
@@ -537,10 +541,11 @@ class HiSiliconStandard(BootProtocol):
             profile.name, len(firmware), spl_override is not None,
         )
 
-        if not await self._send_ddr_step(transport, profile, on_progress):
+        ddr_err = await self._send_ddr_step(transport, profile, on_progress)
+        if ddr_err is not None:
             return RecoveryResult(
                 success=False, stages_completed=stages,
-                error="Failed to send DDR step",
+                error=f"DDR init failed: {ddr_err}",
             )
         stages.append(Stage.DDR_INIT)
 
