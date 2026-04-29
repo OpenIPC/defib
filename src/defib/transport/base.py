@@ -60,6 +60,42 @@ class Transport(ABC):
             return await self.read(waiting, timeout=0.1)
         return b""
 
+    async def drain_until_silent(
+        self,
+        quiet_period: float = 0.5,
+        max_wait: float = 5.0,
+    ) -> int:
+        """Read and discard incoming data until the line stays quiet.
+
+        Reads bytes with short timeouts, restarting the quiet timer whenever
+        any data arrives.  Returns once no data has been seen for
+        ``quiet_period`` seconds, or once ``max_wait`` total seconds elapsed.
+
+        This is more reliable than a fixed sleep + ``flush_input`` because
+        ``flush_input`` only drains the buffer at one moment in time — bytes
+        arriving immediately after survive.  Reading until silence guarantees
+        a clean state when the chip is physically off (which can't transmit).
+
+        Returns the number of bytes discarded.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max_wait
+        last_data_at = loop.time()
+        discarded = 0
+
+        await self.flush_input()
+        while loop.time() < deadline:
+            if loop.time() - last_data_at >= quiet_period:
+                return discarded
+            try:
+                chunk = await self.read(256, timeout=0.05)
+                if chunk:
+                    discarded += len(chunk)
+                    last_data_at = loop.time()
+            except TransportTimeout:
+                continue
+        return discarded
+
     async def read_exact(self, size: int, timeout: float | None = None) -> bytes:
         """Read exactly `size` bytes, raising TransportTimeout on timeout."""
         buf = bytearray()

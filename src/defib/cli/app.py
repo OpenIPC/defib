@@ -1666,6 +1666,28 @@ _NAND_LAYOUT = {
 }
 
 
+def _nand_bootargs(rootfs_is_ubi: bool) -> str:
+    """Return kernel cmdline for OpenIPC NAND install.
+
+    Don't rely on U-Boot's compiled-in default bootargs — recent OpenIPC
+    builds default to squashfs+ubiblock, which kernel-panics with
+    "Unable to mount root fs" when the actual rootfs volume contains
+    UBIFS.  Always set bootargs explicitly to match what we wrote.
+
+    The mtdparts substring must agree with the layout we set in U-Boot
+    (1M boot, 1M env, 8M kernel, rest UBI) so ``ubi.mtd=3`` resolves to
+    the right partition.
+    """
+    base = (
+        "mem=256M console=ttyAMA0,115200 panic=20 ubi.mtd=3,2048 "
+        "mtdparts=hinand:1024k(boot),1024k(env),8192k(kernel),-(ubi)"
+    )
+    if rootfs_is_ubi:
+        return f"root=ubi0:rootfs rootfstype=ubifs {base}"
+    # Squashfs on a UBI block device (modern OpenIPC layout)
+    return f"root=/dev/ubiblock0_0 rootfstype=squashfs ubi.block=0,0 init=/init {base}"
+
+
 async def _install_async(
     chip: str,
     firmware_path: str,
@@ -2136,6 +2158,9 @@ async def _install_async(
                     r"setenv bootcmd nand read ${baseaddr} 0x200000 0x800000\; bootm ${baseaddr}",
                     timeout=3.0,
                 )
+                # Match bootargs to actual rootfs format — see _nand_bootargs.
+                bootargs = _nand_bootargs(rootfs_is_ubi=is_ubi_image(rootfs_data))
+                await _cmd(f"setenv bootargs {bootargs}", timeout=3.0)
             else:
                 nor_cmd = "setnor8m" if nor_size < 16 else "setnor16m"
                 if output == "human":

@@ -67,6 +67,7 @@ class RecoverySession:
         on_progress: Callable[[ProgressEvent], None] | None = None,
         on_log: Callable[[LogEvent], None] | None = None,
         send_break: bool = False,
+        max_handshake_attempts: int = 2,
     ) -> RecoveryResult:
         """Execute the full recovery: handshake → firmware transfer.
 
@@ -75,6 +76,9 @@ class RecoverySession:
             on_progress: Callback for progress events.
             on_log: Callback for log events.
             send_break: If True, send Ctrl-C after upload to enter U-Boot console.
+            max_handshake_attempts: Retry the power-cycle + handshake + DDR-init
+                phase up to this many times if the transient handshake fails.
+                Only applies when programmatic power control is configured.
 
         Returns:
             RecoveryResult with success status.
@@ -97,93 +101,153 @@ class RecoverySession:
             isinstance(protocol, HiSiliconStandard) and protocol.uses_frame_blast_handshake
         )
 
-        # Power cycle
-        if self._power and self._poe_port:
-            if on_log:
+        # Retry the transient phase (power-cycle + handshake + DDR init) up
+        # to ``max_handshake_attempts`` times.  Only meaningful when we have
+        # programmatic power control — manual power cycling would require
+        # human re-intervention.
+        can_retry = bool(self._power and self._poe_port)
+        attempts = max_handshake_attempts if can_retry else 1
+
+        firmware = self._load_firmware()
+        handshake: HandshakeResult | None = None
+        last_attempt_error: str | None = None
+
+        for attempt in range(1, attempts + 1):
+            if attempt > 1 and on_log:
                 on_log(LogEvent(
-                    level="info",
-                    message=f"Power-cycling device on {self._poe_port}...",
-                ))
-            if on_progress:
-                on_progress(ProgressEvent(
-                    stage=Stage.POWER_CYCLE, bytes_sent=0, bytes_total=1,
-                    message=f"Power-cycling {self._poe_port}...",
+                    level="warn",
+                    message=(
+                        f"Retrying handshake (attempt {attempt}/{attempts}) — "
+                        f"previous error: {last_attempt_error}"
+                    ),
                 ))
 
-            try:
-                await self._power.power_cycle(self._poe_port)
-            except Exception as e:
-                elapsed = (time.monotonic() - start_time) * 1000
+            # Power cycle
+            if self._power and self._poe_port:
                 if on_log:
-                    on_log(LogEvent(level="error", message=f"Power cycle failed: {e}"))
-                return RecoveryResult(
-                    success=False,
-                    error=f"Power cycle failed: {e}",
-                    elapsed_ms=elapsed,
+                    on_log(LogEvent(
+                        level="info",
+                        message=f"Power-cycling device on {self._poe_port}...",
+                    ))
+                if on_progress:
+                    on_progress(ProgressEvent(
+                        stage=Stage.POWER_CYCLE, bytes_sent=0, bytes_total=1,
+                        message=f"Power-cycling {self._poe_port}...",
+                    ))
+
+                try:
+                    await self._power.power_cycle(self._poe_port)
+                except Exception as e:
+                    elapsed = (time.monotonic() - start_time) * 1000
+                    if on_log:
+                        on_log(LogEvent(level="error", message=f"Power cycle failed: {e}"))
+                    return RecoveryResult(
+                        success=False,
+                        error=f"Power cycle failed: {e}",
+                        elapsed_ms=elapsed,
+                    )
+
+                # Drain serial until line stays quiet for 500ms.  Replaces a
+                # fixed 2-second sleep + flush_input — that approach can miss
+                # late-arriving stale bytes (the camera may still be powering
+                # down when the flush runs) and isn't robust against pyserial
+                # buffer caveats.  Quiet-detection is deterministic: a
+                # powered-off chip cannot transmit.
+                discarded = await transport.drain_until_silent(
+                    quiet_period=0.5, max_wait=5.0,
                 )
+                if discarded and on_log:
+                    on_log(LogEvent(
+                        level="info",
+                        message=f"Drained {discarded} stale bytes from serial",
+                    ))
 
-            # Wait for power to actually be cut, then flush any warm-reboot
-            # garbage from the serial buffer.
-            import asyncio
-            await asyncio.sleep(2.0)
-            await transport.flush_input()
+                if on_progress:
+                    on_progress(ProgressEvent(
+                        stage=Stage.POWER_CYCLE, bytes_sent=1, bytes_total=1,
+                        message="Power cycle complete",
+                    ))
 
-            if on_progress:
-                on_progress(ProgressEvent(
-                    stage=Stage.POWER_CYCLE, bytes_sent=1, bytes_total=1,
-                    message="Power cycle complete",
-                ))
+            # Handshake — skip for frame-blast chips (handled inside send_firmware)
+            if frame_blast:
+                if on_log:
+                    on_log(LogEvent(
+                        level="info",
+                        message=f"Using sendFrameForStart handshake for {self.chip}",
+                    ))
+                handshake = HandshakeResult(success=True, message="Frame-blast (deferred)")
+            elif self._power and self._poe_port:
+                # Power-cycle mode with 0x20→0xAA handshake: flood 0xAA
+                if on_log:
+                    on_log(LogEvent(
+                        level="info",
+                        message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
+                    ))
+                import asyncio as _asyncio
+                handshake_task = _asyncio.create_task(
+                    protocol.handshake(transport, on_progress)
+                )
+                handshake = await handshake_task
+            else:
+                # Manual power cycling — just start handshake and wait
+                if on_log:
+                    on_log(LogEvent(
+                        level="info",
+                        message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
+                    ))
+                handshake = await protocol.handshake(transport, on_progress)
 
-        # Handshake — skip for frame-blast chips (handled inside send_firmware)
-        if frame_blast:
+            # If non-frame-blast handshake failed and we can retry, try again
+            if not handshake.success:
+                last_attempt_error = f"handshake: {handshake.message}"
+                if attempt < attempts:
+                    continue
+                break
+
+            # Handshake OK (or deferred for frame-blast).  Send firmware.
             if on_log:
                 on_log(LogEvent(
                     level="info",
-                    message=f"Using sendFrameForStart handshake for {self.chip}",
+                    message=f"Sending {len(firmware)} bytes of firmware...",
                 ))
-            handshake = HandshakeResult(success=True, message="Frame-blast (deferred)")
-        elif self._power and self._poe_port:
-            # Power-cycle mode with 0x20→0xAA handshake: flood 0xAA
-            if on_log:
-                on_log(LogEvent(
-                    level="info",
-                    message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
-                ))
-            import asyncio
-            handshake_task = asyncio.create_task(
-                protocol.handshake(transport, on_progress)
+            send_result = await protocol.send_firmware(
+                transport, firmware, on_progress,
             )
-            handshake = await handshake_task
+            if send_result.success:
+                # Mutate handshake variable so post-loop code sees success.
+                handshake_succeeded_result = send_result
+                break
+
+            # Firmware send failed — only retry if it failed in the early
+            # handshake/DDR phase (frame-blast handshake or DDR init).
+            # Once we're past DDR init, retrying is unlikely to help and
+            # costs another 30+ seconds of upload time.
+            err = send_result.error or ""
+            is_early = (
+                Stage.DDR_INIT not in send_result.stages_completed
+            )
+            if is_early and attempt < attempts:
+                last_attempt_error = err
+                continue
+
+            # Either past-DDR failure or final attempt — bail out.
+            handshake_succeeded_result = send_result
+            break
         else:
-            # Manual power cycling — just start handshake and wait
-            if on_log:
-                on_log(LogEvent(
-                    level="info",
-                    message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
-                ))
-            handshake = await protocol.handshake(transport, on_progress)
-        if not handshake.success:
+            # Loop completed without break — all retries exhausted on handshake
             elapsed = (time.monotonic() - start_time) * 1000
             if on_log:
-                on_log(LogEvent(level="error", message=f"Handshake failed: {handshake.message}"))
+                on_log(LogEvent(
+                    level="error",
+                    message=f"Handshake failed after {attempts} attempts: {last_attempt_error}",
+                ))
             return RecoveryResult(
                 success=False,
-                error=f"Handshake failed: {handshake.message}",
+                error=f"Handshake failed: {last_attempt_error}",
                 elapsed_ms=elapsed,
             )
 
-        # Note: handshake success is already reported via on_progress,
-        # so we don't duplicate it here via on_log.
-
-        # Firmware transfer
-        firmware = self._load_firmware()
-        if on_log:
-            on_log(LogEvent(
-                level="info",
-                message=f"Sending {len(firmware)} bytes of firmware...",
-            ))
-
-        result = await protocol.send_firmware(transport, firmware, on_progress)
+        result = handshake_succeeded_result
         result.elapsed_ms = (time.monotonic() - start_time) * 1000
 
         # Send break (Ctrl-C) to interrupt U-Boot autoboot
