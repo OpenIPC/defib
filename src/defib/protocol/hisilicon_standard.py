@@ -128,10 +128,15 @@ class HiSiliconStandard(BootProtocol):
         ever_saw_data = False
         counter = 0
         total_markers = 0
+        # Write a chunk per iteration in flooding mode — at 115200 baud the
+        # UART can only clock ~11.5 KB/s, so a 64-byte burst keeps roughly
+        # 5 ms of 0xAA on the wire continuously and saturates the bootrom's
+        # ~100 ms catch window even with TCP/RFC 2217 round-trip latency.
+        BURST = b"\xaa" * 64
 
         while True:
             if flooding:
-                await transport.write(BOOTMODE_ACK)
+                await transport.write(BURST)
 
             try:
                 byte = await transport.read(1, timeout=0.05 if flooding else 1.0)

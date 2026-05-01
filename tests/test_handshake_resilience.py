@@ -257,6 +257,15 @@ class _ScriptedTransport(MockTransport):
         return 0
 
 
+async def _fake_handshake_ok(self, transport, on_progress=None):  # noqa: ARG001
+    """Stand-in for ``HiSiliconStandard.handshake`` used by tests that
+    exercise session orchestration (retries, attempt counting) rather
+    than the marker-detection protocol itself.  Returns success
+    immediately so the session moves on to ``send_firmware``."""
+    from defib.recovery.events import HandshakeResult
+    return HandshakeResult(success=True, message="ok")
+
+
 @pytest.mark.asyncio
 async def test_session_retries_handshake_on_transient_failure(monkeypatch):
     """When DDR-init fails on the first attempt but succeeds on the second,
@@ -284,6 +293,10 @@ async def test_session_retries_handshake_on_transient_failure(monkeypatch):
     monkeypatch.setattr(
         HiSiliconStandard, "send_firmware", scripted_send_firmware,
     )
+    # Frame-blast chips with power control go through ``handshake()``
+    # since the marker-handshake refactor; stub it out so the test
+    # focuses on the retry-loop semantics rather than the protocol.
+    monkeypatch.setattr(HiSiliconStandard, "handshake", _fake_handshake_ok)
 
     session = RecoverySession(
         chip="hi3516av200",
@@ -329,6 +342,7 @@ async def test_session_does_not_retry_post_ddr_failures(monkeypatch):
     monkeypatch.setattr(
         HiSiliconStandard, "send_firmware", post_ddr_failure,
     )
+    monkeypatch.setattr(HiSiliconStandard, "handshake", _fake_handshake_ok)
 
     session = RecoverySession(
         chip="hi3516av200",
@@ -401,6 +415,7 @@ async def test_session_max_attempts_respected(monkeypatch):
         )
 
     monkeypatch.setattr(HiSiliconStandard, "send_firmware", always_fail)
+    monkeypatch.setattr(HiSiliconStandard, "handshake", _fake_handshake_ok)
 
     session = RecoverySession(
         chip="hi3516av200",

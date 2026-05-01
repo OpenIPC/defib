@@ -118,12 +118,16 @@ Handles both `tftpboot` and `tftp` U-Boot commands transparently.
 - macOS serial workaround (ACK byte correction)
 - Cross-platform: Linux, macOS, Windows
 
-## Automated Power Cycling (PoE)
+## Automated Power Cycling
 
-Defib can automatically power-cycle devices via a MikroTik PoE switch,
-eliminating manual intervention for recovery loops and research workflows.
+Defib can automatically power-cycle devices, eliminating manual intervention
+for recovery loops and research workflows.  Two backends are supported,
+selected via `DEFIB_POWER_TYPE`:
+
+### MikroTik RouterOS PoE switch (default)
 
 ```bash
+export DEFIB_POWER_TYPE=routeros           # optional, the default
 export DEFIB_POE_HOST=192.168.88.1
 export DEFIB_POE_USER=admin
 export DEFIB_POE_PASS=
@@ -133,6 +137,50 @@ defib burn -c hi3516ev300 -p /dev/uart-IVG85HG50PYA-S --power-cycle -b
 # Burn and open serial terminal to see boot output (Ctrl-C to exit)
 defib burn -c hi3516ev300 -p /dev/uart-IVG85HG50PYA-S --power-cycle -t
 ```
+
+### OpenIPC Vectis UART bridge
+
+[Vectis](https://github.com/OpenIPC/vectis) is a USB/Ethernet UART bridge
+that exposes the camera's UART over TCP and drives camera power via the
+bridge's RTS/DTR lines.  Vectis ≥ 1.2.0 speaks [RFC 2217][rfc2217] (Telnet
+COM Port Control Option) on the listener: the data path is binary safe
+and modem-control lines are commanded out-of-band as `SET-CONTROL`
+sub-options instead of in-band magic bytes.  Defib uses the same TCP
+connection for the UART and the reset:
+
+[rfc2217]: https://datatracker.ietf.org/doc/html/rfc2217
+
+```bash
+export DEFIB_POWER_TYPE=vectis
+export DEFIB_VECTIS_HOST=172.17.32.17
+export DEFIB_VECTIS_PORT=35240             # optional, the upstream default
+
+defib burn -c hi3516cv300 -p rfc2217://172.17.32.17:35240 --power-cycle -b
+```
+
+The `rfc2217://` URL scheme routes the UART through pyserial's RFC 2217
+client (which handles RFC 854 escaping for `0xFF` and the `SET-CONTROL`
+DTR/RTS pulse for reset).  An older Vectis without RFC 2217 support is
+still reachable via the legacy `tcp://host:port` URL and the in-band
+`Ctrl+P` reset trigger.
+
+Smoke-test the bridge first with `telnet` (which negotiates RFC 2217)
+or with `socat` (which stays in legacy raw mode):
+
+```bash
+telnet 172.17.32.17 35240
+# Or, legacy raw mode:
+socat -,raw,echo=0 TCP:172.17.32.17:35240
+```
+
+> Note: Vectis only emits a fixed-width reset pulse, so it does not
+> work with `defib restore` (which needs independent
+> `power_off`/`power_on`).
+>
+> Note: tight-loop bootrom catching needs a low-RTT link to Vectis.
+> Over a high-RTT WAN link the bootrom's `0x20`-marker / `0xAA`-ack
+> window can close before the round-trip completes; running Vectis
+> on the same host as defib (or close to it on a LAN) is recommended.
 
 The `-t` flag auto-detects the post-boot mode:
 - **Normal U-Boot shell** (e.g. hi3516ev300): raw terminal passthrough — type commands directly

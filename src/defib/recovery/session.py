@@ -104,8 +104,10 @@ class RecoverySession:
         # Retry the transient phase (power-cycle + handshake + DDR init) up
         # to ``max_handshake_attempts`` times.  Only meaningful when we have
         # programmatic power control — manual power cycling would require
-        # human re-intervention.
-        can_retry = bool(self._power and self._poe_port)
+        # human re-intervention.  Some controllers (e.g. Vectis) don't have
+        # a notion of named ports, so we treat any non-None ``poe_port``
+        # (including the empty string) as "automated power available".
+        can_retry = self._power is not None and self._poe_port is not None
         attempts = max_handshake_attempts if can_retry else 1
 
         firmware = self._load_firmware()
@@ -123,16 +125,17 @@ class RecoverySession:
                 ))
 
             # Power cycle
-            if self._power and self._poe_port:
+            if self._power is not None and self._poe_port is not None:
+                label = self._poe_port or self._power.name()
                 if on_log:
                     on_log(LogEvent(
                         level="info",
-                        message=f"Power-cycling device on {self._poe_port}...",
+                        message=f"Power-cycling device on {label}...",
                     ))
                 if on_progress:
                     on_progress(ProgressEvent(
                         stage=Stage.POWER_CYCLE, bytes_sent=0, bytes_total=1,
-                        message=f"Power-cycling {self._poe_port}...",
+                        message=f"Power-cycling {label}...",
                     ))
 
                 try:
@@ -147,20 +150,22 @@ class RecoverySession:
                         elapsed_ms=elapsed,
                     )
 
-                # Drain serial until line stays quiet for 500ms.  Replaces a
-                # fixed 2-second sleep + flush_input — that approach can miss
-                # late-arriving stale bytes (the camera may still be powering
-                # down when the flush runs) and isn't robust against pyserial
-                # buffer caveats.  Quiet-detection is deterministic: a
-                # powered-off chip cannot transmit.
-                discarded = await transport.drain_until_silent(
-                    quiet_period=0.5, max_wait=5.0,
-                )
-                if discarded and on_log:
-                    on_log(LogEvent(
-                        level="info",
-                        message=f"Drained {discarded} stale bytes from serial",
-                    ))
+                # Drain stale bytes — but skip on frame-blast chips because
+                # the bootrom emits the 0x20 markers we need to catch
+                # within ~tens of ms of reset.  The marker-based handshake
+                # below filters non-marker bytes itself, so a separate
+                # quiet-line drain just eats the catch window.
+                if frame_blast:
+                    await transport.flush_input()
+                else:
+                    discarded = await transport.drain_until_silent(
+                        quiet_period=0.5, max_wait=5.0,
+                    )
+                    if discarded and on_log:
+                        on_log(LogEvent(
+                            level="info",
+                            message=f"Drained {discarded} stale bytes from serial",
+                        ))
 
                 if on_progress:
                     on_progress(ProgressEvent(
@@ -168,15 +173,35 @@ class RecoverySession:
                         message="Power cycle complete",
                     ))
 
-            # Handshake — skip for frame-blast chips (handled inside send_firmware)
-            if frame_blast:
+            # Handshake.  Frame-blast chips (e.g. hi3516cv300) historically
+            # skipped this and relied on send_firmware's HEAD-blast, but
+            # that approach catches U-Boot's character echo on healthy
+            # boards: the camera autoboots, U-Boot echoes our 0xAA back,
+            # and the protocol mistakes the echo for a bootrom ACK.  The
+            # marker-based handshake (with continuous_ack flooding 0xAA)
+            # is strictly more robust because it requires actually seeing
+            # the bootrom's 0x20 markers as proof of download mode.
+            if frame_blast and self._power is not None and self._poe_port is not None:
+                if on_log:
+                    on_log(LogEvent(
+                        level="info",
+                        message=f"Listening for 0x20 markers + flooding 0xAA for {self.chip}",
+                    ))
+                import asyncio as _asyncio
+                handshake_task = _asyncio.create_task(
+                    protocol.handshake(transport, on_progress)
+                )
+                handshake = await handshake_task
+            elif frame_blast:
+                # No power control — fall back to deferred frame-blast
+                # inside send_firmware (manual reset path).
                 if on_log:
                     on_log(LogEvent(
                         level="info",
                         message=f"Using sendFrameForStart handshake for {self.chip}",
                     ))
                 handshake = HandshakeResult(success=True, message="Frame-blast (deferred)")
-            elif self._power and self._poe_port:
+            elif self._power is not None and self._poe_port is not None:
                 # Power-cycle mode with 0x20→0xAA handshake: flood 0xAA
                 if on_log:
                     on_log(LogEvent(

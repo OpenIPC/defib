@@ -1,10 +1,13 @@
-"""Async Unix socket transport for connecting to QEMU chardev sockets.
+"""Async socket transport for Unix-domain (QEMU) and TCP (Vectis) sockets.
 
-Allows defib to connect to a QEMU instance using:
-    -chardev socket,id=ser0,path=/tmp/sock,server=on,wait=off -serial chardev:ser0
+Two URL schemes are supported via :func:`defib.transport.serial_platform.
+create_transport`:
 
-Usage:
-    defib burn -c hi3516ev300 -p socket:///tmp/sock
+- ``socket:///tmp/sock`` — Unix-domain socket (QEMU chardev sockets).
+- ``tcp://host:port``    — TCP/IP socket (e.g. OpenIPC Vectis UART bridge).
+
+Both share the same non-blocking read/write implementation; only the
+``connect()`` step differs.
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 class SocketTransport(Transport):
-    """Transport over a Unix domain socket (SOCK_STREAM)."""
+    """Transport over a stream socket (AF_UNIX or AF_INET)."""
 
     def __init__(self, conn: sock_mod.socket) -> None:
         self._sock = conn
@@ -37,7 +40,26 @@ class SocketTransport(Transport):
         except OSError as e:
             raise TransportError(f"Failed to connect to socket {path}: {e}") from e
 
-        logger.info("Connected to QEMU socket: %s", path)
+        logger.info("Connected to Unix socket: %s", path)
+        return cls(s)
+
+    @classmethod
+    async def create_tcp(cls, host: str, port: int) -> SocketTransport:
+        """Connect to a TCP socket at host:port."""
+        try:
+            s = sock_mod.socket(sock_mod.AF_INET, sock_mod.SOCK_STREAM)
+            s.setblocking(False)
+            # TCP_NODELAY: small UART-style writes (e.g. single Ctrl+P
+            # byte for Vectis) must not be delayed by Nagle's algorithm.
+            s.setsockopt(sock_mod.IPPROTO_TCP, sock_mod.TCP_NODELAY, 1)
+            loop = asyncio.get_event_loop()
+            await loop.sock_connect(s, (host, port))
+        except OSError as e:
+            raise TransportError(
+                f"Failed to connect to TCP {host}:{port}: {e}"
+            ) from e
+
+        logger.info("Connected to TCP socket: %s:%d", host, port)
         return cls(s)
 
     async def read(self, size: int, timeout: float | None = None) -> bytes:

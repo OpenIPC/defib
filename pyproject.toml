@@ -46,6 +46,7 @@ hisilicon_cv6xx = "defib.protocol.hisilicon_cv6xx:HiSiliconCV6xx"
 
 [project.entry-points."defib.power"]
 routeros = "defib.power.routeros:RouterOSController"
+vectis = "defib.power.vectis:VectisController"
 
 [build-system]
 requires = ["hatchling"]
