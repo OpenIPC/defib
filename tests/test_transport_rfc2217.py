@@ -577,8 +577,11 @@ class TestE2EAgainstFakeServer:
         try:
             sock = t._port._socket
             assert sock is not None
+            # ``getsockopt(TCP_NODELAY)`` returns a non-zero value when
+            # the option is enabled.  Linux reports ``1``, macOS may
+            # report the C ``int`` width (``4``); either is fine.
             opt = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
-            assert opt == 1, "TCP_NODELAY must be enabled on the RFC 2217 socket"
+            assert opt != 0, "TCP_NODELAY must be enabled on the RFC 2217 socket"
         finally:
             await t.close()
 
