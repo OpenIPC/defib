@@ -100,10 +100,11 @@ async def _burn_async(
     power_controller = None
     poe_port = None
     if power_cycle:
+        from defib.power.factory import power_controller_from_env
         from defib.power.routeros import RouterOSController
 
         try:
-            power_controller = RouterOSController.from_env()
+            power_controller = power_controller_from_env()
         except Exception as e:
             if output == "json":
                 print(json_mod.dumps({"event": "error", "message": str(e)}))
@@ -111,24 +112,32 @@ async def _burn_async(
                 console.print(f"[red]Power controller error:[/red] {e}")
             raise typer.Exit(1)
 
-        # Extract device label from serial port name for auto-discovery
-        # e.g. /dev/uart-IVGHP203Y-AF -> IVGHP203Y-AF
-        from pathlib import Path
-        port_basename = Path(port).name
-        device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
+        if isinstance(power_controller, RouterOSController):
+            # Extract device label from serial port name for auto-discovery
+            # e.g. /dev/uart-IVGHP203Y-AF -> IVGHP203Y-AF
+            from pathlib import Path
+            port_basename = Path(port).name
+            device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
 
-        try:
-            poe_port = await power_controller.find_port_by_comment(device_label)
-        except Exception as e:
-            if output == "json":
-                print(json_mod.dumps({"event": "error", "message": str(e)}))
-            else:
-                console.print(f"[red]PoE port discovery failed:[/red] {e}")
-            await power_controller.close()
-            raise typer.Exit(1)
+            try:
+                poe_port = await power_controller.find_port_by_comment(device_label)
+            except Exception as e:
+                if output == "json":
+                    print(json_mod.dumps({"event": "error", "message": str(e)}))
+                else:
+                    console.print(f"[red]PoE port discovery failed:[/red] {e}")
+                await power_controller.close()
+                raise typer.Exit(1)
 
-        if output == "human":
-            console.print(f"PoE control: [cyan]{poe_port}[/cyan] on [cyan]{power_controller._host}[/cyan]")
+            if output == "human":
+                console.print(f"PoE control: [cyan]{poe_port}[/cyan] on [cyan]{power_controller._host}[/cyan]")
+        else:
+            # Vectis (and any future single-port controller) has no port
+            # discovery — pass an empty string so the recovery session
+            # knows automated cycling is available.
+            poe_port = ""
+            if output == "human":
+                console.print(f"Power: [cyan]{power_controller.name()}[/cyan]")
 
     try:
         session = RecoverySession(
@@ -158,6 +167,18 @@ async def _burn_async(
         else:
             console.print(f"[red]Failed to open serial port:[/red] {e}")
         raise typer.Exit(2)
+
+    # Vectis: hand the live RFC 2217 transport (or legacy raw TCP) to
+    # the controller so RTS/DTR toggles ride the same connection that
+    # the UART data uses — Vectis only allows one client at a time.
+    if power_controller is not None:
+        from defib.power.vectis import VectisController
+        from defib.transport.rfc2217 import Rfc2217Transport
+        from defib.transport.socket import SocketTransport
+        if isinstance(power_controller, VectisController) and isinstance(
+            transport, (Rfc2217Transport, SocketTransport)
+        ):
+            power_controller.attach_transport(transport)
 
     # Rich progress bar for human output
     from rich.progress import TaskID
@@ -1827,24 +1848,30 @@ async def _install_async(
     power_controller = None
     poe_port = None
     if power_cycle:
+        from defib.power.factory import power_controller_from_env
         from defib.power.routeros import RouterOSController
         try:
-            power_controller = RouterOSController.from_env()
+            power_controller = power_controller_from_env()
         except Exception as e:
             console.print(f"[red]Power controller error:[/red] {e}")
             raise typer.Exit(1)
 
-        port_basename = Path(port).name
-        device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
-        try:
-            poe_port = await power_controller.find_port_by_comment(device_label)
-        except Exception as e:
-            console.print(f"[red]PoE port discovery failed:[/red] {e}")
-            await power_controller.close()
-            raise typer.Exit(1)
+        if isinstance(power_controller, RouterOSController):
+            port_basename = Path(port).name
+            device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
+            try:
+                poe_port = await power_controller.find_port_by_comment(device_label)
+            except Exception as e:
+                console.print(f"[red]PoE port discovery failed:[/red] {e}")
+                await power_controller.close()
+                raise typer.Exit(1)
 
-        if output == "human":
-            console.print(f"  PoE: [cyan]{poe_port}[/cyan]")
+            if output == "human":
+                console.print(f"  PoE: [cyan]{poe_port}[/cyan]")
+        else:
+            poe_port = ""
+            if output == "human":
+                console.print(f"  Power: [cyan]{power_controller.name()}[/cyan]")
 
     session = RecoverySession(
         chip=chip, firmware_path=str(cached),
@@ -1857,6 +1884,15 @@ async def _install_async(
             console.print("  [yellow]Power-cycle the camera now![/yellow]")
 
     transport = await create_transport(normalize_port_name(port))
+
+    # Vectis: share the TCP transport for Ctrl+P delivery (see burn).
+    if power_controller is not None:
+        from defib.power.vectis import VectisController
+        from defib.transport.socket import SocketTransport
+        if isinstance(power_controller, VectisController) and isinstance(
+            transport, SocketTransport
+        ):
+            power_controller.attach_transport(transport)
 
     def on_log(event: LogEvent) -> None:
         if output == "human":
@@ -2367,11 +2403,25 @@ async def _restore_async(
     power_controller = None
     poe_port = None
     if power_cycle:
+        from defib.power.factory import power_controller_from_env
         from defib.power.routeros import RouterOSController
         try:
-            power_controller = RouterOSController.from_env()
+            power_controller = power_controller_from_env()
         except Exception as e:
             console.print(f"[red]Power controller error:[/red] {e}")
+            raise typer.Exit(1)
+
+        # restore needs independent power_off/power_on (frame-blast flow);
+        # Vectis only emits a fixed pulse and cannot satisfy that.
+        if not isinstance(power_controller, RouterOSController):
+            console.print(
+                f"[red]restore requires a controller that supports independent "
+                f"power_off/power_on; {power_controller.name()!r} only supports "
+                f"power_cycle. Use --power-cycle with DEFIB_POWER_TYPE=routeros, "
+                f"or run restore without --power-cycle and cycle power manually."
+                f"[/red]"
+            )
+            await power_controller.close()
             raise typer.Exit(1)
 
         port_basename = Path(port).name
@@ -2395,6 +2445,9 @@ async def _restore_async(
     # open serial on a quiet line, then let session handle power-on.
     if power_controller and poe_port:
         import asyncio as _aio
+        from defib.power.routeros import RouterOSController
+        # We rejected non-RouterOS controllers above — narrow for mypy.
+        assert isinstance(power_controller, RouterOSController)
         if output == "human":
             console.print("  Powering off...")
         power_controller._saved_poe_out[poe_port] = "forced-on"

@@ -117,10 +117,14 @@ async def create_transport(
     """Create a platform-appropriate transport.
 
     Args:
-        device: Serial port device path (e.g., /dev/ttyUSB0, COM3) or
+        device: Serial port device path (e.g., /dev/ttyUSB0, COM3),
                 Unix socket path with ``socket://`` prefix (e.g.,
-                ``socket:///tmp/qemu.sock``).
-        baudrate: Baud rate (default 115200, ignored for sockets).
+                ``socket:///tmp/qemu.sock``), raw TCP endpoint with
+                ``tcp://`` prefix, or RFC 2217 endpoint with
+                ``rfc2217://`` prefix (recommended for OpenIPC Vectis
+                ≥1.2.0 — binary safe + out-of-band RTS/DTR control).
+        baudrate: Baud rate (default 115200, ignored for non-RFC-2217
+                sockets — for ``rfc2217://`` it is sent during open).
         force_platform: Override platform detection ("linux", "darwin", "win32").
 
     Returns:
@@ -132,6 +136,33 @@ async def create_transport(
         path = device[len("socket://"):]
         logger.info("Using SocketTransport: %s", path)
         return await SocketTransport.create(path)
+
+    # TCP socket transport (raw, no escaping — for non-RFC-2217 bridges
+    # or for compatibility with old Vectis builds without RFC 2217).
+    if device.startswith("tcp://"):
+        from defib.transport.socket import SocketTransport
+        endpoint = device[len("tcp://"):]
+        host, _, port_str = endpoint.rpartition(":")
+        if not host or not port_str:
+            raise TransportError(
+                f"tcp:// transport needs host:port (got '{device}')"
+            )
+        try:
+            port_num = int(port_str)
+        except ValueError as e:
+            raise TransportError(
+                f"tcp:// port is not a number: '{port_str}'"
+            ) from e
+        logger.info("Using TCP SocketTransport: %s:%d", host, port_num)
+        return await SocketTransport.create_tcp(host, port_num)
+
+    # RFC 2217 transport (binary-safe + modem-control sub-options).
+    # Pass the URL through pyserial's rfc2217 backend; baud rate is
+    # negotiated via SET-BAUDRATE during open.  Used by VectisController.
+    if device.startswith("rfc2217://"):
+        from defib.transport.rfc2217 import Rfc2217Transport
+        logger.info("Using RFC 2217 transport: %s", device)
+        return await Rfc2217Transport.create(device, baudrate=baudrate)
 
     platform = force_platform or sys.platform
 
