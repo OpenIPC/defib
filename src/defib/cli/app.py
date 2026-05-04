@@ -1644,7 +1644,7 @@ def install(
     host_ip: str = typer.Option("192.168.1.10", "--host-ip", help="IP to assign to host NIC for TFTP"),
     device_ip: str = typer.Option("192.168.1.20", "--device-ip", help="IP for camera in U-Boot"),
     tftp_port: int = typer.Option(69, "--tftp-port", help="TFTP server port"),
-    nor_size: int = typer.Option(8, "--nor-size", help="NOR flash size in MB (8 or 16)"),
+    nor_size: int = typer.Option(8, "--nor-size", help="NOR flash size in MB (8, 16, or 32)"),
     nand: bool = typer.Option(False, "--nand", help="Use NAND flash instead of NOR"),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
@@ -1676,6 +1676,16 @@ _NOR16M_LAYOUT = {
     "env":         (0x040000, 0x10000),   # 64KB
     "kernel":      (0x050000, 0x300000),  # 3MB
     "rootfs":      (0x350000, 0xA00000),  # 10240KB
+}
+
+# 32MB NOR flash layout — OpenIPC U-Boot has no setnor32m env var, so we
+# send mtdparts directly. Pattern continues 8m/16m: same boot/env/kernel
+# offsets, larger rootfs to use the extra space.
+_NOR32M_LAYOUT = {
+    "boot":        (0x000000, 0x40000),   # 256KB
+    "env":         (0x040000, 0x10000),   # 64KB
+    "kernel":      (0x050000, 0x300000),  # 3MB
+    "rootfs":      (0x350000, 0x1800000), # 24MB
 }
 
 # NAND flash layout: 1M(boot),1M(env),8M(kernel),-(ubi)
@@ -1753,7 +1763,12 @@ async def _install_async(
         flash_cmd = "nand"
         flash_label = "NAND"
     else:
-        layout = _NOR16M_LAYOUT if nor_size >= 16 else _NOR8M_LAYOUT
+        if nor_size >= 32:
+            layout = _NOR32M_LAYOUT
+        elif nor_size >= 16:
+            layout = _NOR16M_LAYOUT
+        else:
+            layout = _NOR8M_LAYOUT
         flash_cmd = "sf"
         flash_label = f"NOR {nor_size}MB"
 
@@ -2198,13 +2213,19 @@ async def _install_async(
                 bootargs = _nand_bootargs(rootfs_is_ubi=is_ubi_image(rootfs_data))
                 await _cmd(f"setenv bootargs {bootargs}", timeout=3.0)
             else:
-                nor_cmd = "setnor8m" if nor_size < 16 else "setnor16m"
                 if output == "human":
-                    console.print(f"\n  [bold]Setting boot environment[/bold] (run {nor_cmd})")
-                # setnor8m does: set mtdparts, set bootcmd, saveenv, reset
-                # We do it manually to avoid the auto-reset
-                mtdparts_var = f"mtdpartsnor{nor_size}m"
-                await _cmd(f"run {mtdparts_var}", timeout=3.0)
+                    console.print("\n  [bold]Setting boot environment[/bold]")
+                # OpenIPC U-Boot defines mtdpartsnor{8,16}m env vars but
+                # not 32m — for 32MB, send the raw mtdparts string.
+                if nor_size >= 32:
+                    mtdparts = (
+                        "hi_sfc:256k(boot),64k(env),3072k(kernel),"
+                        "24576k(rootfs),-(rootfs_data)"
+                    )
+                    await _cmd(f"setenv mtdparts {mtdparts}", timeout=3.0)
+                else:
+                    mtdparts_var = f"mtdpartsnor{nor_size}m"
+                    await _cmd(f"run {mtdparts_var}", timeout=3.0)
                 await _cmd("setenv bootcmd ${bootcmdnor}", timeout=3.0)
             resp = await _cmd("saveenv", timeout=10.0)
             if output == "human":

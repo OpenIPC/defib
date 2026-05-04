@@ -8,6 +8,7 @@ from defib.protocol.crc import ACK_BYTE
 from defib.protocol.hisilicon_standard import HiSiliconStandard
 from defib.profiles.loader import load_profile
 from defib.recovery.events import Stage
+from defib.transport.base import TransportTimeout
 from defib.transport.mock import MockTransport
 
 PROFILES_DIR = __import__("pathlib").Path(__file__).parent.parent / "src" / "defib" / "profiles" / "data"
@@ -286,3 +287,181 @@ class TestStandardFirmwareTransfer:
         assert Stage.UBOOT in result.stages_completed
         assert Stage.COMPLETE in result.stages_completed
         assert len(progress_events) > 0
+
+
+class TestDetectSplSize:
+    """Regression tests for _detect_spl_size — see PR #55 + gzip-detection fix.
+
+    Bug history:
+      - PR #55 added LZMA-header detection so SVB-enabled av200 SPL (>profile_max)
+        wasn't truncated. Used max(detected, profile_max).
+      - hi3516av300 OpenIPC builds use gzip (not LZMA) for the embedded U-Boot
+        and the SPL is more compact than HiTool's reference. With max(), defib
+        sent profile_max (24KB) which overshoots the 21KB code into bootrom RAM
+        and hangs the SPL transfer mid-chunk.
+      - Fix: also detect gzip; trust the detected boundary regardless of
+        profile_max; round DOWN to 1KB so we never spill into compressed bytes.
+    """
+
+    @staticmethod
+    def _detect(firmware: bytes, profile_max: int = 0x6000) -> int:
+        return HiSiliconStandard._detect_spl_size(firmware, profile_max)
+
+    def test_gzip_header_detected_below_profile_max(self):
+        # Real av300 layout: gzip at 0x52F0 inside a profile_max=0x6000 window.
+        firmware = bytes(0x52F0) + b"\x1f\x8b\x08" + b"\x00" * 100
+        # Round DOWN to 1 KB — never include any byte of the gzip payload.
+        assert self._detect(firmware, profile_max=0x6000) == 0x5000
+
+    def test_gzip_header_above_profile_max(self):
+        firmware = bytes(0x6800) + b"\x1f\x8b\x08" + b"\x00" * 100
+        assert self._detect(firmware, profile_max=0x6000) == 0x6800
+
+    def test_lzma_header_detected_below_profile_max(self):
+        # 0x5D + dict_size 0x10000 (64K) is a valid LZMA header.
+        firmware = bytes(0x5400) + b"\x5d\x00\x00\x01\x00" + b"\x00" * 100
+        assert self._detect(firmware, profile_max=0x6000) == 0x5400
+
+    def test_lzma_header_rounds_down(self):
+        # Header at 0x53F0 rounds DOWN to 0x5000 (not up to 0x5400).
+        firmware = bytes(0x53F0) + b"\x5d\x00\x00\x01\x00" + b"\x00" * 100
+        assert self._detect(firmware, profile_max=0x6000) == 0x5000
+
+    def test_lzma_invalid_dict_size_ignored(self):
+        # 0x5D followed by garbage dict size is not a real LZMA header.
+        firmware = bytes(0x5400) + b"\x5d\xff\xff\xff\xff" + b"\x00" * 100
+        # Falls through to profile_max because no valid marker found.
+        assert self._detect(firmware, profile_max=0x6000) == 0x6000
+
+    def test_no_marker_falls_back_to_profile_max(self):
+        firmware = b"\xa5" * 0x10000
+        assert self._detect(firmware, profile_max=0x6000) == 0x6000
+
+    def test_marker_before_search_window_ignored(self):
+        # The scan starts at 0x4000 — markers in the .reg region don't count.
+        firmware = bytes(0x100) + b"\x1f\x8b\x08" + bytes(0x6000)
+        assert self._detect(firmware, profile_max=0x6000) == 0x6000
+
+
+class TestZeroLongFfRuns:
+    """Regression tests for _zero_long_ff_runs.
+
+    The hi3516cv500-family bootrom hangs mid-DATA frame when payload contains
+    >=12 consecutive 0xFF bytes (likely a UART RX-path quirk in the bootrom).
+    These runs only appear as inert padding between SPL code and the
+    compressed U-Boot payload, so zeroing them is safe.
+    """
+
+    @staticmethod
+    def _zero(firmware: bytes, threshold: int = 12) -> bytes:
+        return HiSiliconStandard._zero_long_ff_runs(firmware, threshold)
+
+    def test_run_at_threshold_is_zeroed(self):
+        firmware = b"\xaa" + b"\xff" * 12 + b"\xbb"
+        out = self._zero(firmware)
+        assert out == b"\xaa" + b"\x00" * 12 + b"\xbb"
+
+    def test_run_below_threshold_preserved(self):
+        firmware = b"\xaa" + b"\xff" * 11 + b"\xbb"
+        assert self._zero(firmware) == firmware
+
+    def test_run_at_end_of_buffer_zeroed(self):
+        firmware = b"\xaa" + b"\xff" * 16
+        out = self._zero(firmware)
+        assert out == b"\xaa" + b"\x00" * 16
+
+    def test_no_runs_returns_unchanged(self):
+        firmware = bytes(range(256)) * 4
+        assert self._zero(firmware) is firmware  # short-circuits, no copy
+
+    def test_multiple_runs_all_zeroed(self):
+        firmware = b"\xff" * 12 + b"\xaa" + b"\xff" * 13 + b"\xbb"
+        out = self._zero(firmware)
+        assert out == b"\x00" * 12 + b"\xaa" + b"\x00" * 13 + b"\xbb"
+
+    def test_av300_padding_pattern(self):
+        # The exact pattern from hi3516av300 u-boot.bin at offset 0x52E0:
+        # 4 SPL bytes, 12 0xFF padding, gzip header.
+        firmware = bytes([0x04, 0x00, 0x02, 0x12]) + b"\xff" * 12 + b"\x1f\x8b\x08"
+        out = self._zero(firmware)
+        assert out == bytes([0x04, 0x00, 0x02, 0x12]) + b"\x00" * 12 + b"\x1f\x8b\x08"
+
+
+class TestSplTailNonFatalForFrameBlast:
+    """Regression test for av200/av300 SPL TAIL handling.
+
+    On chips with PRESTEP0 (frame-blast handshake), the SPL detaches the
+    bootrom protocol handler as soon as it has received all declared bytes,
+    so the TAIL frame is never ACKed. Treating that as fatal stalls the
+    install at SPL completion. (Mirrors the existing U-Boot TAIL behavior.)
+    """
+
+    @pytest.mark.asyncio
+    async def test_spl_tail_no_ack_succeeds_for_av300(self):
+        transport = MockTransport(flush_clears_buffer=False)
+        profile = load_profile("hi3516av300", PROFILES_DIR)
+        protocol = HiSiliconStandard()
+        protocol.set_profile(profile)
+
+        # av300 profile_max is 0x6000 = 24576 bytes = 24 chunks of 1024.
+        # No marker in zeros, so _detect_spl_size falls back to profile_max.
+        firmware = b"\x00" * profile.spl_max_size
+        spl_chunks = (profile.spl_max_size + 1023) // 1024
+
+        # ACKs for SPL HEAD + chunks. Deliberately NO ACK for TAIL —
+        # TAIL retries time out, then fall through (because prestep_data is set).
+        transport.enqueue_rx(ACK_BYTE * (1 + spl_chunks))
+
+        ok = await protocol._send_spl(transport, firmware, profile)
+        assert ok, "av300 SPL must succeed even without TAIL ACK"
+
+    @pytest.mark.asyncio
+    async def test_spl_tail_no_ack_fails_for_chip_without_prestep(self):
+        # On chips WITHOUT prestep_data, TAIL ACK is required — verify the
+        # legacy strict behavior is preserved.
+        transport = MockTransport(flush_clears_buffer=False)
+        profile = load_profile("gk7201v300", PROFILES_DIR)  # no PRESTEP0
+        assert profile.prestep_data is None
+        protocol = HiSiliconStandard()
+        protocol.set_profile(profile)
+
+        firmware = b"\x00" * profile.spl_max_size
+        spl_chunks = (profile.spl_max_size + 1023) // 1024
+        # ACKs for HEAD + chunks, no TAIL ACK.
+        transport.enqueue_rx(ACK_BYTE * (1 + spl_chunks))
+
+        ok = await protocol._send_spl(transport, firmware, profile)
+        assert not ok, "chips without prestep_data must still treat SPL TAIL as fatal"
+
+
+class TestWriteTimeoutRetry:
+    """Regression test for write-timeout handling in _send_frame_with_retry.
+
+    Previously, transport.write() blocked outside the try/except, so a hung
+    write (e.g. PL2303 TX buffer not draining) would propagate a raw
+    TransportTimeout up to the caller — bypassing the retry loop entirely.
+    Now the write is inside the try block: a transient write failure is
+    treated like an ACK timeout and retried.
+    """
+
+    @pytest.mark.asyncio
+    async def test_transient_write_timeout_is_retried(self):
+        class FlakeyTransport(MockTransport):
+            """Times out the first N writes, then behaves normally."""
+            def __init__(self, fail_writes: int) -> None:
+                super().__init__(flush_clears_buffer=False)
+                self._remaining_failures = fail_writes
+
+            async def write(self, data: bytes) -> None:
+                if self._remaining_failures > 0:
+                    self._remaining_failures -= 1
+                    raise TransportTimeout("simulated write hang")
+                await super().write(data)
+
+        transport = FlakeyTransport(fail_writes=2)
+        transport.enqueue_rx(ACK_BYTE)
+
+        protocol = HiSiliconStandard()
+        # _send_head goes through _send_frame_with_retry.
+        ok = await protocol._send_head(transport, length=64, address=0x04017000)
+        assert ok, "retry loop must recover from transient write timeouts"

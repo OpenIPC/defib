@@ -82,9 +82,25 @@ class SerialTransport(Transport):
             self._port.timeout = old_timeout
 
     async def write(self, data: bytes) -> None:
-        await asyncio.get_event_loop().run_in_executor(
-            None, self._port.write, data
-        )
+        # Pyserial honours write_timeout inside Serial.write(), so the worker
+        # thread actually returns instead of blocking in pselect6 forever.
+        # asyncio.wait_for can't help here — cancelling a run_in_executor
+        # future leaves the underlying thread still blocked.
+        # 5s ceiling: a 1KB write at 115200 baud is ~89ms; >5s means the
+        # kernel TX buffer isn't draining (USB-serial hung, flow control,
+        # cable unplugged).
+        old_wt = self._port.write_timeout
+        self._port.write_timeout = 5.0
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._port.write, data
+            )
+        except serial.SerialTimeoutException as exc:
+            raise TransportTimeout(
+                f"Write timeout (5.0s, {len(data)} bytes)"
+            ) from exc
+        finally:
+            self._port.write_timeout = old_wt
 
     async def flush_input(self) -> None:
         self._port.reset_input_buffer()
