@@ -195,8 +195,8 @@ class HiSiliconStandard(BootProtocol):
         for attempt in range(retries):
             await transport.flush_input()
             await transport.flush_output()
-            await transport.write(frame_data)
             try:
+                await transport.write(frame_data)
                 ack = await transport.read(1, timeout=timeout)
                 if ack == ACK_BYTE:
                     logger.debug("TX %s ACKed (attempt %d/%d)", label, attempt + 1, retries)
@@ -394,28 +394,38 @@ class HiSiliconStandard(BootProtocol):
         """Detect actual SPL code size from firmware binary.
 
         HiSilicon mini-boot layout: vector table + .reg + executable code +
-        LZMA-compressed U-Boot payload.  The SPL only needs the code region.
-        If the code is larger than the profile default (e.g. when SVB is
-        enabled), use the actual size so the bootrom receives all of it.
+        compressed U-Boot payload (LZMA or gzip, depending on the build).
+        The SPL only needs the code region — bytes past the compressed
+        payload boundary land in SRAM that the bootrom uses for its own
+        stack/state, so writing them corrupts the bootrom.
+
+        When a compressed-payload boundary is found we trust it absolutely
+        and use it instead of profile_max — even if it's smaller. profile_max
+        comes from HiTool's reference SPL which fills the full window; an
+        OpenIPC build that's more compact must NOT be padded to that size.
         """
-        # Search for LZMA header (0x5D + 4-byte LE dictionary size) after
-        # the .reg region.  Common dict sizes: 64K, 128K, 256K, 512K, 1M, 8M.
-        VALID_DICT_SIZES = {
-            1 << n for n in range(16, 25)  # 64K .. 16M
-        }
+        # LZMA: 0x5D + 4-byte LE dictionary size (64K..16M)
+        VALID_LZMA_DICT = {1 << n for n in range(16, 25)}
+        # gzip: 1f 8b 08 (deflate method)
         for i in range(0x4000, min(len(firmware), 0x10000)):
-            if firmware[i] == 0x5D:
+            b = firmware[i]
+            detected: int | None = None
+            if b == 0x5D:
                 ds = int.from_bytes(firmware[i + 1 : i + 5], "little")
-                if ds in VALID_DICT_SIZES:
-                    # Round up to 1 KB boundary
-                    detected = (i + 0x3FF) & ~0x3FF
-                    if detected > profile_max:
-                        logger.info(
-                            "SPL code extends to 0x%X (%d bytes), "
-                            "profile default was 0x%X (%d bytes)",
-                            detected, detected, profile_max, profile_max,
-                        )
-                    return max(detected, profile_max)
+                if ds in VALID_LZMA_DICT:
+                    detected = i & ~0x3FF
+                    label = "LZMA"
+            elif b == 0x1F and firmware[i + 1] == 0x8B and firmware[i + 2] == 0x08:
+                detected = i & ~0x3FF
+                label = "gzip"
+            if detected is not None:
+                if detected != profile_max:
+                    logger.info(
+                        "SPL boundary detected (%s) at 0x%X (%d bytes); "
+                        "profile default was 0x%X (%d bytes)",
+                        label, detected, detected, profile_max, profile_max,
+                    )
+                return detected
         return profile_max
 
     async def _send_spl(
@@ -457,7 +467,11 @@ class HiSiliconStandard(BootProtocol):
             ))
 
         if not await self._send_tail(transport, len(chunks) + 1):
-            return False
+            # av200/av300 SPL detaches the bootrom protocol handler as
+            # soon as all declared bytes arrive — no TAIL ACK is sent.
+            if profile.prestep_data is None:
+                return False
+            logger.debug("SPL TAIL not ACKed (non-fatal for av200/av300, all data sent)")
 
         # DDR training delay: HiTool sleeps 300ms after SPL transfer.
         # Always apply — the SPL runs DDR training which needs time.
@@ -471,6 +485,38 @@ class HiSiliconStandard(BootProtocol):
         ))
         return True
 
+    @staticmethod
+    def _zero_long_ff_runs(firmware: bytes, threshold: int = 12) -> bytes:
+        """Zero out long runs of 0xFF bytes.
+
+        The hi3516cv500-family bootrom (av300, dv300, cv500) hangs mid-DATA
+        frame when the payload contains >=12 consecutive 0xFF bytes — almost
+        certainly a quirk in the bootrom's UART receive path.  These runs
+        only appear as inert padding between SPL code and the compressed
+        U-Boot payload, so zeroing them is safe.
+        """
+        if firmware.count(b"\xff" * threshold) == 0:
+            return firmware
+        out = bytearray(firmware)
+        run_start = -1
+        for i, b in enumerate(out):
+            if b == 0xFF:
+                if run_start < 0:
+                    run_start = i
+            else:
+                if run_start >= 0 and i - run_start >= threshold:
+                    logger.debug(
+                        "_zero_long_ff_runs: zeroed %d 0xFF bytes at offset 0x%X",
+                        i - run_start, run_start,
+                    )
+                    for j in range(run_start, i):
+                        out[j] = 0
+                run_start = -1
+        if run_start >= 0 and len(out) - run_start >= threshold:
+            for j in range(run_start, len(out)):
+                out[j] = 0
+        return bytes(out)
+
     async def _send_uboot(
         self,
         transport: Transport,
@@ -480,6 +526,7 @@ class HiSiliconStandard(BootProtocol):
         label: str = "U-Boot",
     ) -> bool:
         """Send U-Boot (or agent) image to DDR."""
+        firmware = self._zero_long_ff_runs(firmware)
         total = len(firmware)
         logger.debug(
             "=== %s === address=0x%08X total=%d chunks=%d",
