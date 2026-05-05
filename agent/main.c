@@ -783,8 +783,29 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
 #define SCAN_STUCK_PAT    0x03
 #define SCAN_UNSTABLE     0x04
 #define SCAN_READ_ERROR   0x05
+#define SCAN_BAD_BLOCK    0x06   /* NAND only: factory-marked bad block (OOB[0] != 0xFF) */
 
 #define SCAN_BATCH_MAX    8  /* sectors per RSP_SCAN packet — small for live progress */
+
+/* CMD_MARK_BAD: write 0x00 to OOB[0] of page 0 of a NAND block, marking
+ * it as a factory-style bad block.  Used for testing the scan's bad-block
+ * detection (synthesize a bad block, scan, then erase to clear).
+ *   Host sends: CMD_MARK_BAD [block:4LE]
+ *   Reply: ACK_OK or ACK_FLASH_ERROR */
+static void handle_mark_bad(const uint8_t *data, uint32_t len) {
+    if (len < 4) { proto_send_ack(ACK_CRC_ERROR); return; }
+    if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
+    if (flash_info.flash_type != FLASH_TYPE_NAND) {
+        proto_send_ack(ACK_FLASH_ERROR); return;  /* NOR has no OOB */
+    }
+    uint32_t block = read_le32(&data[0]);
+    uint32_t num_blocks = flash_info.size / flash_info.sector_size;
+    if (block >= num_blocks) { proto_send_ack(ACK_FLASH_ERROR); return; }
+
+    uint8_t marker = 0x00;
+    int rc = flash_program_oob(block, &marker, 1);
+    proto_send_ack(rc == 0 ? ACK_OK : ACK_FLASH_ERROR);
+}
 
 static void handle_scan(const uint8_t *data __attribute__((unused)),
                         uint32_t len __attribute__((unused))) {
@@ -806,15 +827,45 @@ static void handle_scan(const uint8_t *data __attribute__((unused)),
     write_le32(header, num_sectors);
     proto_send(RSP_SCAN, header, 4);
 
-    /* Process sectors in batches */
+    /* Process sectors in batches.  scan_buf holds one sector's worth of
+     * bytes for NAND (which can't be read via mem-mapped pointer); on NOR
+     * we still use the direct pointer for zero-copy.  Sized for the
+     * largest NAND block we currently support (128 KiB on MX35LF). */
+    static uint8_t scan_buf[128 * 1024];
     uint8_t result_buf[SCAN_BATCH_MAX * 5];
     uint32_t buf_idx = 0;
+    int is_nand = (flash_info.flash_type == FLASH_TYPE_NAND);
 
     for (uint32_t s = 0; s < num_sectors; s++) {
-        const uint8_t *ptr = (const uint8_t *)(FLASH_MEM + s * sector_sz);
         uint8_t status = SCAN_GOOD;
+        const uint8_t *ptr;
 
         proto_drain_fifo();
+
+        if (is_nand) {
+            /* NAND: factory bad-block marker is OOB[0] of page 0 of the
+             * block.  If != 0xFF the block was marked bad at the factory
+             * (or by previous wear) and must not be erased/programmed. */
+            uint8_t oob[2];
+            if (flash_read_oob(s, oob, 2) == 0 && oob[0] != 0xFF) {
+                /* Bad block — skip data-area scan, report and continue. */
+                result_buf[buf_idx++] = SCAN_BAD_BLOCK;
+                write_le32(&result_buf[buf_idx], 0);
+                buf_idx += 4;
+                if (buf_idx >= SCAN_BATCH_MAX * 5 || s == num_sectors - 1) {
+                    proto_send(RSP_SCAN, result_buf, buf_idx);
+                    buf_idx = 0;
+                }
+                continue;
+            }
+            /* Good block: read data area into RAM buf for the rest of the
+             * scan (memory-mapped reads don't work on NAND). */
+            flash_read(s * sector_sz, scan_buf, sector_sz);
+            ptr = scan_buf;
+        } else {
+            /* NOR: direct mem-mapped read (FMC boot-mode window). */
+            ptr = (const uint8_t *)(FLASH_MEM + s * sector_sz);
+        }
 
         /* Pass 1: CRC32 */
         uint32_t crc1 = crc32(0, ptr, sector_sz);
@@ -839,8 +890,12 @@ static void handle_scan(const uint8_t *data __attribute__((unused)),
             status = SCAN_STUCK_ZERO;
         } else if (all_same) {
             status = SCAN_STUCK_PAT;
-        } else {
-            /* Pass 2: stability check — re-read CRC */
+        } else if (!is_nand) {
+            /* Pass 2: stability check — re-read CRC.  NOR only because
+             * NAND re-reads always go through the same on-chip ECC and
+             * would never report differences (the chip auto-corrects
+             * single-bit flips).  For NAND, ECC error would be a
+             * separate signal we don't yet expose. */
             proto_drain_fifo();
             uint32_t crc2 = crc32(0, ptr, sector_sz);
             if (crc2 != crc1) status = SCAN_UNSTABLE;
@@ -911,6 +966,7 @@ static void handle_set_baud(const uint8_t *data, uint32_t len) {
             case CMD_WRITE: handle_write(pkt, pkt_len); break;
             case CMD_CRC32: handle_crc32_cmd(pkt, pkt_len); break;
             case CMD_SCAN:  handle_scan(pkt, pkt_len); break;
+            case CMD_MARK_BAD: handle_mark_bad(pkt, pkt_len); break;
             default:        proto_send_ack(ACK_OK); break;
         }
     }
@@ -986,6 +1042,9 @@ int main(void) {
                 break;
             case CMD_FLASH_STREAM:
                 handle_flash_stream(cmd_buf, data_len);
+                break;
+            case CMD_MARK_BAD:
+                handle_mark_bad(cmd_buf, data_len);
                 break;
             case CMD_SET_BAUD:
                 handle_set_baud(cmd_buf, data_len);

@@ -606,6 +606,49 @@ int flash_write_page(uint32_t addr, const uint8_t *data, uint32_t len) {
     return 0;
 }
 
+int flash_program_oob(uint32_t block, const uint8_t *buf, uint32_t len) {
+    if (current_flash_type != FLASH_TYPE_NAND) return -1;
+    if (len > 64) len = 64;
+    /* nand_program_page handles full-page programs starting at any
+     * column; passing column = NAND_PAGE_SIZE writes into the OOB
+     * area instead of the data area. */
+    uint32_t row = block * (NAND_BLOCK_SIZE / NAND_PAGE_SIZE);
+    return nand_program_page(row, NAND_PAGE_SIZE, buf, len);
+}
+
+int flash_read_oob(uint32_t block, uint8_t *buf, uint32_t len) {
+    if (current_flash_type != FLASH_TYPE_NAND) return -1;
+    if (len > 64) len = 64;
+
+    /* OOB lives at column NAND_PAGE_SIZE..NAND_PAGE_SIZE+63 of page 0 of
+     * the block.  Issue PAGE_READ for the first page of the block, wait
+     * OIP, then READ_FROM_CACHE at column = NAND_PAGE_SIZE.  Same
+     * iobuf[1] dummy-byte skip as nand_read. */
+    uint32_t row = block * (NAND_BLOCK_SIZE / NAND_PAGE_SIZE);  /* = block * 64 */
+
+    fmc_reg(FMC_INT_CLR) = 0xFF;
+    fmc_reg(FMC_CMD) = SPI_CMD_NAND_PAGE_READ;
+    fmc_reg(FMC_ADDRL) = row;
+    fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(3);
+    fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_REG_OP_START;
+    fmc_wait_ready();
+    nand_wait_oip();
+
+    volatile uint8_t *iobuf = (volatile uint8_t *)(FLASH_MEM);
+    fmc_reg(FMC_INT_CLR) = 0xFF;
+    fmc_reg(FMC_CMD) = SPI_CMD_NAND_READ_CACHE;
+    fmc_reg(FMC_ADDRL) = NAND_PAGE_SIZE;          /* column = start of OOB */
+    fmc_reg(FMC_DATA_NUM) = len + 1;              /* +1 for the dummy byte */
+    fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0)
+                        | OP_CFG_ADDR_NUM(2)
+                        | OP_CFG_DUMMY_NUM(0);
+    fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
+    fmc_wait_ready();
+    for (uint32_t i = 0; i < len; i++)
+        buf[i] = iobuf[i + 1];   /* skip iobuf[0] = dummy */
+    return 0;
+}
+
 uint32_t flash_crc32(uint32_t addr, uint32_t len) {
     /* Use register-based reads to compute CRC32 over flash region.
      * Boot mode memory window wraps at 1MB on some SoCs. */

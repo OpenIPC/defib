@@ -19,6 +19,7 @@
 #define CMD_SCAN        0x09
 #define CMD_FLASH_PROGRAM 0x0A
 #define CMD_FLASH_STREAM  0x0B
+#define CMD_MARK_BAD      0x0C  /* NAND only: write 0x00 to OOB[0] of page 0 of a block */
 
 /* Responses (device → host) */
 #define RSP_INFO    0x81

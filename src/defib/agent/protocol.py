@@ -46,6 +46,7 @@ CMD_SET_BAUD = 0x08
 CMD_SCAN = 0x09
 CMD_FLASH_PROGRAM = 0x0A
 CMD_FLASH_STREAM = 0x0B
+CMD_MARK_BAD = 0x0C  # NAND only: synthesize a bad-block marker (OOB[0] = 0x00)
 
 # Responses
 RSP_INFO = 0x81
