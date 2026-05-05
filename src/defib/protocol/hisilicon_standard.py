@@ -437,7 +437,15 @@ class HiSiliconStandard(BootProtocol):
         spl_override: bytes | None = None,
     ) -> bool:
         """Send SPL (secondary program loader) to SRAM."""
-        spl_size = self._detect_spl_size(firmware, profile.spl_max_size)
+        # Detect SPL boundary from the buffer we're actually going to send.
+        # When spl_override is set (agent flash flow), the agent binary itself
+        # has no gzip/LZMA payload to act as a boundary marker; scanning it
+        # falls back to profile_max, which on av300 is 0x6000 — past the
+        # 12-byte 0xFF padding at 0x52E4 that hangs the cv500-family bootrom.
+        # Detecting from spl_override gives 0x5000 (gzip at 0x52F0 rounded
+        # down) and excludes the FF run.
+        scan_buf = spl_override if spl_override is not None else firmware
+        spl_size = self._detect_spl_size(scan_buf, profile.spl_max_size)
         logger.debug(
             "=== SPL === address=0x%08X size=%d chunks=%d",
             profile.spl_address, spl_size,
@@ -447,6 +455,10 @@ class HiSiliconStandard(BootProtocol):
             spl_data = spl_override[:spl_size].ljust(spl_size, b"\x00")
         else:
             spl_data = firmware[:spl_size]
+        # Defense-in-depth: zero any ≥12-byte 0xFF runs even after the
+        # boundary fix, so non-OpenIPC SPL builds with FF padding earlier
+        # in the binary don't trip the same cv500-family bootrom RX bug.
+        spl_data = self._zero_long_ff_runs(spl_data)
 
         _emit(on_progress, ProgressEvent(
             stage=Stage.SPL, bytes_sent=0, bytes_total=spl_size,
