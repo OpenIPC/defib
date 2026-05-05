@@ -606,6 +606,16 @@ int flash_write_page(uint32_t addr, const uint8_t *data, uint32_t len) {
     return 0;
 }
 
+int flash_program_oob(uint32_t block, const uint8_t *buf, uint32_t len) {
+    if (current_flash_type != FLASH_TYPE_NAND) return -1;
+    if (len > 64) len = 64;
+    /* nand_program_page handles full-page programs starting at any
+     * column; passing column = NAND_PAGE_SIZE writes into the OOB
+     * area instead of the data area. */
+    uint32_t row = block * (NAND_BLOCK_SIZE / NAND_PAGE_SIZE);
+    return nand_program_page(row, NAND_PAGE_SIZE, buf, len);
+}
+
 int flash_read_oob(uint32_t block, uint8_t *buf, uint32_t len) {
     if (current_flash_type != FLASH_TYPE_NAND) return -1;
     if (len > 64) len = 64;

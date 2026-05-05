@@ -787,6 +787,26 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
 
 #define SCAN_BATCH_MAX    8  /* sectors per RSP_SCAN packet — small for live progress */
 
+/* CMD_MARK_BAD: write 0x00 to OOB[0] of page 0 of a NAND block, marking
+ * it as a factory-style bad block.  Used for testing the scan's bad-block
+ * detection (synthesize a bad block, scan, then erase to clear).
+ *   Host sends: CMD_MARK_BAD [block:4LE]
+ *   Reply: ACK_OK or ACK_FLASH_ERROR */
+static void handle_mark_bad(const uint8_t *data, uint32_t len) {
+    if (len < 4) { proto_send_ack(ACK_CRC_ERROR); return; }
+    if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
+    if (flash_info.flash_type != FLASH_TYPE_NAND) {
+        proto_send_ack(ACK_FLASH_ERROR); return;  /* NOR has no OOB */
+    }
+    uint32_t block = read_le32(&data[0]);
+    uint32_t num_blocks = flash_info.size / flash_info.sector_size;
+    if (block >= num_blocks) { proto_send_ack(ACK_FLASH_ERROR); return; }
+
+    uint8_t marker = 0x00;
+    int rc = flash_program_oob(block, &marker, 1);
+    proto_send_ack(rc == 0 ? ACK_OK : ACK_FLASH_ERROR);
+}
+
 static void handle_scan(const uint8_t *data __attribute__((unused)),
                         uint32_t len __attribute__((unused))) {
     if (!flash_readable) {
@@ -946,6 +966,7 @@ static void handle_set_baud(const uint8_t *data, uint32_t len) {
             case CMD_WRITE: handle_write(pkt, pkt_len); break;
             case CMD_CRC32: handle_crc32_cmd(pkt, pkt_len); break;
             case CMD_SCAN:  handle_scan(pkt, pkt_len); break;
+            case CMD_MARK_BAD: handle_mark_bad(pkt, pkt_len); break;
             default:        proto_send_ack(ACK_OK); break;
         }
     }
@@ -1021,6 +1042,9 @@ int main(void) {
                 break;
             case CMD_FLASH_STREAM:
                 handle_flash_stream(cmd_buf, data_len);
+                break;
+            case CMD_MARK_BAD:
+                handle_mark_bad(cmd_buf, data_len);
                 break;
             case CMD_SET_BAUD:
                 handle_set_baud(cmd_buf, data_len);

@@ -20,6 +20,7 @@ from defib.agent.protocol import (
     CMD_ERASE,
     CMD_FLASH_STREAM,
     CMD_INFO,
+    CMD_MARK_BAD,
     CMD_READ,
     CMD_SCAN,
     CMD_SELFUPDATE,
@@ -783,6 +784,21 @@ class FlashAgentClient:
         logger.warning("Verification at %d baud failed, reverting to %d", baud, old_baud)
         port.baudrate = old_baud
         return False
+
+    async def mark_bad_block(self, block: int) -> bool:
+        """Mark a NAND block as bad by writing 0x00 to OOB[0] of page 0.
+
+        After this call, scan_flash() will report the block as
+        SectorStatus.BAD_BLOCK.  An erase_flash() of the block clears
+        the marker (OOB returns to 0xFF after erase).
+
+        Used for testing the scan's bad-block detection.  NOR returns
+        False (no OOB).
+        """
+        self._clear_rx_buffers()
+        await send_packet(self._transport, CMD_MARK_BAD, struct.pack("<I", block))
+        cmd, resp = await recv_response(self._transport, timeout=5.0)
+        return cmd == RSP_ACK and resp[0] == ACK_OK
 
     async def reboot(self) -> None:
         """Reset the device via watchdog. Bootrom boots from flash if

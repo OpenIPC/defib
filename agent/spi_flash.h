@@ -75,4 +75,11 @@ uint32_t flash_crc32(uint32_t addr, uint32_t len);
  * bad-block marker at OOB[0] of page 0 of every block. */
 int flash_read_oob(uint32_t block, uint8_t *buf, uint32_t len);
 
+/* Write N bytes of OOB to page 0 of a NAND block.  Mainly used to
+ * write the bad-block marker (single 0x00 at OOB[0]).  The chip's
+ * on-chip ECC computes spare-area ECC bytes; we only set OOB[0..N-1]
+ * which sits in the user OOB area before the ECC region.  Returns 0
+ * on success, -1 if NOR or program fails. */
+int flash_program_oob(uint32_t block, const uint8_t *buf, uint32_t len);
+
 #endif /* SPI_FLASH_H */
