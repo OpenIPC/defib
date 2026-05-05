@@ -113,6 +113,8 @@ def get_agent_binary(chip: str) -> Path | None:
         "gk7202v300": "gk7205v200",
         "hi3516cv300": "hi3516cv300",
         "hi3516cv500": "hi3516cv500",
+        "hi3516av300": "hi3516cv500",  # cv500-family, same memory map
+        "hi3516dv300": "hi3516cv500",  # cv500-family, same memory map
         "hi3516cv610": "hi3516cv610",
         "hi3518ev200": "hi3518ev200",
     }

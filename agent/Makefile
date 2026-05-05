@@ -73,7 +73,10 @@ else ifeq ($(SOC),hi3516cv300)
   CRG_BASE       = 0x12010000
   SYSCTRL_REBOOT = 0x12020004
 else ifeq ($(SOC),hi3516cv500)
-  UART_BASE      = 0x12100000
+  # cv500-family (cv500, av300, dv300) — Cortex-A7. Memory map per
+  # qemu-hisilicon hi3516cv500_soc; UART0 is at 0x120A0000, not the
+  # 0x12100000 used by V3 (cv300) or hi3518ev200.
+  UART_BASE      = 0x120A0000
   UART_CLOCK     = 24000000
   LOAD_ADDR      = 0x81000000
   FLASH_MEM      = 0x14000000
