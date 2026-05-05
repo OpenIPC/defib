@@ -105,8 +105,22 @@ else ifeq ($(SOC),hi3516cv610)
   WDT_BASE       = 0x12030000
   CRG_BASE       = 0x12010000
   SYSCTRL_REBOOT = 0x12020004
+else ifeq ($(SOC),hi3519v101)
+  # V3A generation (3519v101 family: hi3519v101, hi3516av200) — Cortex-A7
+  # with V3-era peripheral addresses (UART 0x12100000, WDT 0x12080000)
+  # but DDR at 0x80000000 like cv500-family. Memory map per
+  # qemu-hisilicon hi3519v101_soc.
+  UART_BASE      = 0x12100000
+  UART_CLOCK     = 24000000
+  LOAD_ADDR      = 0x81000000
+  FLASH_MEM      = 0x14000000
+  FMC_BASE       = 0x10000000
+  RAM_BASE       = 0x80000000
+  WDT_BASE       = 0x12080000
+  CRG_BASE       = 0x12010000
+  SYSCTRL_REBOOT = 0x12020004
 else
-  $(error Unknown SOC: $(SOC). Supported: hi3516ev300 hi3516ev200 gk7205v200 gk7205v300 hi3516cv300 hi3516cv500 hi3518ev200 hi3516cv610)
+  $(error Unknown SOC: $(SOC). Supported: hi3516ev300 hi3516ev200 gk7205v200 gk7205v300 hi3516cv300 hi3516cv500 hi3518ev200 hi3516cv610 hi3519v101)
 endif
 
 # Per-SoC CPU. V3 chips (cv300) are ARM926EJ-S (ARMv5TEJ);
