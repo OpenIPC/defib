@@ -131,10 +131,10 @@ static void handle_info(void) {
     resp[0] = flash_info.jedec_id[0];
     resp[1] = flash_info.jedec_id[1];
     resp[2] = flash_info.jedec_id[2];
-    resp[3] = 0;
+    resp[3] = flash_info.flash_type;   /* was reserved padding */
     write_le32(&resp[4], flash_info.size);
     write_le32(&resp[8], RAM_BASE);
-    write_le32(&resp[12], 0x10000);    /* 64KB sector */
+    write_le32(&resp[12], flash_info.sector_size);  /* NOR=64K, NAND=128K */
     write_le32(&resp[16], AGENT_VERSION);
     write_le32(&resp[20], AGENT_CAPS);
     proto_send(RSP_INFO, resp, 24);
@@ -300,6 +300,10 @@ static void handle_write(const uint8_t *data, uint32_t len) {
 static void handle_erase(const uint8_t *data, uint32_t len) {
     if (len < 8) { proto_send_ack(ACK_CRC_ERROR); return; }
     if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
+    /* SPI NAND erase/write are not yet implemented — read-only on NAND. */
+    if (flash_info.flash_type == FLASH_TYPE_NAND) {
+        proto_send_ack(ACK_FLASH_ERROR); return;
+    }
 
     uint32_t addr = read_le32(&data[0]);
     uint32_t size = read_le32(&data[4]);
@@ -346,6 +350,9 @@ static void handle_erase(const uint8_t *data, uint32_t len) {
 static void handle_flash_write(const uint8_t *data, uint32_t len) {
     if (len < 12) { proto_send_ack(ACK_CRC_ERROR); return; }
     if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
+    if (flash_info.flash_type == FLASH_TYPE_NAND) {
+        proto_send_ack(ACK_FLASH_ERROR); return;  /* NAND write not yet implemented */
+    }
 
     uint32_t flash_addr = read_le32(&data[0]);
     uint32_t size = read_le32(&data[4]);
@@ -432,6 +439,9 @@ static void handle_flash_write(const uint8_t *data, uint32_t len) {
 static void handle_flash_program(const uint8_t *data, uint32_t len) {
     if (len < 16) { proto_send_ack(ACK_CRC_ERROR); return; }
     if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
+    if (flash_info.flash_type == FLASH_TYPE_NAND) {
+        proto_send_ack(ACK_FLASH_ERROR); return;  /* NAND program not yet implemented */
+    }
 
     uint32_t ram_addr = read_le32(&data[0]);
     uint32_t flash_addr = read_le32(&data[4]);
@@ -551,6 +561,9 @@ static void erase_and_program(uint32_t addr, const uint8_t *buf,
 static void handle_flash_stream(const uint8_t *data, uint32_t len) {
     if (len < 44) { proto_send_ack(ACK_CRC_ERROR); return; }
     if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
+    if (flash_info.flash_type == FLASH_TYPE_NAND) {
+        proto_send_ack(ACK_FLASH_ERROR); return;  /* NAND stream-write not yet implemented */
+    }
 
     uint32_t flash_addr = read_le32(&data[0]);
     uint32_t size = read_le32(&data[4]);
@@ -789,6 +802,11 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
 static void handle_scan(const uint8_t *data __attribute__((unused)),
                         uint32_t len __attribute__((unused))) {
     if (!flash_readable) {
+        proto_send_ack(ACK_FLASH_ERROR);
+        return;
+    }
+    if (flash_info.flash_type == FLASH_TYPE_NAND) {
+        /* SCAN uses erase+write; NAND erase/write not yet implemented. */
         proto_send_ack(ACK_FLASH_ERROR);
         return;
     }

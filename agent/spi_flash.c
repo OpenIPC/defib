@@ -33,6 +33,7 @@
 #define OP_CFG_OEN_EN       (1 << 13)
 #define OP_CFG_CS(n)        ((n) << 11)
 #define OP_CFG_ADDR_NUM(n)  ((n) << 4)  /* 3 or 4 byte address */
+#define OP_CFG_DUMMY_NUM(n) ((n) & 0xF) /* dummy bytes between address and data */
 
 /* FMC_OP bits */
 #define FMC_OP_REG_OP_START (1 << 0)
@@ -50,9 +51,25 @@
 #define SPI_CMD_SECTOR_ERASE  0xD8
 #define SPI_CMD_CHIP_ERASE    0xC7
 
-/* SPI status bits */
+/* SPI NOR status bits */
 #define SPI_STATUS_WIP  (1 << 0)
 #define SPI_STATUS_WEL  (1 << 1)
+
+/* SPI NAND commands (MX35LF1GE4AB / generic SPI NAND) */
+#define SPI_CMD_NAND_GET_FEATURES  0x0F
+#define SPI_CMD_NAND_SET_FEATURE   0x1F
+#define SPI_CMD_NAND_PAGE_READ     0x13   /* row addr -> chip cache */
+#define SPI_CMD_NAND_READ_CACHE    0x03   /* col addr -> read cached page */
+
+/* SPI NAND feature register addresses */
+#define NAND_FEATURE_PROTECT  0xA0
+#define NAND_FEATURE_OTP      0xB0       /* bit 4 = ECC_E (on-chip ECC enable) */
+#define NAND_FEATURE_STATUS   0xC0       /* bit 0 = OIP (operation in progress) */
+
+/* NAND geometry — currently only MX35LF1GE4AB (1Gbit) is recognized.
+ * On-chip ECC is enabled by default; reads return ECC-corrected data. */
+#define NAND_PAGE_SIZE   2048
+#define NAND_BLOCK_SIZE  (64 * NAND_PAGE_SIZE)   /* 128 KiB */
 
 /* CRG register for FMC clock — CRG_BASE is per-SoC (set via -DCRG_BASE=...) */
 #define REG_FMC_CRG         (*(volatile uint32_t *)(CRG_BASE + 0x0144))
@@ -204,6 +221,22 @@ void flash_read_id(uint8_t id[3]) {
     id[2] = (data >> 16) & 0xFF;
 }
 
+/* Cached flash type from last flash_init — used by flash_read to dispatch. */
+static uint8_t current_flash_type = FLASH_TYPE_NOR;
+
+/* Identify SPI NAND chip from JEDEC ID. Returns 1 if recognized, 0 otherwise.
+ * Currently only MX35LF1GE4AB (Macronix, c2 12, 1Gbit / 128MB).  The agent's
+ * flash_read_id reads bytes [0..2] of an 8-byte fetch; some SPI NAND chips
+ * return the manufacturer ID with a leading dummy byte, so we accept the ID
+ * shifted by one position too. */
+static int nand_identify(const uint8_t id[3]) {
+    /* Direct: id[0]=0xC2 id[1]=0x12 */
+    if (id[0] == 0xC2 && id[1] == 0x12) return 1;
+    /* Shifted by 1 (dummy byte at id[0]): id[1]=0xC2 id[2]=0x12 */
+    if (id[1] == 0xC2 && id[2] == 0x12) return 1;
+    return 0;
+}
+
 int flash_init(flash_info_t *info) {
     /* Ensure FMC clock is enabled and not in reset */
     uint32_t crg = REG_FMC_CRG;
@@ -223,17 +256,107 @@ int flash_init(flash_info_t *info) {
     /* Read JEDEC ID (requires normal mode) */
     fmc_enter_normal();
     flash_read_id(info->jedec_id);
+
+    if (nand_identify(info->jedec_id)) {
+        /* SPI NAND path. No flash_unlock / fmc_enter_boot — NAND has no
+         * memory-mapped boot mode and uses different protection (BP bits
+         * via SET_FEATURE 0xA0 instead of write-status-register). */
+        info->flash_type = FLASH_TYPE_NAND;
+        info->size = 128u * 1024u * 1024u;     /* MX35LF1GE4AB = 128 MiB */
+        info->sector_size = NAND_BLOCK_SIZE;    /* 128 KiB erase block */
+        info->page_size = NAND_PAGE_SIZE;       /* 2 KiB read/program page */
+        current_flash_type = FLASH_TYPE_NAND;
+        return 0;
+    }
+
+    /* SPI NOR path */
     fmc_enter_boot();
 
+    info->flash_type = FLASH_TYPE_NOR;
     info->size = detect_size(info->jedec_id[2]);
     info->sector_size = 0x10000;  /* 64KB */
     info->page_size = 256;
+    current_flash_type = FLASH_TYPE_NOR;
 
     return (info->jedec_id[0] != 0x00 && info->jedec_id[0] != 0xFF) ? 0 : -1;
 }
 
+/* SPI NAND: poll OIP bit (Operation In Progress) in status feature 0xC0. */
+static void nand_wait_oip(void) {
+    volatile uint8_t *iobuf = (volatile uint8_t *)(FLASH_MEM);
+    for (uint32_t i = 0; i < 1000000; i++) {
+        fmc_reg(FMC_INT_CLR) = 0xFF;
+        fmc_reg(FMC_CMD) = SPI_CMD_NAND_GET_FEATURES;
+        fmc_reg(FMC_ADDRL) = NAND_FEATURE_STATUS;
+        fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(1);
+        fmc_reg(FMC_DATA_NUM) = 1;
+        fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
+        fmc_wait_ready();
+        if (!(iobuf[0] & 0x01)) return;
+        proto_drain_fifo();  /* keep host-side UART happy during wait */
+    }
+}
+
+/* Read up to NAND_PAGE_SIZE bytes from a NAND page (data area only).
+ * row = page index (0 .. flash_size/page_size - 1)
+ * column = byte offset within the 2 KiB data area (0 .. NAND_PAGE_SIZE-1)
+ * On-chip ECC is left at its power-on default (enabled on MX35LF*) so the
+ * returned bytes are ECC-corrected. */
+static void nand_read(uint32_t row, uint32_t column,
+                      uint8_t *buf, uint32_t len) {
+    /* 1) PAGE_READ: load page from array into chip cache. */
+    fmc_reg(FMC_INT_CLR) = 0xFF;
+    fmc_reg(FMC_CMD) = SPI_CMD_NAND_PAGE_READ;
+    fmc_reg(FMC_ADDRL) = row;
+    fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(3);
+    fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_REG_OP_START;
+    fmc_wait_ready();
+
+    /* 2) Wait for OIP=0 — chip finishes ECC correction and signals ready. */
+    nand_wait_oip();
+
+    /* 3) READ_FROM_CACHE: pull data from cache via column addressing.
+     * SPI NAND READ_FROM_CACHE_x1 (0x03) requires 1 dummy byte (8 dummy
+     * clock cycles) between the column address and the returned data.
+     * FMC's I/O buffer is 256-byte capacity, so chunk per fetch. */
+    volatile uint8_t *iobuf = (volatile uint8_t *)(FLASH_MEM);
+    uint32_t off = 0;
+    while (off < len) {
+        uint32_t chunk = (len - off > 256) ? 256 : (len - off);
+        fmc_reg(FMC_INT_CLR) = 0xFF;
+        fmc_reg(FMC_CMD) = SPI_CMD_NAND_READ_CACHE;
+        fmc_reg(FMC_ADDRL) = column + off;
+        fmc_reg(FMC_DATA_NUM) = chunk;
+        fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0)
+                            | OP_CFG_ADDR_NUM(2)
+                            | OP_CFG_DUMMY_NUM(1);
+        fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
+        fmc_wait_ready();
+        for (uint32_t i = 0; i < chunk; i++)
+            buf[off + i] = iobuf[i];
+        off += chunk;
+    }
+}
+
 void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
-    /* Use register-based reads (normal mode) instead of memory window.
+    if (current_flash_type == FLASH_TYPE_NAND) {
+        /* NAND: convert byte offset to (page, column) and read page-by-page
+         * via PAGE_READ + READ_FROM_CACHE.  No mode-switching — NAND lives
+         * entirely in normal mode. */
+        while (len > 0) {
+            uint32_t row = addr / NAND_PAGE_SIZE;
+            uint32_t col = addr % NAND_PAGE_SIZE;
+            uint32_t in_page = NAND_PAGE_SIZE - col;
+            uint32_t chunk = (len < in_page) ? len : in_page;
+            nand_read(row, col, buf, chunk);
+            buf += chunk;
+            addr += chunk;
+            len -= chunk;
+        }
+        return;
+    }
+
+    /* NOR: register-based reads (normal mode) instead of memory window.
      * The boot mode memory window wraps at 1MB on some SoCs. */
     fmc_enter_normal();
     volatile uint8_t *iobuf = (volatile uint8_t *)(FLASH_MEM);

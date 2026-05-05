@@ -1,8 +1,10 @@
 /*
- * HiSilicon FMC SPI NOR flash driver.
+ * HiSilicon FMC SPI flash driver — supports SPI NOR + SPI NAND.
  *
- * Uses the FMC (Flash Memory Controller) register interface for
- * erase/write, and memory-mapped read window for fast reads.
+ * NOR: register-based reads via FMC normal mode (faster than memory
+ * window when window wraps at 1MB on some SoCs).
+ * NAND: PAGE_READ → READ_FROM_CACHE flow with on-chip ECC enabled.
+ *       Currently read-only (erase/write are NOR-only).
  */
 
 #ifndef SPI_FLASH_H
@@ -28,12 +30,17 @@
 /* FMC register access */
 #define fmc_reg(off) (*(volatile uint32_t *)(FMC_BASE + (off)))
 
+/* Flash type */
+#define FLASH_TYPE_NOR  0
+#define FLASH_TYPE_NAND 1
+
 /* Flash info */
 typedef struct {
     uint8_t  jedec_id[3];   /* Manufacturer + device ID */
-    uint32_t size;           /* Total flash size in bytes */
-    uint32_t sector_size;    /* Erase sector size (typically 64KB) */
-    uint32_t page_size;      /* Program page size (typically 256B) */
+    uint32_t size;           /* Total flash size in bytes (data only, no OOB) */
+    uint32_t sector_size;    /* Erase unit (NOR: 64KB sector, NAND: 128KB block) */
+    uint32_t page_size;      /* Read/program unit (NOR: 256B, NAND: 2KB) */
+    uint8_t  flash_type;     /* FLASH_TYPE_NOR or FLASH_TYPE_NAND */
 } flash_info_t;
 
 /* Initialize flash controller, detect flash chip */
