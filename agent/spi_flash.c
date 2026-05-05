@@ -54,8 +54,7 @@
 #define SPI_STATUS_WIP  (1 << 0)
 #define SPI_STATUS_WEL  (1 << 1)
 
-/* CRG register for FMC clock (hi3516ev300) */
-#define CRG_BASE            0x12010000
+/* CRG register for FMC clock — CRG_BASE is per-SoC (set via -DCRG_BASE=...) */
 #define REG_FMC_CRG         (*(volatile uint32_t *)(CRG_BASE + 0x0144))
 #define FMC_CLK_ENABLE      (1 << 1)
 #define FMC_SOFT_RESET      (1 << 0)
