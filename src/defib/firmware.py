@@ -79,6 +79,21 @@ def get_cached_path(chip: str) -> Path | None:
     return None
 
 
+def pad_to_size(data: bytes, target_size: int, fill: int = 0xFF) -> bytes:
+    """Right-pad `data` to `target_size` with `fill` bytes (default 0xFF).
+
+    OpenIPC dropped the historical 1 MiB padding from published U-Boot
+    assets (issue #73). Consumers that flash to a fixed-size partition
+    must now pad locally to the partition size so trailing flash bytes
+    are erased (0xFF), not left at whatever was previously written.
+    """
+    if len(data) > target_size:
+        raise ValueError(
+            f"Data is {len(data)} bytes, larger than target {target_size}"
+        )
+    return data.ljust(target_size, bytes([fill]))
+
+
 def download_firmware(
     chip: str,
     on_progress: Callable[[int, int], None] | None = None,
