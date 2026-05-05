@@ -36,6 +36,7 @@ BLOCK_EMPTY = "·"  # erased (all 0xFF)
 BLOCK_DEAD = "▓"  # stuck/dead
 BLOCK_UNSTABLE = "▒"  # data degrading
 BLOCK_ERROR = "✕"  # read error
+BLOCK_BAD = "✗"  # NAND factory bad block (OOB[0] != 0xFF)
 
 
 BOX_INNER = 42  # visible cells between ║ and ║
@@ -135,6 +136,7 @@ class SectorGrid(Widget):
             SectorStatus.STUCK_PATTERN: (BLOCK_DEAD, "red"),
             SectorStatus.UNSTABLE: (BLOCK_UNSTABLE, "yellow"),
             SectorStatus.READ_ERROR: (BLOCK_ERROR, "bright_red"),
+            SectorStatus.BAD_BLOCK: (BLOCK_BAD, "magenta"),
         }
 
         lines: list[str] = []
@@ -187,6 +189,7 @@ class ScanStats(Static):
         bad: int,
         unstable: int,
         elapsed: float,
+        bad_block: int = 0,
     ) -> None:
         if total == 0:
             self.update("")
@@ -218,12 +221,15 @@ class ScanStats(Static):
             lines.append(f"  [green]{bar}[/] 100%")
 
         lines.append("")
-        lines.append(
+        line = (
             f"  [green]█[/] Good: [bold]{good:>4}[/]  "
             f"[bright_black]·[/] Empty: [bold]{empty:>4}[/]  "
             f"[yellow]▒[/] Unstable: [bold]{unstable:>3}[/]  "
             f"[red]▓[/] Dead: [bold]{bad:>3}[/]"
         )
+        if bad_block:
+            line += f"  [magenta]✗[/] Bad-block: [bold]{bad_block:>3}[/]"
+        lines.append(line)
 
         self.update("\n".join(lines))
 
@@ -363,6 +369,7 @@ class FlashDoctorScreen(Screen[None]):
         self._empty = 0
         self._bad = 0
         self._unstable = 0
+        self._bad_block = 0
         self._num_sectors = 0
         self._sector_size = 0x10000
         self._flash_size = 0
@@ -622,6 +629,7 @@ class FlashDoctorScreen(Screen[None]):
         self._empty = 0
         self._bad = 0
         self._unstable = 0
+        self._bad_block = 0
         self._t0 = time.time()
 
         self.query_one("#scan-btn", Button).disabled = True
@@ -688,6 +696,8 @@ class FlashDoctorScreen(Screen[None]):
                 self._empty += 1
             elif result.status == SectorStatus.UNSTABLE:
                 self._unstable += 1
+            elif result.status == SectorStatus.BAD_BLOCK:
+                self._bad_block += 1
             else:
                 self._bad += 1
 
@@ -695,6 +705,7 @@ class FlashDoctorScreen(Screen[None]):
             self._scanned, self._num_sectors,
             self._good, self._empty, self._bad, self._unstable,
             time.time() - self._t0,
+            self._bad_block,
         )
 
     def _scan_error(self, error: str) -> None:
@@ -723,6 +734,7 @@ class FlashDoctorScreen(Screen[None]):
             self._num_sectors, self._num_sectors,
             self._good, self._empty, self._bad, self._unstable,
             elapsed,
+            self._bad_block,
         )
 
         self._log("")

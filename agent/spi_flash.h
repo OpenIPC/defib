@@ -67,4 +67,12 @@ extern uint8_t flash_unlock_debug[3];
 /* CRC32 of flash region (using memory-mapped read) */
 uint32_t flash_crc32(uint32_t addr, uint32_t len);
 
+/* Read N bytes of OOB (out-of-band / spare area) from a NAND page.
+ * `block` is the block index (0 .. flash_size/sector_size - 1); the
+ * function reads OOB of page 0 of that block.  `len` is capped at 64
+ * (typical OOB size on small SPI NAND).  Returns 0 on success, -1 if
+ * the chip is NOR (no OOB).  Used by handle_scan to read the factory
+ * bad-block marker at OOB[0] of page 0 of every block. */
+int flash_read_oob(uint32_t block, uint8_t *buf, uint32_t len);
+
 #endif /* SPI_FLASH_H */

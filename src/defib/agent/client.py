@@ -48,6 +48,7 @@ class SectorStatus(IntEnum):
     STUCK_PATTERN = 0x03
     UNSTABLE = 0x04
     READ_ERROR = 0x05
+    BAD_BLOCK = 0x06   # NAND only: factory-marked bad block (OOB[0] != 0xFF)
 
 
 @dataclass
@@ -86,6 +87,10 @@ class ScanResult:
     @property
     def unstable(self) -> list[SectorResult]:
         return [s for s in self.sectors if s.status == SectorStatus.UNSTABLE]
+
+    @property
+    def bad_block(self) -> list[SectorResult]:
+        return [s for s in self.sectors if s.status == SectorStatus.BAD_BLOCK]
 
 
 # Packet size for WRITE data chunks
