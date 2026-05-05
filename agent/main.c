@@ -42,6 +42,11 @@ void data_abort_handler(uint32_t dfar, uint32_t dfsr, uint32_t pc) {
 #define WDT_BASE 0x12030000
 #endif
 
+/* SYSCTRL software-reset register — set via -DSYSCTRL_REBOOT=... */
+#ifndef SYSCTRL_REBOOT
+#define SYSCTRL_REBOOT 0x12020004
+#endif
+
 #define WDT_LOAD    (*(volatile uint32_t *)(WDT_BASE + 0x000))
 #define WDT_CONTROL (*(volatile uint32_t *)(WDT_BASE + 0x008))
 #define WDT_INTCLR  (*(volatile uint32_t *)(WDT_BASE + 0x00C))
@@ -988,10 +993,11 @@ int main(void) {
             case CMD_REBOOT:
                 /* ACK first, then system reset via sysctrl register.
                  * This is the standard HiSilicon reset (same as Linux
-                 * hisi-reboot driver): write 0xdeadbeef to 0x12020004. */
+                 * hisi-reboot driver): write 0xdeadbeef to SYSCTRL_REBOOT.
+                 * Address is per-SoC (V3/V4 generations differ). */
                 proto_send_ack(ACK_OK);
                 for (volatile int i = 0; i < 100000; i++) {}
-                *(volatile uint32_t *)0x12020004 = 0xdeadbeef;
+                *(volatile uint32_t *)SYSCTRL_REBOOT = 0xdeadbeef;
                 while (1) {}
                 break;
             default:

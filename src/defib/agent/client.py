@@ -108,8 +108,6 @@ def get_agent_binary(chip: str) -> Path | None:
     """Get the path to the pre-compiled agent binary for a chip."""
     chip_to_agent = {
         "hi3516ev300": "hi3516ev300",
-        "hi3516ev200": "hi3516ev200",
-        "hi3518ev300": "hi3516ev200",
         "gk7205v200": "gk7205v200",
         "gk7205v300": "gk7205v200",
         "gk7202v300": "gk7205v200",

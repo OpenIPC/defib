@@ -20,6 +20,11 @@
 #define FMC_BASE    0x10000000
 #endif
 
+/* PERI_CRG controller base (set via -DCRG_BASE=...) */
+#ifndef CRG_BASE
+#define CRG_BASE    0x12010000
+#endif
+
 /* FMC register access */
 #define fmc_reg(off) (*(volatile uint32_t *)(FMC_BASE + (off)))
 

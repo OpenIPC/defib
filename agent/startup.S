@@ -3,8 +3,10 @@
  *
  * Uploaded via HiSilicon boot protocol to DDR.
  * DDR and clocks are already initialized by the bootrom + DDR step.
- * Sets up MMU with identity mapping + D-cache for fast COBS+CRC
- * processing, then jumps to main().
+ *
+ * Two CPU paths:
+ *   ARM926EJ-S (ARMv5TEJ, hi3516cv300): minimal startup, no MMU/cache.
+ *   Cortex-A7+ (ARMv7-A, ev300/cv500/cv610/...): MMU + D-cache for speed.
  */
 
     .section .text.start
@@ -12,8 +14,9 @@
     .arm
 
 /*
- * ARM exception vector table.
- * Must be at the entry point so VBAR points here.
+ * ARM exception vector table.  Must be at the start of the image because
+ * the bootrom/SPL jumps to LOAD_ADDR (= _start) and we want a `b _start_code`
+ * as the first instruction.
  */
 _start:
 _vectors:
@@ -21,7 +24,11 @@ _vectors:
     b       _exc_hang           /* Undefined instruction */
     b       _exc_hang           /* SWI */
     b       _exc_hang           /* Prefetch abort */
+#ifdef CPU_ARM926
+    b       _exc_hang           /* Data abort (no fancy handler on ARMv5) */
+#else
     b       _data_abort         /* Data abort */
+#endif
     b       _exc_hang           /* Reserved */
     b       _exc_hang           /* IRQ */
     b       _exc_hang           /* FIQ */
@@ -29,8 +36,10 @@ _vectors:
 _exc_hang:
     b       _exc_hang
 
+#ifndef CPU_ARM926
 /*
  * Data abort handler — prints fault info over UART before hanging.
+ * ARMv7-only (uses `cps #imm`, ARM926 has no equivalent encoding here).
  */
     .global _data_abort
 _data_abort:
@@ -43,8 +52,63 @@ _data_abort:
     bl      data_abort_handler
     pop     {r0-r3, lr}
     b       _exc_hang
+#endif
 
 _start_code:
+#ifdef CPU_ARM926
+    /* =========================================================
+     * ARM926EJ-S (ARMv5TEJ) — hi3516cv300
+     *
+     * No VBAR (vectors are at 0x00000000 or 0xFFFF0000 per CP15 c1.V).
+     * No ARMv7 short-descriptor MMU.  Run uncached, no MMU — the agent
+     * only needs ~80 KB/s sustained UART throughput, which the ARM926
+     * easily handles without cache.  Skips: VBAR mcr, dsb/isb, MMU/page
+     * table setup, D-cache enable.
+     * ========================================================= */
+
+    /* Switch to SVC mode and mask IRQ + FIQ */
+    mrs     r0, cpsr
+    bic     r0, r0, #0x1F           /* clear mode bits */
+    orr     r0, r0, #0x13           /* SVC */
+    orr     r0, r0, #0xC0           /* mask IRQ + FIQ */
+    msr     cpsr_c, r0
+
+    /* Read SCTLR (CP15 c1) and force MMU/caches off */
+    mrc     p15, 0, r0, c1, c0, 0
+    bic     r0, r0, #0x1            /* M = 0 (MMU off) */
+    bic     r0, r0, #0x4            /* C = 0 (D-cache off) */
+    bic     r0, r0, #0x1000         /* I = 0 (I-cache off) */
+    mcr     p15, 0, r0, c1, c0, 0
+
+    /* Invalidate I+D cache and TLB (ARMv5 ops) */
+    mov     r0, #0
+    mcr     p15, 0, r0, c7, c7, 0   /* invalidate I+D cache */
+    mcr     p15, 0, r0, c8, c7, 0   /* invalidate TLB */
+
+    /* Set up stack pointer (16KB below _start) */
+    ldr     sp, =_start
+    sub     sp, sp, #0x4000
+
+    /* Clear BSS */
+    ldr     r0, =__bss_start
+    ldr     r1, =__bss_end
+    mov     r2, #0
+bss_loop_v5:
+    cmp     r0, r1
+    strlt   r2, [r0], #4
+    blt     bss_loop_v5
+
+    /* Jump to C main */
+    bl      main
+
+hang_v5:
+    b       hang_v5
+
+#else
+    /* =========================================================
+     * Cortex-A7 / ARMv7-A — ev300/cv500/cv610/gk7205/...
+     * ========================================================= */
+
     /* Set VBAR to our vector table */
     adr     r0, _start
     mcr     p15, 0, r0, c12, c0, 0
@@ -175,9 +239,10 @@ hang:
     wfi
     b       hang
 
-/* ===== PAGE TABLE (in BSS, 16KB aligned) ===== */
+/* ===== PAGE TABLE (in BSS, 16KB aligned) — Cortex-A7 only ===== */
     .section .bss
     .align 14
     .global _page_table
 _page_table:
     .space 16384
+#endif
