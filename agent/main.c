@@ -131,10 +131,10 @@ static void handle_info(void) {
     resp[0] = flash_info.jedec_id[0];
     resp[1] = flash_info.jedec_id[1];
     resp[2] = flash_info.jedec_id[2];
-    resp[3] = 0;
+    resp[3] = flash_info.flash_type;   /* was reserved padding */
     write_le32(&resp[4], flash_info.size);
     write_le32(&resp[8], RAM_BASE);
-    write_le32(&resp[12], 0x10000);    /* 64KB sector */
+    write_le32(&resp[12], flash_info.sector_size);  /* NOR=64K, NAND=128K */
     write_le32(&resp[16], AGENT_VERSION);
     write_le32(&resp[20], AGENT_CAPS);
     proto_send(RSP_INFO, resp, 24);
