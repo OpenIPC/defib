@@ -1654,6 +1654,12 @@ def install(
     tftp_port: int = typer.Option(69, "--tftp-port", help="TFTP server port"),
     nor_size: int = typer.Option(8, "--nor-size", help="NOR flash size in MB (8, 16, or 32)"),
     nand: bool = typer.Option(False, "--nand", help="Use NAND flash instead of NOR"),
+    wipe_env: bool = typer.Option(
+        False, "--wipe-env",
+        help="Erase the env partition during U-Boot flash (loses ethaddr; "
+             "default is to preserve env so MACs aren't reset to the OpenIPC "
+             "u-boot default 00:00:23:34:45:66).",
+    ),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
 ) -> None:
@@ -1666,7 +1672,7 @@ def install(
     import asyncio
     asyncio.run(_install_async(
         chip, firmware, port, power_cycle, nic, host_ip, device_ip,
-        tftp_port, nor_size, nand, output, debug,
+        tftp_port, nor_size, nand, wipe_env, output, debug,
     ))
 
 
@@ -1738,6 +1744,7 @@ async def _install_async(
     tftp_port: int,
     nor_size: int,
     nand: bool,
+    wipe_env: bool,
     output: str,
     debug: bool,
 ) -> None:
@@ -1868,10 +1875,15 @@ async def _install_async(
     env_off, env_sz = layout["env"]
     # OpenIPC publishes raw U-Boot now (issue #73) — pad locally to the
     # boot partition size so the trailing flash is erased (0xFF), not
-    # left at whatever was previously written. We then erase boot+env
-    # together so the env partition gets cleared in the same operation.
+    # left at whatever was previously written.
     uboot_data = pad_to_size(uboot_raw, b_sz)
-    uboot_flash_size = b_sz + env_sz
+    # Default: erase only the boot partition. Erasing the env partition
+    # destroys any ethaddr that u-boot derived on a previous boot, which
+    # then has the OpenIPC compiled-in default 00:00:23:34:45:66 saved
+    # back in its place at the saveenv at the end of install — that's
+    # how multiple cameras converge on the same MAC.  --wipe-env opts
+    # back into the old behavior when a clean env is wanted.
+    uboot_flash_size = b_sz + env_sz if wipe_env else b_sz
 
     if output == "human":
         if len(uboot_raw) == len(uboot_data):
@@ -2250,6 +2262,37 @@ async def _install_async(
                     mtdparts_var = f"mtdpartsnor{nor_size}m"
                     await _cmd(f"run {mtdparts_var}", timeout=3.0)
                 await _cmd("setenv bootcmd ${bootcmdnor}", timeout=3.0)
+
+            # Rescue ethaddr before saveenv. OpenIPC u-boot's compiled-in
+            # default env carries ethaddr=00:00:23:34:45:66; if u-boot
+            # loaded that default (because the env partition was empty
+            # or just got erased by --wipe-env), saveenv would persist
+            # the bogus MAC and every fresh camera in a fleet would
+            # converge on it. Replace with a locally-administered random
+            # MAC if we see the default or nothing valid.
+            from defib.uboot_env import (
+                generate_locally_administered_mac,
+                is_unset_or_default_ethaddr,
+                parse_printenv_value,
+            )
+            eth_resp = await _cmd("printenv ethaddr", timeout=5.0)
+            current_eth = parse_printenv_value(eth_resp, "ethaddr")
+            if is_unset_or_default_ethaddr(current_eth):
+                new_mac = generate_locally_administered_mac()
+                if output == "human":
+                    if current_eth:
+                        console.print(
+                            f"  ethaddr was [yellow]{current_eth}[/yellow] "
+                            f"(OpenIPC default) — assigning [cyan]{new_mac}[/cyan]"
+                        )
+                    else:
+                        console.print(
+                            f"  ethaddr unset — assigning [cyan]{new_mac}[/cyan]"
+                        )
+                await _cmd(f"setenv ethaddr {new_mac}", timeout=3.0)
+            elif output == "human":
+                console.print(f"  ethaddr preserved: [cyan]{current_eth}[/cyan]")
+
             resp = await _cmd("saveenv", timeout=10.0)
             if output == "human":
                 console.print("  [green]Environment saved[/green]")
