@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import pytest
 
 from defib.firmware import (
     AVAILABLE_FIRMWARE,
@@ -9,6 +10,7 @@ from defib.firmware import (
     has_firmware,
     get_cache_dir,
     get_cached_path,
+    pad_to_size,
 )
 
 
@@ -64,3 +66,28 @@ class TestCacheDir:
 
     def test_cached_path_missing(self):
         assert get_cached_path("nonexistent_chip_xyz") is None
+
+
+class TestPadToSize:
+    def test_pads_short_input_with_ff(self):
+        # Issue #73: producer dropped 1 MiB padding; consumer pads now.
+        # 199276-byte raw u-boot → 1 MiB partition.
+        raw = b"\xde\xad\xbe\xef" * 49819  # 199276 bytes
+        padded = pad_to_size(raw, 0x100000)
+        assert len(padded) == 0x100000
+        assert padded[: len(raw)] == raw
+        assert padded[len(raw):] == b"\xff" * (0x100000 - len(raw))
+
+    def test_exact_size_unchanged(self):
+        data = b"\x00\x11\x22\x33"
+        assert pad_to_size(data, 4) == data
+
+    def test_oversize_raises(self):
+        with pytest.raises(ValueError, match="larger than target"):
+            pad_to_size(b"\x00" * 10, 4)
+
+    def test_custom_fill_byte(self):
+        assert pad_to_size(b"x", 4, fill=0x00) == b"x\x00\x00\x00"
+
+    def test_empty_input(self):
+        assert pad_to_size(b"", 3) == b"\xff\xff\xff"

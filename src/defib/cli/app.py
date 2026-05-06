@@ -1752,7 +1752,12 @@ async def _install_async(
     from rich.console import Console
 
     from defib.flashdump import get_ram_staging_addr, send_command
-    from defib.firmware import download_firmware, get_cached_path, has_firmware
+    from defib.firmware import (
+        download_firmware,
+        get_cached_path,
+        has_firmware,
+        pad_to_size,
+    )
     from defib.network.ip_manager import list_interfaces, temporary_ip
     from defib.network.tftp_server import start_tftp_server
     from defib.recovery.events import LogEvent, ProgressEvent
@@ -1858,14 +1863,24 @@ async def _install_async(
             console.print(f"  Downloading U-Boot for [cyan]{chip}[/cyan]...")
         cached = download_firmware(chip)
 
-    uboot_data = cached.read_bytes()
+    uboot_raw = cached.read_bytes()
     b_off, b_sz = layout["boot"]
     env_off, env_sz = layout["env"]
-    # U-Boot to flash = boot partition (pad to boot+env size so env is clean)
+    # OpenIPC publishes raw U-Boot now (issue #73) — pad locally to the
+    # boot partition size so the trailing flash is erased (0xFF), not
+    # left at whatever was previously written. We then erase boot+env
+    # together so the env partition gets cleared in the same operation.
+    uboot_data = pad_to_size(uboot_raw, b_sz)
     uboot_flash_size = b_sz + env_sz
 
     if output == "human":
-        console.print(f"  U-Boot: [cyan]{cached.name}[/cyan] ({len(uboot_data)} bytes)")
+        if len(uboot_raw) == len(uboot_data):
+            console.print(f"  U-Boot: [cyan]{cached.name}[/cyan] ({len(uboot_data)} bytes)")
+        else:
+            console.print(
+                f"  U-Boot: [cyan]{cached.name}[/cyan] "
+                f"({len(uboot_raw)} bytes → padded to {len(uboot_data)})"
+            )
 
     # --- Step 3: Power cycle + burn U-Boot to RAM ---
     power_controller = None
