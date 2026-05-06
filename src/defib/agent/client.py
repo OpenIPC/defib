@@ -464,13 +464,21 @@ class FlashAgentClient:
         addr: int,
         data: bytes,
         on_progress: Callable[[int, int], None] | None = None,
+        fast: bool = True,
     ) -> bool:
         """Stream data directly to flash: erase + receive + program per sector.
 
         Single-phase: host streams DATA, agent erases/programs each sector
         as data arrives. No separate RAM upload. Fastest possible path.
+
+        If fast=True and data > 4KB, switches to DEFAULT_FAST_BAUD before
+        streaming. Without this, multi-MiB writes (e.g. agent flash) run
+        at the boot baud (~12 KB/s) instead of ~85 KB/s.
         """
         self._clear_rx_buffers()
+
+        if fast and len(data) > 4096:
+            await self._switch_baud(DEFAULT_FAST_BAUD)
 
         total = len(data)
         expected_crc = zlib.crc32(data) & 0xFFFFFFFF

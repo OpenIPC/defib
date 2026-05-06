@@ -567,10 +567,13 @@ static void handle_flash_stream(const uint8_t *data, uint32_t len) {
     uint32_t num_sectors = (size + sector_sz - 1) / sector_sz;
 
     /* Double buffer: receive into one while erasing+programming the other.
-     * Only 128KB total — works on all SoCs. */
+     * Each buffer must be at least sector_sz bytes — NAND sectors are
+     * 128 KiB, NOR up to 64 KiB. Spacing by 128 KiB covers both. Older
+     * 64 KiB spacing caused sector N+1's receive to clobber the second
+     * half of sector N during NAND program (bug observed on av200). */
     uint8_t *buf[2] = {
         (uint8_t *)(RAM_BASE + 0x200000),
-        (uint8_t *)(RAM_BASE + 0x210000),
+        (uint8_t *)(RAM_BASE + 0x220000),
     };
     int rx_buf = 0;  /* Buffer currently being filled */
 
