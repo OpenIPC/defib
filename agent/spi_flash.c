@@ -75,10 +75,22 @@
 /* SPI NOR commands */
 #define SPI_CMD_READ_ID       0x9F
 #define SPI_CMD_READ_STATUS   0x05
+#define SPI_CMD_READ_STATUS2  0x35
+#define SPI_CMD_READ_STATUS3  0x15
+#define SPI_CMD_WRITE_STATUS  0x01
+#define SPI_CMD_WRITE_STATUS2 0x31
+#define SPI_CMD_WRITE_STATUS3 0x11
 #define SPI_CMD_WRITE_ENABLE  0x06
 #define SPI_CMD_PAGE_PROGRAM  0x02
 #define SPI_CMD_SECTOR_ERASE  0xD8
 #define SPI_CMD_CHIP_ERASE    0xC7
+/* Winbond Global Block/Sector Unlock — releases all individual sector
+ * lock bits at once.  Required when SR3.WPS=1 has put the chip into
+ * per-sector lock mode (SPL/factory firmware sometimes leaves it set,
+ * which makes BP-bit unlock alone insufficient — sector locks override
+ * BP and silently no-op every erase/program).  Mirrors the workaround
+ * in OpenIPC's kernel (commit 3961fada, drivers/mtd/spi-nor/spi-nor.c). */
+#define SPI_CMD_GLOBAL_UNLOCK 0x98
 
 /* SPI NOR status bits */
 #define SPI_STATUS_WIP  (1 << 0)
@@ -205,8 +217,91 @@ static void spi_write_enable(void) {
  * HiSilicon SPL locks all sectors (BP0-BP3 = 0x38 in status register).
  * Must be called before any erase/write operation.
  */
-#define SPI_CMD_WRITE_STATUS  0x01
 #define SPI_STATUS_BP_MASK    0x7C  /* BP0-BP4: bits 2-6 */
+
+/* Per Winbond W25Q128FV datasheet, bit-precise masks for the unlock path.
+ * Only these bits gate program/erase; everything else (QE, drive strength,
+ * OTP locks, hold/reset) must be preserved across the unlock. */
+#define SPI_SR1_LOCK_MASK     0xFC  /* BP0..BP2 (2-4), TB (5), SEC (6), SRP0 (7) */
+#define SPI_SR2_LOCK_MASK     0x41  /* SRL (0), CMP (6) — preserve QE, LB1-3, SUS */
+#define SPI_SR3_WPS           0x04  /* WPS (2) — preserve DRV, HOLD/RST, reserved */
+
+/* Read SR2 (cmd 0x35) or SR3 (cmd 0x15). */
+static uint8_t flash_read_sr_n(uint8_t cmd) {
+    fmc_reg(FMC_CMD) = cmd;
+    fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0);
+    fmc_reg(FMC_DATA_NUM) = 1;
+    fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
+    fmc_wait_ready();
+    return (uint8_t)(*(volatile uint32_t *)(FLASH_MEM) & 0xFF);
+}
+
+/* Write a single byte to SR1/SR2/SR3 via WRSR (cmd 0x01/0x31/0x11). */
+static void flash_write_sr_n(uint8_t cmd, uint8_t val) {
+    spi_write_enable();
+    volatile uint8_t *fmc_buf = (volatile uint8_t *)(FLASH_MEM);
+    fmc_buf[0] = val;
+    fmc_reg(FMC_CMD) = cmd;
+    fmc_reg(FMC_DATA_NUM) = 1;
+    fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0);
+    fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_WRITE_DATA | FMC_OP_REG_OP_START;
+    fmc_wait_ready();
+    spi_wait_wip();
+}
+
+/* SR3 read/write before/after global unlock (sr3_pre, sr3_post). */
+uint8_t flash_unlock_sr3[2];
+
+/*
+ * Bit-precise unlock for Winbond W25Q-family chips, mirroring the intent
+ * of the OpenIPC kernel workaround (commit 3961fada in OpenIPC/linux) but
+ * touching only the bits the datasheet defines as protection state.
+ *
+ * Sequence per the W25Q128FV datasheet:
+ *   • Issue 0x98 (Global Block/Sector Unlock) only when SR3.WPS=1 — that's
+ *     the only mode where individual block lock bits exist; with WPS=0
+ *     they're undefined and the command is a no-op.
+ *   • Clear SR1 BP[0-2]/TB/SEC/SRP0 (mask 0xFC), preserving the read-only
+ *     BUSY/WEL bits (writing them is ignored anyway).
+ *   • Clear SR2 SRL+CMP (mask 0x41), preserving QE (bit 1), LB1-3 (OTP),
+ *     and the read-only SUS bit.
+ *   • Clear SR3 WPS only (mask 0x04), preserving DRV[0-1] and HOLD/RST.
+ *
+ * Each WRSR is conditional on the corresponding lock bits actually being
+ * set, so an already-unlocked chip is a no-op (no NV writes, no wear).
+ */
+static void flash_global_unlock(void) {
+    /* Disable hardware WP in the FMC controller before any SR write. */
+    fmc_reg(FMC_GLOBAL_CFG) = 0;
+
+    uint8_t sr1 = flash_read_status();
+    uint8_t sr2 = flash_read_sr_n(SPI_CMD_READ_STATUS2);
+    uint8_t sr3 = flash_read_sr_n(SPI_CMD_READ_STATUS3);
+    flash_unlock_sr3[0] = sr3;
+
+    /* 0x98 only meaningful when WPS=1 — it clears the per-block lock bits
+     * which only exist in WPS mode.  Issuing it with WPS=0 is harmless on
+     * Winbond, but we skip it to match the datasheet's intent. */
+    if (sr3 & SPI_SR3_WPS) {
+        spi_write_enable();
+        fmc_reg(FMC_CMD) = SPI_CMD_GLOBAL_UNLOCK;
+        fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0);
+        fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_REG_OP_START;
+        fmc_wait_ready();
+        spi_wait_wip();
+    }
+
+    if (sr1 & SPI_SR1_LOCK_MASK)
+        flash_write_sr_n(SPI_CMD_WRITE_STATUS,  sr1 & ~SPI_SR1_LOCK_MASK);
+
+    if (sr2 & SPI_SR2_LOCK_MASK)
+        flash_write_sr_n(SPI_CMD_WRITE_STATUS2, sr2 & ~SPI_SR2_LOCK_MASK);
+
+    if (sr3 & SPI_SR3_WPS)
+        flash_write_sr_n(SPI_CMD_WRITE_STATUS3, sr3 & ~SPI_SR3_WPS);
+
+    flash_unlock_sr3[1] = flash_read_sr_n(SPI_CMD_READ_STATUS3);
+}
 
 static void flash_unlock(void) {
     /* Read current status */
@@ -347,7 +442,12 @@ int flash_init(flash_info_t *info) {
         return 0;
     }
 
-    /* SPI NOR path */
+    /* SPI NOR path: still in normal mode here.  Run the OpenIPC-kernel
+     * style global unlock once before switching to memory-mapped boot
+     * mode for reads.  This clears SR3.WPS plus any SR1/SR2 lock bits
+     * that the per-op flash_unlock() (BP-only) doesn't touch. */
+    flash_global_unlock();
+
     fmc_enter_boot();
 
     info->flash_type = FLASH_TYPE_NOR;
@@ -538,6 +638,32 @@ uint8_t flash_read_status(void) {
     return (uint8_t)(*(volatile uint32_t *)(FLASH_MEM) & 0xFF);
 }
 
+/* Post-erase smoke test: confirm the just-erased range really reads
+ * back as 0xFF.  This catches the same "silent no-op" failure class
+ * we hit when SR3.WPS=1 made the chip swallow program/erase commands
+ * — the ERASE_OP completed cleanly but the cells weren't actually
+ * cleared.  Without this check the higher-level CRC32 verify can be
+ * fooled when the post-erase content happens to match (rare) or when
+ * the controller's read window returns stale data.
+ *
+ * Samples first/last 16 bytes of the range — fast (one register-mode
+ * cycle each) and high-signal: real silent-erase leaves the original
+ * data verbatim, which is essentially never all-FF in practice.
+ * Returns 0 if all sampled bytes are 0xFF, -1 otherwise. */
+static int flash_verify_erased(uint32_t addr, uint32_t len) {
+    const uint8_t *p = (const uint8_t *)(FLASH_MEM + addr);
+    uint32_t head = len < 16 ? len : 16;
+    for (uint32_t i = 0; i < head; i++) {
+        if (p[i] != 0xFF) return -1;
+    }
+    if (len > 32) {
+        for (uint32_t i = len - 16; i < len; i++) {
+            if (p[i] != 0xFF) return -1;
+        }
+    }
+    return 0;
+}
+
 int flash_erase_sector(uint32_t addr) {
     if (current_flash_type == FLASH_TYPE_NAND) {
         /* `addr` is the byte offset of any page within the block.
@@ -565,7 +691,11 @@ int flash_erase_sector(uint32_t addr) {
     /* Soft-reset FMC to return to boot mode for memory-mapped reads */
     fmc_enter_boot();
 
-    /* Re-verify status — soft reset may re-load flash status from hardware */
+    /* Smoke test: did the erase actually do anything? */
+    uint32_t sector_sz = 0x10000;  /* NOR sector size */
+    if (flash_verify_erased(addr, sector_sz) != 0) {
+        return -1;
+    }
     return 0;
 }
 

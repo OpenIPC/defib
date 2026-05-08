@@ -318,7 +318,10 @@ static void handle_erase(const uint8_t *data, uint32_t len) {
     proto_send_ack(ACK_OK);
 
     for (uint32_t i = 0; i < num_sectors; i++) {
-        flash_erase_sector(addr + i * sector_sz);
+        if (flash_erase_sector(addr + i * sector_sz) != 0) {
+            proto_send_ack(ACK_FLASH_ERROR);
+            return;
+        }
 
         /* Progress: [sectors_done:2LE][debug:3B] */
         uint8_t progress[5];
@@ -474,7 +477,10 @@ static void handle_flash_program(const uint8_t *data, uint32_t len) {
 
     /* Phase 1: Erase sectors */
     for (uint32_t s = 0; s < num_sectors; s++) {
-        flash_erase_sector(erase_start + s * sector_sz);
+        if (flash_erase_sector(erase_start + s * sector_sz) != 0) {
+            proto_send_ack(ACK_FLASH_ERROR);
+            return;
+        }
 
         /* Progress: [sectors_done:2LE] [total:2LE] */
         uint8_t progress[4];
@@ -532,11 +538,12 @@ static int page_is_ff(const uint8_t *data, uint32_t len) {
     return 1;
 }
 
-/* Erase sector + program non-0xFF pages from buffer */
-static void erase_and_program(uint32_t addr, const uint8_t *buf,
-                               uint32_t bytes, uint32_t page_sz,
-                               int drain_fifo) {
-    flash_erase_sector(addr);
+/* Erase sector + program non-0xFF pages from buffer.
+ * Returns 0 on success, -1 if erase failed the post-erase verify. */
+static int erase_and_program(uint32_t addr, const uint8_t *buf,
+                              uint32_t bytes, uint32_t page_sz,
+                              int drain_fifo) {
+    if (flash_erase_sector(addr) != 0) return -1;
     uint32_t offset = 0;
     while (offset < bytes) {
         uint32_t chunk = bytes - offset;
@@ -546,6 +553,7 @@ static void erase_and_program(uint32_t addr, const uint8_t *buf,
         offset += chunk;
         if (drain_fifo) proto_drain_fifo();
     }
+    return 0;
 }
 
 static void handle_flash_stream(const uint8_t *data, uint32_t len) {
@@ -594,13 +602,19 @@ static void handle_flash_stream(const uint8_t *data, uint32_t len) {
         if (!(bitmap[s / 8] & (1 << (s % 8)))) {
             /* Still process pending data sector if any */
             if (pending_buf >= 0) {
-                erase_and_program(pending_addr, buf[pending_buf],
-                                  pending_bytes, page_sz, 1);
+                if (erase_and_program(pending_addr, buf[pending_buf],
+                                       pending_bytes, page_sz, 1) != 0) {
+                    proto_send_ack(ACK_FLASH_ERROR);
+                    return;
+                }
                 pending_buf = -1;
             }
 
             /* Erase this sector (ensure 0xFF state) but don't program */
-            flash_erase_sector(flash_addr + sector_offset);
+            if (flash_erase_sector(flash_addr + sector_offset) != 0) {
+                proto_send_ack(ACK_FLASH_ERROR);
+                return;
+            }
 
             /* Send progress — no data to receive */
             uint8_t progress[4];
@@ -649,8 +663,11 @@ static void handle_flash_stream(const uint8_t *data, uint32_t len) {
         /* Process previous sector if pending (erase + program).
          * Host is streaming next sector into the OTHER buffer right now. */
         if (pending_buf >= 0) {
-            erase_and_program(pending_addr, buf[pending_buf],
-                              pending_bytes, page_sz, 1);
+            if (erase_and_program(pending_addr, buf[pending_buf],
+                                   pending_bytes, page_sz, 1) != 0) {
+                proto_send_ack(ACK_FLASH_ERROR);
+                return;
+            }
         }
 
         /* This sector's buffer becomes the pending one */
@@ -664,8 +681,11 @@ static void handle_flash_stream(const uint8_t *data, uint32_t len) {
 
     /* Process the last sector (no more data to receive) */
     if (pending_buf >= 0) {
-        erase_and_program(pending_addr, buf[pending_buf],
-                          pending_bytes, page_sz, 0);
+        if (erase_and_program(pending_addr, buf[pending_buf],
+                               pending_bytes, page_sz, 0) != 0) {
+            proto_send_ack(ACK_FLASH_ERROR);
+            return;
+        }
     }
 
     proto_send_ack(ACK_OK);
