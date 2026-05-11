@@ -192,22 +192,62 @@ class HiSiliconStandard(BootProtocol):
             label, len(frame_data), hex_preview,
             "..." if len(frame_data) > 30 else "",
         )
+        import asyncio as _aio
         for attempt in range(retries):
             await transport.flush_input()
             await transport.flush_output()
             try:
                 await transport.write(frame_data)
-                ack = await transport.read(1, timeout=timeout)
-                if ack == ACK_BYTE:
-                    logger.debug("TX %s ACKed (attempt %d/%d)", label, attempt + 1, retries)
+                # Read until ACK_BYTE found or per-attempt timeout fires.
+                # Tolerates leading garbage (BootROM banner residue, late
+                # prior-ACK arrivals, TCP-bridge batches that bundle ACK
+                # with noise) by discarding non-ACK bytes within the
+                # timeout window — earlier behaviour ("bail on first
+                # non-ACK byte") burned through 16 retries in <1 ms on
+                # rack-pod-style WiFi-bridged UARTs.
+                deadline = _aio.get_event_loop().time() + timeout
+                acked = False
+                stray = 0
+                last_stray: int | None = None
+                while True:
+                    remaining = deadline - _aio.get_event_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        b = await transport.read(1, timeout=remaining)
+                    except TransportTimeout:
+                        break
+                    if b == ACK_BYTE:
+                        acked = True
+                        break
+                    if b:
+                        last_stray = b[0]
+                        stray += 1
+                if acked:
+                    if stray:
+                        logger.debug(
+                            "TX %s ACKed after %d stray bytes (last 0x%02X) "
+                            "(attempt %d/%d)",
+                            label, stray, last_stray, attempt + 1, retries,
+                        )
+                    else:
+                        logger.debug(
+                            "TX %s ACKed (attempt %d/%d)",
+                            label, attempt + 1, retries,
+                        )
                     return True
-                logger.debug(
-                    "TX %s got 0x%02X instead of ACK (attempt %d/%d)",
-                    label, ack[0], attempt + 1, retries,
-                )
-            except TransportTimeout:
-                if attempt < 3 or attempt == retries - 1:
-                    logger.debug("TX %s timeout (attempt %d/%d)", label, attempt + 1, retries)
+                if last_stray is not None:
+                    logger.debug(
+                        "TX %s no ACK in %.0f ms after %d stray bytes "
+                        "(last 0x%02X) (attempt %d/%d)",
+                        label, timeout * 1000, stray, last_stray,
+                        attempt + 1, retries,
+                    )
+                elif attempt < 3 or attempt == retries - 1:
+                    logger.debug(
+                        "TX %s silent timeout (attempt %d/%d)",
+                        label, attempt + 1, retries,
+                    )
                 continue
             except Exception as e:
                 logger.debug("TX %s error: %s (attempt %d/%d)", label, e, attempt + 1, retries)

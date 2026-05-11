@@ -515,3 +515,50 @@ class TestWriteTimeoutRetry:
         # _send_head goes through _send_frame_with_retry.
         ok = await protocol._send_head(transport, length=64, address=0x04017000)
         assert ok, "retry loop must recover from transient write timeouts"
+
+
+class TestFrameAckSkipsLeadingGarbage:
+    """Regression for the rack-pod TCP-bridge failure mode.
+
+    Symptom: the bridge buffers camera UART output while no client is
+    connected, then dumps it as the first bytes the host reads. The old
+    `_send_frame_with_retry` bailed on the first non-ACK byte, so each
+    of 16 retries chewed one buffered garbage byte in <1 ms — frame
+    "FAILED after 16 retries" without ever waiting for the real ACK.
+
+    The fix reads bytes within the per-attempt timeout until ACK_BYTE
+    is found (or the timeout fires on a silent line). One attempt is
+    enough to skim past any pre-existing chatter and pick up the ACK.
+    """
+
+    @pytest.mark.asyncio
+    async def test_ack_after_leading_garbage_is_accepted(self):
+        transport = MockTransport(flush_clears_buffer=False)
+        # 16 bytes of bridge-buffered junk followed by a real ACK.
+        transport.enqueue_rx(b"\xfe\x5e\x40\xff\x5e\x41\x5e\x40"
+                             b"\x5e\x40\x5e\x40\x40\x5e\x41\x30")
+        transport.enqueue_rx(ACK_BYTE)
+
+        protocol = HiSiliconStandard()
+        ok = await protocol._send_head(transport, length=64, address=0x04017000)
+        assert ok, "must skim past leading garbage and find the ACK"
+
+    @pytest.mark.asyncio
+    async def test_silent_line_still_times_out(self):
+        """If the device never ACKs, the retry budget must still expire."""
+        transport = MockTransport(flush_clears_buffer=False)
+        # No data ever enqueued — read() will TransportTimeout immediately.
+
+        protocol = HiSiliconStandard()
+        ok = await protocol._send_head(transport, length=64, address=0x04017000)
+        assert not ok, "silent line must fail after retries"
+
+    @pytest.mark.asyncio
+    async def test_pure_ack_still_accepted_on_first_byte(self):
+        """No garbage: ACK as the very first byte should still work."""
+        transport = MockTransport(flush_clears_buffer=False)
+        transport.enqueue_rx(ACK_BYTE)
+
+        protocol = HiSiliconStandard()
+        ok = await protocol._send_head(transport, length=64, address=0x04017000)
+        assert ok
