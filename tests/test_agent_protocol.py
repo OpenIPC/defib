@@ -237,6 +237,141 @@ class TestRecvPacket:
 
 
 # ---------------------------------------------------------------------------
+# Tests: recv_packet async-leftover buffer stress
+#
+# These exercise the per-transport buffer that recv_packet keeps for
+# bytes that arrived after a frame's delimiter — a regression class
+# (PR #86) that's worth pinning down with stream-style scenarios:
+# split frames across reads, large multi-packet streams, READY
+# interleave, per-transport isolation, and timeout behaviour when
+# the buffer has incomplete frame data.
+# ---------------------------------------------------------------------------
+
+class TestRecvPacketAsyncLeftoverStress:
+    @pytest.mark.asyncio
+    async def test_frame_split_across_two_reads_recombines(self) -> None:
+        """A single frame can arrive split across two transport reads
+        (typical for large TCP packets that cross MTU). The parser
+        must accumulate until the delimiter and parse cleanly."""
+        from defib.transport.mock import MockTransport
+        pkt = make_device_packet(RSP_INFO, b"X" * 32)
+        # Split the packet at an arbitrary mid-frame byte.
+        split = len(pkt) // 2
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(pkt[:split])
+        t.enqueue_rx(pkt[split:])
+
+        cmd, data = await recv_packet(t, timeout=1.0)
+        assert cmd == RSP_INFO
+        assert data == b"X" * 32
+
+    @pytest.mark.asyncio
+    async def test_large_stream_50_packets_in_one_chunk(self) -> None:
+        """Stress: 50 small packets crammed into one chunk should
+        all come out, in order. Catches off-by-one bugs in the
+        leftover slicing."""
+        from defib.transport.mock import MockTransport
+        N = 50
+        payloads = [bytes([i, 0xAA, 0x55]) for i in range(N)]
+        stream = b"".join(
+            make_device_packet(RSP_DATA, b"\x00\x00" + p) for p in payloads
+        )
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(stream)
+
+        for i in range(N):
+            cmd, data = await recv_packet(t, timeout=1.0)
+            assert cmd == RSP_DATA
+            assert data == b"\x00\x00" + payloads[i], f"packet {i} mismatch"
+
+    @pytest.mark.asyncio
+    async def test_recv_response_skips_ready_in_leftover(self) -> None:
+        """The READY-skipping logic of recv_response (used by INFO,
+        CRC32, etc.) must work even when the READY and the real
+        response are coalesced into a single chunk via leftover."""
+        from defib.transport.mock import MockTransport
+        chunk = (
+            make_device_packet(RSP_READY, b"DEFIB")
+            + make_device_packet(RSP_READY, b"DEFIB")
+            + make_device_packet(RSP_INFO,  b"PAYLOAD!")
+            + make_device_packet(RSP_READY, b"DEFIB")  # trailing READY queued
+        )
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(chunk)
+
+        cmd, data = await recv_response(t, timeout=1.0)
+        assert cmd == RSP_INFO
+        assert data == b"PAYLOAD!"
+        # The trailing READY is still parseable on the next call —
+        # leftover survived recv_response's internal recv_packet calls.
+        cmd2, _ = await recv_packet(t, timeout=1.0)
+        assert cmd2 == RSP_READY
+
+    @pytest.mark.asyncio
+    async def test_per_transport_isolation(self) -> None:
+        """Two transports must not share leftover state. If they did,
+        bytes from one socket would surface on another's read."""
+        from defib.transport.mock import MockTransport
+        pkt_a = make_device_packet(RSP_INFO, b"AAA")
+        pkt_b = make_device_packet(RSP_DATA, b"\x00\x00BBB")
+        ta = MockTransport(flush_clears_buffer=False)
+        tb = MockTransport(flush_clears_buffer=False)
+        # Two whole packets per transport — leftover gets populated.
+        ta.enqueue_rx(pkt_a + pkt_a)
+        tb.enqueue_rx(pkt_b + pkt_b)
+
+        # Interleave reads
+        ca, _ = await recv_packet(ta, timeout=1.0)
+        cb, _ = await recv_packet(tb, timeout=1.0)
+        ca2, _ = await recv_packet(ta, timeout=1.0)
+        cb2, _ = await recv_packet(tb, timeout=1.0)
+
+        assert ca  == RSP_INFO
+        assert ca2 == RSP_INFO
+        assert cb  == RSP_DATA
+        assert cb2 == RSP_DATA
+
+    @pytest.mark.asyncio
+    async def test_incomplete_frame_in_leftover_blocks_until_timeout(self) -> None:
+        """A leftover containing only PART of a frame (no delimiter yet)
+        must wait for more data and time out cleanly if none arrives —
+        never spuriously return a partial frame."""
+        from defib.transport.mock import MockTransport
+        pkt = make_device_packet(RSP_DATA, b"\x00\x00" + b"Z" * 16)
+        # Half the packet only, no delimiter.
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(pkt[: len(pkt) // 2])
+
+        with pytest.raises(TransportTimeout):
+            await recv_packet(t, timeout=0.2)
+
+    @pytest.mark.asyncio
+    async def test_corrupt_frame_skipped_then_recovers(self) -> None:
+        """A frame that fails CRC mid-stream must be discarded and the
+        parser must recover to the next valid frame."""
+        from defib.transport.mock import MockTransport
+        # Build a packet, then flip a bit in the middle to corrupt
+        # the CRC. The parser should clear that frame and pick up the
+        # next valid one.
+        good = make_device_packet(RSP_INFO, b"GOOD")
+        broken = bytearray(make_device_packet(RSP_DATA, b"\x00\x00" + b"BAD!"))
+        broken[4] ^= 0x42   # flip a payload bit → CRC32 mismatch
+        ok2 = make_device_packet(RSP_ACK, bytes([ACK_OK]))
+
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(bytes(broken) + good + ok2)
+
+        # First call: parser sees broken frame (CRC fail, discards),
+        # then sees the GOOD packet.
+        cmd, data = await recv_packet(t, timeout=1.0)
+        assert cmd == RSP_INFO
+        assert data == b"GOOD"
+        # Second call should hit the trailing ACK via leftover.
+        cmd2, _ = await recv_packet(t, timeout=1.0)
+        assert cmd2 == RSP_ACK
+
+
+# ---------------------------------------------------------------------------
 # Tests: send_packet
 # ---------------------------------------------------------------------------
 
