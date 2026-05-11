@@ -89,6 +89,81 @@ class RackController(PowerController):
         # Stateless HTTP — nothing to release.
         return None
 
+    async def tftp_put(
+        self,
+        name: str,
+        data: bytes,
+        timeout: float = 60.0,
+    ) -> dict[str, object]:
+        """Stage a file for the pod's local TFTP server.
+
+        The pod hosts a tiny TFTP server on its W5500 interface
+        (``192.168.1.1:69``) — the camera's U-Boot can fetch staged
+        files directly over the local LAN with no host-side TFTP
+        server and no NAT44 in the data path.
+
+        Args:
+            name: filename the camera will request via ``tftp <addr> <name>``.
+                Must not contain ``/``; the pod rejects path-traversal.
+            data: raw file bytes.  PSRAM-allocated on the pod; max size
+                is reported by the pod's ``GET /tftp`` (``max_size_bytes``).
+            timeout: HTTP timeout in seconds.
+
+        Returns:
+            JSON from the pod, e.g. ``{"name": "uImage", "size": 2055676}``.
+            On size/OOM the pod returns 4xx/503 with an ``error`` field —
+            surfaced as ``PowerControllerError`` with the response body.
+        """
+        if "/" in name or not name:
+            raise PowerControllerError(f"bad TFTP filename: {name!r}")
+        url = f"http://{self._host}:{self._port}/tftp/{name}"
+        logger.info("rack POST %s (%d bytes)", url, len(data))
+        return await asyncio.to_thread(self._http_send_sync, "POST", url, data, timeout)
+
+    async def tftp_delete(self, name: str, timeout: float = 10.0) -> dict[str, object]:
+        """Drop a staged TFTP file on the pod."""
+        if "/" in name:
+            raise PowerControllerError(f"bad TFTP filename: {name!r}")
+        path = f"/tftp/{name}" if name else "/tftp"
+        url = f"http://{self._host}:{self._port}{path}"
+        return await asyncio.to_thread(self._http_send_sync, "DELETE", url, b"", timeout)
+
+    async def tftp_clear(self, timeout: float = 10.0) -> dict[str, object]:
+        """Drop all staged TFTP files on the pod."""
+        url = f"http://{self._host}:{self._port}/tftp"
+        return await asyncio.to_thread(self._http_send_sync, "DELETE", url, b"", timeout)
+
+    async def tftp_list(self, timeout: float = 10.0) -> dict[str, object]:
+        """List staged TFTP files + PSRAM headroom."""
+        url = f"http://{self._host}:{self._port}/tftp"
+        return await asyncio.to_thread(self._http_send_sync, "GET", url, None, timeout)
+
+    @staticmethod
+    def _http_send_sync(
+        method: str, url: str, body: bytes | None, timeout: float,
+    ) -> dict[str, object]:
+        req = urllib.request.Request(url, method=method)
+        if body is not None:
+            req.data = body
+            req.add_header("Content-Type", "application/octet-stream")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = resp.read()
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            raise PowerControllerError(
+                f"rack HTTP {e.code} on {method} {url}: {detail}"
+            ) from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise PowerControllerError(
+                f"rack unreachable at {url}: {e}"
+            ) from e
+        try:
+            result = json.loads(payload)
+        except json.JSONDecodeError:
+            return {}
+        return result if isinstance(result, dict) else {}
+
     async def fastboot(
         self,
         spl_address: int,

@@ -403,3 +403,106 @@ class TestFastbootWireFormat:
         # = 12 + 6 + 128 + 4 + 24576 + 4 + 17104 = 41834
         assert len(rec.calls[0][2]) == 41834
         assert len(rec.calls[0][2]) < 1024 * 1024  # < FASTBOOT_MAX_BODY
+
+
+# ---------------------------------------------------------------------------
+# tftp_put / tftp_delete / tftp_clear / tftp_list — pod-hosted TFTP staging
+# ---------------------------------------------------------------------------
+
+class TestTftpStaging:
+    """RackController.tftp_put / delete / clear / list — the host wrapper
+    around the pod's POST /tftp/<name>, DELETE /tftp/<name>, GET /tftp.
+
+    Lets defib (or any caller) stage firmware into the pod's PSRAM so the
+    camera's U-Boot can fetch it from 192.168.1.1 over the local LAN —
+    no host-side TFTP server required."""
+
+    @pytest.mark.asyncio
+    async def test_tftp_put_posts_correct_url_and_body(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctrl = RackController(host="pod", port=8080)
+        body = b'{"name":"uImage","size":2048}'
+        with patched_urlopen(monkeypatch, body=body) as rec:
+            r = await ctrl.tftp_put("uImage", b"X" * 2048)
+        assert len(rec.calls) == 1
+        method, url, data = rec.calls[0]
+        assert method == "POST"
+        assert url == "http://pod:8080/tftp/uImage"
+        assert data == b"X" * 2048
+        assert r == {"name": "uImage", "size": 2048}
+
+    @pytest.mark.asyncio
+    async def test_tftp_put_rejects_path_traversal(self) -> None:
+        ctrl = RackController(host="pod", port=8080)
+        with pytest.raises(PowerControllerError, match="bad TFTP filename"):
+            await ctrl.tftp_put("../etc/passwd", b"x")
+        with pytest.raises(PowerControllerError, match="bad TFTP filename"):
+            await ctrl.tftp_put("sub/path", b"x")
+        with pytest.raises(PowerControllerError, match="bad TFTP filename"):
+            await ctrl.tftp_put("", b"x")
+
+    @pytest.mark.asyncio
+    async def test_tftp_delete_one(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctrl = RackController(host="pod", port=8080)
+        with patched_urlopen(monkeypatch, body=b'{"ok":true}') as rec:
+            await ctrl.tftp_delete("uImage")
+        method, url, _ = rec.calls[0]
+        assert method == "DELETE"
+        assert url == "http://pod:8080/tftp/uImage"
+
+    @pytest.mark.asyncio
+    async def test_tftp_clear_all(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctrl = RackController(host="pod", port=8080)
+        with patched_urlopen(monkeypatch, body=b'{"ok":true}') as rec:
+            await ctrl.tftp_clear()
+        method, url, _ = rec.calls[0]
+        assert method == "DELETE"
+        assert url == "http://pod:8080/tftp"   # no trailing /<name>
+
+    @pytest.mark.asyncio
+    async def test_tftp_list_returns_dict(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctrl = RackController(host="pod", port=8080)
+        body = (
+            b'{"files":[{"name":"uImage","size":2048,"reads":0}],'
+            b'"max_size_bytes":8388608,"max_slots":4,'
+            b'"psram_free_bytes":6291456,"psram_largest_free_block":4194304}'
+        )
+        with patched_urlopen(monkeypatch, body=body) as rec:
+            r = await ctrl.tftp_list()
+        method, url, _ = rec.calls[0]
+        assert method == "GET"
+        assert url == "http://pod:8080/tftp"
+        assert r["files"][0]["name"] == "uImage"
+        assert r["max_size_bytes"] == 8388608
+
+    @pytest.mark.asyncio
+    async def test_tftp_put_oom_returns_typed_error(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pod returns 503 + JSON body when PSRAM allocation fails.
+        Surface that as a PowerControllerError with the body so callers
+        can fall back to host TFTP or chunked upload."""
+        import urllib.error
+        err_body = (
+            b'{"error":"oom","requested":8388608,'
+            b'"psram_largest_free":4194304}'
+        )
+
+        def http503(req: Any, timeout: float | None = None) -> None:
+            raise urllib.error.HTTPError(
+                url=req.full_url, code=503, msg="Service Unavailable",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=io.BytesIO(err_body),
+            )
+
+        monkeypatch.setattr(rack_mod.urllib.request, "urlopen", http503)
+        ctrl = RackController(host="pod", port=8080)
+        with pytest.raises(PowerControllerError, match="503"):
+            await ctrl.tftp_put("rootfs", b"X" * 4096)
