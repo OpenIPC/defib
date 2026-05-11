@@ -41,6 +41,7 @@ CHIP_TO_FIRMWARE: dict[str, str] = {
     "hi3516dv100": "hi3516dv100",
     "gk7201v200": "gk7205v200",
     "gk7201v300": "gk7205v200",
+    "gk7205v210": "gk7205v200",
 }
 
 
