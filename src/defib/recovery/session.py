@@ -315,6 +315,13 @@ class RecoverySession:
                 except Exception:
                     pass
 
+            # Preserve everything we consumed during the break phase so the
+            # CLI's terminal mode (or any other caller) can replay the U-Boot
+            # banner — without this, --break -t shows only the Ctrl-C echo
+            # flood because the banner has already scrolled past by the time
+            # terminal mode opens its own read loop.
+            result.post_burn_buffer = bytes(buf)
+
             if prompt_found:
                 if on_log:
                     on_log(LogEvent(level="info", message="U-Boot console ready"))
