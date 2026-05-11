@@ -108,6 +108,9 @@ class SerialTransport(Transport):
     async def flush_output(self) -> None:
         self._port.reset_output_buffer()
 
+    async def set_baudrate(self, baud: int) -> None:
+        self._port.baudrate = baud
+
     async def bytes_waiting(self) -> int:
         return int(self._port.in_waiting)
 

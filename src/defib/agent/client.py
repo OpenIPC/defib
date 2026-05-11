@@ -753,18 +753,20 @@ class FlashAgentClient:
 
         Protocol: send SET_BAUD command, receive ACK at current baud,
         then both sides switch. Verifies with INFO at new baud.
-        Falls back to original baud on failure.
+        Falls back to ``FALLBACK_BAUD`` on failure.
+
+        Routes through :meth:`Transport.set_baudrate` — pyserial
+        transports update their port; RFC 2217 sends SET-BAUDRATE; the
+        rack pod's :class:`RackTransport` POSTs to ``/uart/baud``.
+        Transports without out-of-band baud signalling raise
+        ``NotImplementedError`` and we abort cleanly so the caller can
+        stay at ``FALLBACK_BAUD``.
         """
         self._clear_rx_buffers()
 
         import asyncio
 
-        port = getattr(self._transport, '_port', None)
-        if port is None:
-            logger.error("set_baud requires serial transport with _port")
-            return False
-
-        old_baud = port.baudrate
+        old_baud = self._current_baud
         payload = struct.pack("<I", baud)
         await send_packet(self._transport, CMD_SET_BAUD, payload)
 
@@ -775,22 +777,54 @@ class FlashAgentClient:
 
         # Agent has switched — now switch host side
         await asyncio.sleep(0.05)  # Brief pause for agent to complete switch
-        port.baudrate = baud
+        try:
+            await self._transport.set_baudrate(baud)
+        except NotImplementedError:
+            logger.error(
+                "set_baud: transport has no out-of-band baud control; "
+                "cannot sync host side. Wire mismatch — staying at %d.",
+                old_baud,
+            )
+            # Best-effort: nudge the agent back to fallback so we don't
+            # end up with a permanently mismatched link.
+            try:
+                fallback = struct.pack("<I", FALLBACK_BAUD)
+                await send_packet(self._transport, CMD_SET_BAUD, fallback)
+            except Exception:
+                pass
+            return False
 
-        # Verify communication at new baud
+        # Verify communication at new baud.  Drain first — any bytes that
+        # were on the wire DURING the baud transition (e.g. the agent's
+        # post-ACK drain residue, or bridge UART RX bytes clocked at the
+        # wrong rate during the host→pod /uart/baud RTT) would be parsed
+        # as junk at the new rate and corrupt the next packet.
+        await self._transport.flush_input()
+        # Clear the async-leftover buffer the agent protocol parser keeps
+        # so any half-packet bytes left from the previous rate don't
+        # contaminate the verification read.
+        try:
+            from defib.agent.protocol import _async_leftover
+            _async_leftover.pop(id(self._transport), None)
+        except ImportError:
+            pass
         await asyncio.sleep(0.05)
         try:
             await send_packet(self._transport, CMD_INFO)
             cmd, data = await recv_response(self._transport, timeout=3.0)
             if cmd == RSP_INFO:
                 logger.info("Baud rate switched to %d", baud)
+                self._current_baud = baud
                 return True
         except Exception:
             pass
 
         # Failed — switch back
         logger.warning("Verification at %d baud failed, reverting to %d", baud, old_baud)
-        port.baudrate = old_baud
+        try:
+            await self._transport.set_baudrate(old_baud)
+        except NotImplementedError:
+            pass
         return False
 
     async def mark_bad_block(self, block: int) -> bool:

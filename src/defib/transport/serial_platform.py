@@ -164,6 +164,44 @@ async def create_transport(
         logger.info("Using RFC 2217 transport: %s", device)
         return await Rfc2217Transport.create(device, baudrate=baudrate)
 
+    # Rack pod: TCP UART bridge + HTTP control plane for baud sync.
+    # URL form: rack://host[:bridge_port][?api=http_port].  Defaults
+    # are 9000 / 8080.  Differs from tcp:// only in that set_baudrate()
+    # POSTs to /uart/baud, so the on-device agent's set_baud rendezvous
+    # actually syncs both ends.
+    if device.startswith("rack://"):
+        from defib.transport.rack import RackTransport
+        endpoint = device[len("rack://"):]
+        # Optional ?api=NNN suffix
+        api_port = 8080
+        if "?" in endpoint:
+            endpoint, _, query = endpoint.partition("?")
+            for kv in query.split("&"):
+                if kv.startswith("api="):
+                    try:
+                        api_port = int(kv[len("api="):])
+                    except ValueError as e:
+                        raise TransportError(
+                            f"rack:// api port is not a number: {kv!r}"
+                        ) from e
+        if ":" in endpoint:
+            host, _, bp = endpoint.partition(":")
+            try:
+                bridge_port = int(bp)
+            except ValueError as e:
+                raise TransportError(
+                    f"rack:// bridge port is not a number: {bp!r}"
+                ) from e
+        else:
+            host = endpoint
+            bridge_port = 9000
+        if not host:
+            raise TransportError(f"rack:// transport needs a host (got '{device}')")
+        logger.info(
+            "Using RackTransport: %s:%d (api :%d)", host, bridge_port, api_port,
+        )
+        return await RackTransport.create_rack(host, bridge_port, api_port)
+
     platform = force_platform or sys.platform
 
     if platform == "darwin":
