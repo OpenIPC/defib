@@ -33,6 +33,17 @@ class SoCProfile(BaseModel):
         alias="STEPLEN",
         description="Step frame sizes: [ddr_step, spl]",
     )
+    sram_limit: str | None = Field(
+        default=None, alias="SRAMLIMIT",
+        description=(
+            "Hex string. Hard ceiling on SPL upload size (chip SRAM window "
+            "from spl_address to SRAM end). When set, _detect_spl_size will "
+            "not return a value larger than this, even if it auto-detects a "
+            "compressed-payload boundary further into the firmware. Required "
+            "for single-blob mini-boot binaries whose LZMA payload sits past "
+            "the chip's actual SRAM ceiling."
+        ),
+    )
 
     @property
     def ddr_step_address(self) -> int:
@@ -49,6 +60,12 @@ class SoCProfile(BaseModel):
     @property
     def spl_max_size(self) -> int:
         return int(self.file_lengths[1], 16)
+
+    @property
+    def spl_sram_limit(self) -> int | None:
+        if self.sram_limit is None:
+            return None
+        return int(self.sram_limit, 16)
 
     @property
     def ddr_step_data(self) -> bytes:
