@@ -267,8 +267,14 @@ async def _burn_async(
         import signal
         import sys as _sys
 
+        # Replay any bytes the session consumed during the post-upload break
+        # phase (the U-Boot banner that --break would otherwise have eaten).
+        boot_buf = bytearray(result.post_burn_buffer)
+        if result.post_burn_buffer:
+            _sys.stdout.buffer.write(result.post_burn_buffer)
+            _sys.stdout.buffer.flush()
+
         # Read initial output to detect which mode U-Boot entered
-        boot_buf = bytearray()
         for _ in range(60):  # up to 6 seconds
             try:
                 data = await transport.read(256, timeout=0.1)

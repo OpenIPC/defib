@@ -129,6 +129,56 @@ class TestSessionAutobreak:
         assert any("console ready" in m.lower() for m in log_events)
 
     @pytest.mark.asyncio
+    async def test_post_burn_buffer_preserves_uboot_banner(self):
+        """Banner bytes consumed during --break must be exposed for replay.
+
+        Real-hardware burn with `defib burn -b -t` on hi3516ev300 (2026-05-11):
+        the U-Boot version banner streamed in the window between TAIL ACK and
+        autoboot detection, so the --break loop silently swallowed it. The
+        CLI's terminal mode opened a fresh read AFTER --break finished, by
+        which point only the Ctrl-C `<INTERRUPT>` echoes were left in the
+        buffer. RecoveryResult.post_burn_buffer must contain everything that
+        was read during the break phase so callers can replay the banner.
+        """
+        transport = MockTransport(flush_clears_buffer=False)
+
+        transport.enqueue_rx(b"\x20" * 5)
+        transport.enqueue_rx(ACK_BYTE * 500)
+        # The banner — what would otherwise be lost
+        transport.enqueue_rx(UBOOT_BOOT_OUTPUT)
+        transport.enqueue_rx(AUTOBOOT_OPENIPC)
+        transport.enqueue_rx(OPENIPC_PROMPT)
+
+        session = RecoverySession(chip="hi3516cv300", firmware_data=bytes(range(256)) * 80)
+        result = await session.run(transport, send_break=True)
+
+        assert result.success
+        # Banner identifier from the real capture this test is built on.
+        assert b"U-Boot 2016.11" in result.post_burn_buffer
+        assert b"System startup" in result.post_burn_buffer
+        # And the autoboot line that triggered the Ctrl-C burst is included.
+        assert b"Press Ctrl-c to stop autoboot" in result.post_burn_buffer
+
+    @pytest.mark.asyncio
+    async def test_post_burn_buffer_empty_without_break(self):
+        """No break requested → no post_burn_buffer collection (stays empty).
+
+        post_burn_buffer is populated only inside the --break branch; without
+        --break the session returns immediately after TAIL ACK and any banner
+        bytes are read by the CLI's own terminal-mode loop directly.
+        """
+        transport = MockTransport(flush_clears_buffer=False)
+
+        transport.enqueue_rx(b"\x20" * 5)
+        transport.enqueue_rx(ACK_BYTE * 500)
+
+        session = RecoverySession(chip="hi3516cv300", firmware_data=bytes(range(256)) * 80)
+        result = await session.run(transport, send_break=False)
+
+        assert result.success
+        assert result.post_burn_buffer == b""
+
+    @pytest.mark.asyncio
     async def test_break_not_requested(self):
         """When send_break=False, no break logic runs."""
         transport = MockTransport(flush_clears_buffer=False)

@@ -58,3 +58,9 @@ class RecoveryResult:
     stages_completed: list[Stage] = field(default_factory=list)
     error: str | None = None
     elapsed_ms: float = 0.0
+    # Bytes consumed off the wire during the post-upload break/autoboot-detection
+    # phase. Without this, the U-Boot banner that streams between TAIL ACK and
+    # the autoboot countdown is silently swallowed by the send_break loop and
+    # the CLI's terminal mode never sees it. Callers that want to display or
+    # archive the banner should prepend this buffer to whatever they read next.
+    post_burn_buffer: bytes = b""
