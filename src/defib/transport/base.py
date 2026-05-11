@@ -133,5 +133,19 @@ class Transport(ABC):
         """
         raise NotImplementedError("This transport does not support unread()")
 
+    async def set_baudrate(self, baud: int) -> None:
+        """Change the UART baud rate on both ends of the link.
+
+        Real serial transports set their pyserial ``baudrate`` property.
+        RFC 2217 sends a SET-BAUDRATE sub-option to the remote bridge.
+        Bridges that expose an out-of-band control channel (e.g. the
+        rack pod's ``POST /uart/baud``) call into it.
+
+        Plain TCP-bridged UARTs that have no signalling for baud rate
+        changes raise ``NotImplementedError`` and the caller must keep
+        the wire at ``115200``.
+        """
+        raise NotImplementedError("This transport does not support set_baudrate()")
+
     async def close(self) -> None:
         """Close the transport. Default implementation does nothing."""
