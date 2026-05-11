@@ -145,6 +145,13 @@ async def _burn_async(
             if output == "human":
                 console.print(f"Power: [cyan]{power_controller.name()}[/cyan]")
 
+    # Detect rack-pod power early: the pod runs the entire HiSilicon SPL
+    # upload locally over its UART, so we MUST NOT have a TCP client on
+    # tcp://<pod>:9000 during the upload.  Defer transport-open until
+    # after fastboot returns.
+    from defib.power.rack import RackController
+    use_rack_fastboot = isinstance(power_controller, RackController)
+
     try:
         session = RecoverySession(
             chip=chip, firmware_path=firmware_path,
@@ -163,21 +170,24 @@ async def _burn_async(
         console.print(f"Protocol: [cyan]{session.protocol_name}[/cyan]")
         console.print(f"Port: [cyan]{port}[/cyan]")
 
-    # Use platform-aware transport factory
-    try:
-        from defib.transport.serial_platform import create_transport, normalize_port_name
-        transport = await create_transport(normalize_port_name(port))
-    except Exception as e:
-        if output == "json":
-            print(json_mod.dumps({"event": "error", "message": f"Serial port error: {e}"}))
-        else:
-            console.print(f"[red]Failed to open serial port:[/red] {e}")
-        raise typer.Exit(2)
+    # Use platform-aware transport factory.  Skip on rack-fastboot path —
+    # the pod needs exclusive UART access during the upload.
+    from defib.transport.serial_platform import create_transport, normalize_port_name
+    transport = None
+    if not use_rack_fastboot:
+        try:
+            transport = await create_transport(normalize_port_name(port))
+        except Exception as e:
+            if output == "json":
+                print(json_mod.dumps({"event": "error", "message": f"Serial port error: {e}"}))
+            else:
+                console.print(f"[red]Failed to open serial port:[/red] {e}")
+            raise typer.Exit(2)
 
     # Vectis: hand the live RFC 2217 transport (or legacy raw TCP) to
     # the controller so RTS/DTR toggles ride the same connection that
     # the UART data uses — Vectis only allows one client at a time.
-    if power_controller is not None:
+    if power_controller is not None and transport is not None:
         from defib.power.vectis import VectisController
         from defib.transport.rfc2217 import Rfc2217Transport
         from defib.transport.socket import SocketTransport
@@ -238,12 +248,42 @@ async def _burn_async(
             console.print(f"[{style}]{event.message}[/{style}]")
 
     try:
-        result = await session.run(
-            transport,
-            on_progress=on_progress,
-            on_log=on_log,
-            send_break=send_break,
-        )
+        if use_rack_fastboot:
+            # Pod-side fastboot: pod runs handshake + DDR + SPL + U-Boot
+            # locally on its UART (microsecond ACK latency).  No host
+            # transport during the upload.
+            from pathlib import Path
+            from defib.recovery.rack_fastboot import run_rack_fastboot
+            assert isinstance(power_controller, RackController)
+            on_log(LogEvent(level="info", message="Pod-side fastboot in progress…"))
+            firmware_bytes = Path(firmware_path).read_bytes()
+            result = await run_rack_fastboot(
+                power_controller, chip, firmware_bytes,
+            )
+            # Now open the transport for the post-burn flow (terminal /
+            # download_process detection / etc.).
+            if result.success:
+                transport = await create_transport(normalize_port_name(port))
+                if send_break:
+                    # Spam Ctrl-C briefly to break U-Boot autoboot — the
+                    # host-side path does this inside send_firmware, but
+                    # we skipped that.
+                    import asyncio as _aio
+                    end = _aio.get_event_loop().time() + 2.0
+                    while _aio.get_event_loop().time() < end:
+                        try:
+                            await transport.write(b"\x03")
+                        except Exception:
+                            break
+                        await _aio.sleep(0.05)
+        else:
+            assert transport is not None  # opened above when not use_rack_fastboot
+            result = await session.run(
+                transport,
+                on_progress=on_progress,
+                on_log=on_log,
+                send_break=send_break,
+            )
     finally:
         if progress_ctx is not None:
             progress_ctx.stop()
@@ -264,8 +304,10 @@ async def _burn_async(
             console.print(f"\n[red bold]Failed:[/red bold] {result.error}")
 
     if not result.success:
-        await transport.close()
+        if transport is not None:
+            await transport.close()
         raise typer.Exit(1)
+    assert transport is not None  # success ⇒ transport opened
 
     # Terminal mode: stream serial output until Ctrl-C
     # Auto-detects download_process mode and bridges XHEAD/XCMD framing.
@@ -1954,6 +1996,11 @@ async def _install_async(
             if output == "human":
                 console.print(f"  Power: [cyan]{power_controller.name()}[/cyan]")
 
+    # Detect rack-pod power: the pod runs the SPL/DDR/U-Boot upload
+    # locally, requires exclusive UART, so we open the transport AFTER.
+    from defib.power.rack import RackController
+    use_rack_fastboot = isinstance(power_controller, RackController)
+
     session = RecoverySession(
         chip=chip, firmware_path=str(cached),
         power_controller=power_controller, poe_port=poe_port,
@@ -1964,16 +2011,18 @@ async def _install_async(
         if not power_cycle:
             console.print("  [yellow]Power-cycle the camera now![/yellow]")
 
-    transport = await create_transport(normalize_port_name(port))
+    transport = None
+    if not use_rack_fastboot:
+        transport = await create_transport(normalize_port_name(port))
 
-    # Vectis: share the TCP transport for Ctrl+P delivery (see burn).
-    if power_controller is not None:
-        from defib.power.vectis import VectisController
-        from defib.transport.socket import SocketTransport
-        if isinstance(power_controller, VectisController) and isinstance(
-            transport, SocketTransport
-        ):
-            power_controller.attach_transport(transport)
+        # Vectis: share the TCP transport for Ctrl+P delivery (see burn).
+        if power_controller is not None:
+            from defib.power.vectis import VectisController
+            from defib.transport.socket import SocketTransport
+            if isinstance(power_controller, VectisController) and isinstance(
+                transport, SocketTransport
+            ):
+                power_controller.attach_transport(transport)
 
     def on_log(event: LogEvent) -> None:
         if output == "human":
@@ -1984,19 +2033,32 @@ async def _install_async(
         if output == "human" and event.message:
             console.print(f"  {event.message}")
 
-    result = await session.run(
-        transport,
-        on_progress=on_progress,
-        on_log=on_log,
-        send_break=False,
-    )
+    if use_rack_fastboot:
+        from defib.recovery.rack_fastboot import run_rack_fastboot
+        assert isinstance(power_controller, RackController)
+        on_log(LogEvent(level="info", message="Pod-side fastboot in progress…"))
+        result = await run_rack_fastboot(
+            power_controller, chip, cached.read_bytes(),
+        )
+        if result.success:
+            transport = await create_transport(normalize_port_name(port))
+    else:
+        assert transport is not None  # opened above when not use_rack_fastboot
+        result = await session.run(
+            transport,
+            on_progress=on_progress,
+            on_log=on_log,
+            send_break=False,
+        )
 
     if not result.success:
         console.print(f"[red]Burn failed:[/red] {result.error}")
-        await transport.close()
+        if transport is not None:
+            await transport.close()
         if power_controller:
             await power_controller.close()
         raise typer.Exit(1)
+    assert transport is not None  # success ⇒ transport opened
 
     if output == "human":
         console.print(f"  [green]U-Boot loaded in {result.elapsed_ms:.0f}ms[/green]")
