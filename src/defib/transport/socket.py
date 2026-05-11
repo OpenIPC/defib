@@ -95,11 +95,22 @@ class SocketTransport(Transport):
             raise TransportError(f"Socket write error: {e}") from e
 
     async def flush_input(self) -> None:
-        # No-op for sockets: unlike serial ports, there is no stale data
-        # to drain.  Flushing here would discard legitimate ACK responses
-        # that QEMU has already sent back (sockets are fast, no serial
-        # latency to separate the write from the ACK arrival).
-        pass
+        # Match SerialTransport.reset_input_buffer() — discard any pending
+        # input. Necessary for TCP-bridged UARTs (rack pod, generic ser2net)
+        # where the bridge buffers camera UART output while no client is
+        # connected, then floods it on accept. Without draining, the boot
+        # protocol's `_send_frame_with_retry` consumes the stale ASCII as
+        # fake ACKs and burns its entire retry budget in <1 ms.
+        self._buf.clear()
+        while True:
+            try:
+                data = self._sock.recv(4096)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            if not data:
+                break
 
     async def flush_output(self) -> None:
         pass  # sendall already ensures data is sent
