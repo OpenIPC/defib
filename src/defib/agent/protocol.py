@@ -165,6 +165,23 @@ def _recv_packet_sync(port: object, timeout: float) -> tuple[int, bytes]:
     raise TransportTimeout(f"No packet received within {timeout}s")
 
 
+# Per-transport leftover buffer for the async recv_packet path.  Holds
+# bytes that arrived in the same chunk as a parsed packet's delimiter
+# but after the delimiter — they belong to the NEXT packet and must
+# survive across calls. Keyed by id(transport) to avoid coupling
+# Transport to the parser.  Cleaned up when the transport is closed.
+_async_leftover: dict[int, bytearray] = {}
+
+
+def _async_leftover_buf(transport: Transport) -> bytearray:
+    key = id(transport)
+    buf = _async_leftover.get(key)
+    if buf is None:
+        buf = bytearray()
+        _async_leftover[key] = buf
+    return buf
+
+
 async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, bytes]:
     """Receive and parse a COBS-framed packet from the device."""
     import time
@@ -173,9 +190,42 @@ async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, 
     if port is not None:
         return _recv_packet_sync(port, timeout)
 
-    # Fallback: async transport
+    # Async transport: walk the leftover buffer first, then read more from
+    # the transport. Without preserving post-delimiter bytes across calls
+    # multi-packet responses (e.g. RSP_DATA+RSP_ACK arriving in the same
+    # TCP chunk) silently lose every packet after the first.
+    leftover = _async_leftover_buf(transport)
     frame = bytearray()
     deadline = time.monotonic() + timeout
+
+    def _consume(data: bytes) -> tuple[int, bytes] | None:
+        """Walk bytes accumulating into `frame`; return (cmd, payload) and
+        stash anything after the delimiter into `leftover` for next call."""
+        for i, byte in enumerate(data):
+            if byte == 0x00:
+                if frame:
+                    try:
+                        result = parse_packet(bytes(frame))
+                        # Save bytes after the delimiter for the next caller.
+                        if i + 1 < len(data):
+                            leftover[:0] = data[i + 1:]
+                        return result
+                    except ValueError:
+                        pass
+                    frame.clear()
+            else:
+                frame.append(byte)
+                if len(frame) > MAX_PACKET_SIZE:
+                    frame.clear()
+        return None
+
+    # Drain leftover first.
+    if leftover:
+        chunk = bytes(leftover)
+        leftover.clear()
+        got = _consume(chunk)
+        if got is not None:
+            return got
 
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
@@ -183,18 +233,9 @@ async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, 
             break
         try:
             data = await transport.read(256, timeout=min(remaining, 1.0))
-            for byte in data:
-                if byte == 0x00:
-                    if frame:
-                        try:
-                            return parse_packet(bytes(frame))
-                        except ValueError:
-                            pass
-                        frame.clear()
-                else:
-                    frame.append(byte)
-                    if len(frame) > MAX_PACKET_SIZE:
-                        frame.clear()
+            got = _consume(data)
+            if got is not None:
+                return got
         except TransportTimeout:
             continue
 

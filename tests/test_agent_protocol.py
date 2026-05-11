@@ -189,6 +189,52 @@ class TestRecvPacket:
         with pytest.raises(TransportTimeout):
             await recv_packet(transport, timeout=0.1)
 
+    @pytest.mark.asyncio
+    async def test_async_path_preserves_post_delimiter_bytes(self):
+        """Regression: recv_packet over a pyserial-less transport used
+        to drop any bytes that arrived in the same chunk *after* a
+        packet's delimiter. That dropped the RSP_ACK in
+        RSP_DATA+RSP_ACK back-to-back responses, hanging read_memory().
+
+        Drive a transport that has no `_port` attribute so the async
+        path is exercised; deliver two whole packets in one chunk and
+        assert both come out.
+        """
+        from defib.transport.mock import MockTransport
+
+        p1 = make_device_packet(RSP_DATA, b"\x00\x00" + b"hello\x00world")
+        p2 = make_device_packet(RSP_ACK, bytes([ACK_OK]))
+
+        t = MockTransport(flush_clears_buffer=False)
+        # Both packets land in one chunk — that's the case the async
+        # parser previously mishandled.
+        t.enqueue_rx(p1 + p2)
+
+        cmd1, data1 = await recv_packet(t, timeout=1.0)
+        cmd2, data2 = await recv_packet(t, timeout=1.0)
+
+        assert cmd1 == RSP_DATA
+        assert cmd2 == RSP_ACK
+        assert data2 == bytes([ACK_OK])
+
+    @pytest.mark.asyncio
+    async def test_async_path_three_packets_one_chunk(self):
+        from defib.transport.mock import MockTransport
+
+        pkts = (
+            make_device_packet(RSP_READY, b"") +
+            make_device_packet(RSP_DATA, b"\x00\x00" + b"chunk1") +
+            make_device_packet(RSP_ACK, bytes([ACK_OK]))
+        )
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(pkts)
+
+        seen = []
+        for _ in range(3):
+            cmd, _ = await recv_packet(t, timeout=1.0)
+            seen.append(cmd)
+        assert seen == [RSP_READY, RSP_DATA, RSP_ACK]
+
 
 # ---------------------------------------------------------------------------
 # Tests: send_packet
