@@ -197,3 +197,209 @@ class TestErrorMapping:
 
 def _explode(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
     raise AssertionError("urlopen must not be called in this test")
+
+
+# ---------------------------------------------------------------------------
+# fastboot() — binary blob wire format, success/failure shapes
+# ---------------------------------------------------------------------------
+
+def _parse_fastboot_blob(blob: bytes) -> dict[str, object]:
+    """Decode the binary blob the pod's /fastboot endpoint expects, so
+    tests can assert on what the host packed."""
+    off = 0
+
+    def u32() -> int:
+        nonlocal off
+        v = int.from_bytes(blob[off:off + 4], "big")
+        off += 4
+        return v
+
+    def u16() -> int:
+        nonlocal off
+        v = int.from_bytes(blob[off:off + 2], "big")
+        off += 2
+        return v
+
+    def slice_(n: int) -> bytes:
+        nonlocal off
+        v = blob[off:off + n]
+        off += n
+        return v
+
+    spl_address = u32()
+    ddr_step_address = u32()
+    uboot_address = u32()
+    prestep0 = slice_(u16())
+    ddrstep0 = slice_(u16())
+    prestep1 = slice_(u16())
+    spl = slice_(u32())
+    agent = slice_(u32())
+    assert off == len(blob), f"trailing bytes ({len(blob) - off}) past parsed fields"
+    return {
+        "spl_address": spl_address,
+        "ddr_step_address": ddr_step_address,
+        "uboot_address": uboot_address,
+        "prestep0": prestep0,
+        "ddrstep0": ddrstep0,
+        "prestep1": prestep1,
+        "spl": spl,
+        "agent": agent,
+    }
+
+
+class TestFastbootWireFormat:
+    """Round-trip the binary blob the pod's /fastboot endpoint expects.
+
+    The C side in rack/firmware/main/http_api.c reads:
+      [u32 spl_address][u32 ddr_step_address][u32 uboot_address]
+      [u16 prestep0_len][prestep0][u16 ddrstep0_len][ddrstep0]
+      [u16 prestep1_len][prestep1][u32 spl_len][spl][u32 agent_len][agent]
+    all big-endian. Pin that down so a host/pod mismatch breaks loudly.
+    """
+
+    @pytest.mark.asyncio
+    async def test_packs_expected_layout(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctrl = RackController(host="pod", port=8080)
+        body = b'{"success":true,"last_phase":"done","elapsed_ms":4521}'
+
+        with patched_urlopen(monkeypatch, body=body) as rec:
+            await ctrl.fastboot(
+                spl_address=0x04010500,
+                ddr_step_address=0x04013000,
+                uboot_address=0x41000000,
+                prestep0=b"\x01\x02\x03\x04",
+                ddrstep0=b"\x05\x06",
+                prestep1=None,
+                spl=b"S" * 256,
+                agent=b"A" * 128,
+            )
+
+        assert len(rec.calls) == 1
+        method, url, data = rec.calls[0]
+        assert method == "POST"
+        assert url == "http://pod:8080/fastboot"
+        assert data is not None
+        parsed = _parse_fastboot_blob(data)
+        assert parsed["spl_address"]      == 0x04010500
+        assert parsed["ddr_step_address"] == 0x04013000
+        assert parsed["uboot_address"]    == 0x41000000
+        assert parsed["prestep0"]         == b"\x01\x02\x03\x04"
+        assert parsed["ddrstep0"]         == b"\x05\x06"
+        assert parsed["prestep1"]         == b""   # None → empty
+        assert parsed["spl"]              == b"S" * 256
+        assert parsed["agent"]            == b"A" * 128
+
+    @pytest.mark.asyncio
+    async def test_prestep1_passthrough(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctrl = RackController(host="pod", port=8080)
+        prestep1 = bytes(range(64))
+        with patched_urlopen(monkeypatch) as rec:
+            await ctrl.fastboot(
+                spl_address=0, ddr_step_address=0, uboot_address=0,
+                prestep0=b"", ddrstep0=b"", prestep1=prestep1,
+                spl=b"", agent=b"",
+            )
+        parsed = _parse_fastboot_blob(rec.calls[0][2])
+        assert parsed["prestep1"] == prestep1
+
+    @pytest.mark.asyncio
+    async def test_success_response_returned_verbatim(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ctrl = RackController(host="pod", port=8080)
+        body = (
+            b'{"success":true,"last_phase":"done",'
+            b'"elapsed_ms":4521,"handshake_markers":7}'
+        )
+        with patched_urlopen(monkeypatch, body=body):
+            result = await ctrl.fastboot(
+                spl_address=0, ddr_step_address=0, uboot_address=0,
+                prestep0=b"", ddrstep0=b"", prestep1=None,
+                spl=b"", agent=b"",
+            )
+        assert result == {
+            "success": True,
+            "last_phase": "done",
+            "elapsed_ms": 4521,
+            "handshake_markers": 7,
+        }
+
+    @pytest.mark.asyncio
+    async def test_pod_500_returns_json_body_not_exception(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pod returns 500 + JSON for protocol failure. The host must
+        surface that JSON (so callers can read failed_phase / error)
+        rather than raising — a HTTPError surfaces ONLY for non-JSON
+        responses."""
+        import urllib.error
+        err_body = (
+            b'{"success":false,"last_phase":"prestep0",'
+            b'"failed_phase":"prestep0","error":"PRESTEP0 HEAD",'
+            b'"elapsed_ms":214,"handshake_markers":5}'
+        )
+
+        def http500(req: Any, timeout: float | None = None) -> None:
+            raise urllib.error.HTTPError(
+                url=req.full_url, code=500, msg="Internal Server Error",
+                hdrs=None,  # type: ignore[arg-type]
+                fp=io.BytesIO(err_body),
+            )
+
+        monkeypatch.setattr(rack_mod.urllib.request, "urlopen", http500)
+        ctrl = RackController(host="pod", port=8080)
+        result = await ctrl.fastboot(
+            spl_address=0, ddr_step_address=0, uboot_address=0,
+            prestep0=b"", ddrstep0=b"", prestep1=None,
+            spl=b"", agent=b"",
+        )
+        assert result["success"] is False
+        assert result["failed_phase"] == "prestep0"
+        assert "PRESTEP0" in str(result["error"])
+
+    @pytest.mark.asyncio
+    async def test_pod_unreachable_raises_power_controller_error(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import urllib.error
+
+        def raise_urlerr(req: Any, timeout: float | None = None) -> None:
+            raise urllib.error.URLError("no route to host")
+
+        monkeypatch.setattr(rack_mod.urllib.request, "urlopen", raise_urlerr)
+        ctrl = RackController(host="pod", port=8080)
+        with pytest.raises(PowerControllerError, match="rack unreachable"):
+            await ctrl.fastboot(
+                spl_address=0, ddr_step_address=0, uboot_address=0,
+                prestep0=b"", ddrstep0=b"", prestep1=None,
+                spl=b"", agent=b"",
+            )
+
+    @pytest.mark.asyncio
+    async def test_realistic_blob_size_within_pod_limit(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pod caps body at 1 MiB (FASTBOOT_MAX_BODY).  A typical
+        upload is profile (~140 B) + SPL (~24 KB) + agent (~17 KB)
+        ≈ 41 KB. Make sure our packing matches that ballpark."""
+        ctrl = RackController(host="pod", port=8080)
+        prestep = b"\xab" * 64
+        ddr = b"\xcd" * 64
+        spl = b"\x90" * 24_576
+        agent = b"\x55" * 17_104
+        with patched_urlopen(monkeypatch) as rec:
+            await ctrl.fastboot(
+                spl_address=0x04010500,
+                ddr_step_address=0x04013000,
+                uboot_address=0x41000000,
+                prestep0=prestep, ddrstep0=ddr, prestep1=None,
+                spl=spl, agent=agent,
+            )
+        # 3*u32 + 3*u16 + 64 + 64 + 0 + u32 + 24576 + u32 + 17104
+        # = 12 + 6 + 128 + 4 + 24576 + 4 + 17104 = 41834
+        assert len(rec.calls[0][2]) == 41834
+        assert len(rec.calls[0][2]) < 1024 * 1024  # < FASTBOOT_MAX_BODY
