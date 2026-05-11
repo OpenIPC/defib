@@ -89,6 +89,82 @@ class RackController(PowerController):
         # Stateless HTTP — nothing to release.
         return None
 
+    async def fastboot(
+        self,
+        spl_address: int,
+        ddr_step_address: int,
+        uboot_address: int,
+        prestep0: bytes,
+        ddrstep0: bytes,
+        prestep1: bytes | None,
+        spl: bytes,
+        agent: bytes,
+        timeout: float = 60.0,
+    ) -> dict[str, object]:
+        """Run the entire HiSilicon SPL BootROM upload locally on the pod.
+
+        Packs profile + SPL + agent into the binary blob the pod's
+        ``POST /fastboot`` expects, sends it, and returns the parsed JSON
+        response. The pod takes exclusive UART access for the upload,
+        so no concurrent TCP UART client may be active.
+
+        Response shape (success):
+            {"success": true, "last_phase": "done", "elapsed_ms": ...,
+             "handshake_markers": N}
+        Response shape (failure): adds "failed_phase" + "error".
+        """
+        blob = bytearray()
+        blob += spl_address.to_bytes(4, "big")
+        blob += ddr_step_address.to_bytes(4, "big")
+        blob += uboot_address.to_bytes(4, "big")
+        blob += len(prestep0).to_bytes(2, "big")
+        blob += prestep0
+        blob += len(ddrstep0).to_bytes(2, "big")
+        blob += ddrstep0
+        p1 = prestep1 or b""
+        blob += len(p1).to_bytes(2, "big")
+        blob += p1
+        blob += len(spl).to_bytes(4, "big")
+        blob += spl
+        blob += len(agent).to_bytes(4, "big")
+        blob += agent
+
+        url = f"http://{self._host}:{self._port}/fastboot"
+        logger.info("rack POST %s (%d bytes blob)", url, len(blob))
+        return await asyncio.to_thread(self._post_blob_sync, url, bytes(blob), timeout)
+
+    def _post_blob_sync(
+        self, url: str, body: bytes, timeout: float
+    ) -> dict[str, object]:
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = resp.read()
+        except urllib.error.HTTPError as e:
+            # Pod returns 500 + JSON body on protocol failure — surface
+            # the JSON so callers can read failed_phase/error.
+            payload = e.read()
+            try:
+                result = json.loads(payload)
+                return result if isinstance(result, dict) else {}
+            except json.JSONDecodeError:
+                raise PowerControllerError(
+                    f"rack HTTP {e.code} on {url}: "
+                    f"{payload.decode('utf-8', 'replace')[:200]}"
+                ) from e
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise PowerControllerError(
+                f"rack unreachable at {url}: {e}"
+            ) from e
+        try:
+            result = json.loads(payload)
+        except json.JSONDecodeError:
+            return {}
+        return result if isinstance(result, dict) else {}
+
     async def _post(self, path: str) -> dict[str, object]:
         url = f"http://{self._host}:{self._port}{path}"
         logger.info("rack POST %s", url)
