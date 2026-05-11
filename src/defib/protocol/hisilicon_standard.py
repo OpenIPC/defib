@@ -390,7 +390,11 @@ class HiSiliconStandard(BootProtocol):
         return None
 
     @staticmethod
-    def _detect_spl_size(firmware: bytes, profile_max: int) -> int:
+    def _detect_spl_size(
+        firmware: bytes,
+        profile_max: int,
+        sram_limit: int | None = None,
+    ) -> int:
         """Detect actual SPL code size from firmware binary.
 
         HiSilicon mini-boot layout: vector table + .reg + executable code +
@@ -403,6 +407,14 @@ class HiSiliconStandard(BootProtocol):
         and use it instead of profile_max — even if it's smaller. profile_max
         comes from HiTool's reference SPL which fills the full window; an
         OpenIPC build that's more compact must NOT be padded to that size.
+
+        sram_limit is the chip's actual SRAM-window ceiling (spl_address to
+        SRAM end). Set on profiles where the firmware can have a compressed
+        payload boundary that lies past the chip's real SRAM ceiling — e.g.
+        single-blob mini-boot self-extractors (hi3520dv200 OpenIPC build:
+        LZMA at 0x4400 vs ~0x3B00 SRAM window). Writing past sram_limit
+        corrupts bootrom state and the chip re-enters boot-mode mid-upload.
+        Cap the detected boundary so the upload fits.
         """
         # LZMA: 0x5D + 4-byte LE dictionary size (64K..16M)
         VALID_LZMA_DICT = {1 << n for n in range(16, 25)}
@@ -419,6 +431,13 @@ class HiSiliconStandard(BootProtocol):
                 detected = i & ~0x3FF
                 label = "gzip"
             if detected is not None:
+                if sram_limit is not None and detected > sram_limit:
+                    logger.info(
+                        "SPL boundary detected (%s) at 0x%X exceeds SRAM "
+                        "limit 0x%X; capping at SRAM limit",
+                        label, detected, sram_limit,
+                    )
+                    detected = sram_limit
                 if detected != profile_max:
                     logger.info(
                         "SPL boundary detected (%s) at 0x%X (%d bytes); "
@@ -445,7 +464,9 @@ class HiSiliconStandard(BootProtocol):
         # Detecting from spl_override gives 0x5000 (gzip at 0x52F0 rounded
         # down) and excludes the FF run.
         scan_buf = spl_override if spl_override is not None else firmware
-        spl_size = self._detect_spl_size(scan_buf, profile.spl_max_size)
+        spl_size = self._detect_spl_size(
+            scan_buf, profile.spl_max_size, sram_limit=profile.spl_sram_limit,
+        )
         logger.debug(
             "=== SPL === address=0x%08X size=%d chunks=%d",
             profile.spl_address, spl_size,

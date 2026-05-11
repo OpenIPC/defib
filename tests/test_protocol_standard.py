@@ -342,6 +342,56 @@ class TestDetectSplSize:
         firmware = bytes(0x100) + b"\x1f\x8b\x08" + bytes(0x6000)
         assert self._detect(firmware, profile_max=0x6000) == 0x6000
 
+    def test_sram_limit_caps_detected_above_ceiling(self):
+        # Real hi3520dv200 OpenIPC scenario: single-blob mini-boot self-extractor
+        # with LZMA payload at file offset 0x4400 (well past the chip's ~0x3B00
+        # SRAM window from spl_address 0x04010500). Without the cap defib uploads
+        # past the SRAM ceiling and the bootrom faults mid-SPL (returns 0x20
+        # instead of 0xAA, re-enters boot mode). With sram_limit set the SPL
+        # upload stays within the SRAM window.
+        firmware = bytes(0x4400) + b"\x5d\x00\x00\x01\x00" + b"\x00" * 100
+        assert HiSiliconStandard._detect_spl_size(
+            firmware, profile_max=0x2300, sram_limit=0x3B00,
+        ) == 0x3B00
+
+    def test_sram_limit_unchanged_when_detected_below_ceiling(self):
+        # Detection below sram_limit returns detected value, not the limit.
+        firmware = bytes(0x5400) + b"\x5d\x00\x00\x01\x00" + b"\x00" * 100
+        assert HiSiliconStandard._detect_spl_size(
+            firmware, profile_max=0x6000, sram_limit=0x8000,
+        ) == 0x5400
+
+    def test_sram_limit_none_preserves_legacy_above_profile_max(self):
+        # Existing PR #55 semantic: with sram_limit=None, detected may exceed
+        # profile_max (SVB-enabled av200/av300 SPLs are larger than HiTool's
+        # reference). The new sram_limit field is opt-in per profile and MUST
+        # NOT alter behavior for chips that don't set it.
+        firmware = bytes(0x6800) + b"\x1f\x8b\x08" + b"\x00" * 100
+        assert HiSiliconStandard._detect_spl_size(
+            firmware, profile_max=0x6000, sram_limit=None,
+        ) == 0x6800
+
+    def test_sram_limit_does_not_extend_below_profile_max_fallback(self):
+        # When no marker is detected at all, fall back to profile_max — the
+        # sram_limit cap only applies to detected boundaries. profile_max is
+        # already known to be a safe upload size in the no-detection path.
+        firmware = b"\xa5" * 0x10000
+        assert HiSiliconStandard._detect_spl_size(
+            firmware, profile_max=0x2300, sram_limit=0x3B00,
+        ) == 0x2300
+
+    def test_hi3520dv200_profile_wires_sram_limit(self):
+        # End-to-end profile load: the hi3520dv200.json SRAMLIMIT field parses
+        # into spl_sram_limit and is the expected 0x3B00. Catches accidental
+        # field removal / schema rename.
+        profile = load_profile("hi3520dv200", PROFILES_DIR)
+        assert profile.spl_sram_limit == 0x3B00
+
+    def test_profile_without_sram_limit_returns_none(self):
+        # Chips without the optional SRAMLIMIT field continue to return None.
+        profile = load_profile("hi3516ev300", PROFILES_DIR)
+        assert profile.spl_sram_limit is None
+
 
 class TestZeroLongFfRuns:
     """Regression tests for _zero_long_ff_runs.
