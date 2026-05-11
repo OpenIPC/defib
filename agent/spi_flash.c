@@ -649,16 +649,26 @@ uint8_t flash_read_status(void) {
  * Samples first/last 16 bytes of the range — fast (one register-mode
  * cycle each) and high-signal: real silent-erase leaves the original
  * data verbatim, which is essentially never all-FF in practice.
- * Returns 0 if all sampled bytes are 0xFF, -1 otherwise. */
+ * Returns 0 if all sampled bytes are 0xFF, -1 otherwise.
+ *
+ * Uses flash_read() (register-mode SPI READ) instead of direct
+ * memory-mapped access.  The boot-mode memory window at FLASH_MEM
+ * wraps at 1 MB on some SoCs (hi3516ev300 confirmed), so for any
+ * sector at offset ≥ 0x100000 a direct memory-mapped read returns
+ * stale data from sector (addr % 0x100000) and falsely fails the
+ * verify even though the erase succeeded. flash_read() goes through
+ * the FMC's normal-mode SPI READ path which addresses the full chip. */
 static int flash_verify_erased(uint32_t addr, uint32_t len) {
-    const uint8_t *p = (const uint8_t *)(FLASH_MEM + addr);
-    uint32_t head = len < 16 ? len : 16;
+    uint8_t buf[16];
+    uint32_t head = len < sizeof(buf) ? len : sizeof(buf);
+    flash_read(addr, buf, head);
     for (uint32_t i = 0; i < head; i++) {
-        if (p[i] != 0xFF) return -1;
+        if (buf[i] != 0xFF) return -1;
     }
     if (len > 32) {
-        for (uint32_t i = len - 16; i < len; i++) {
-            if (p[i] != 0xFF) return -1;
+        flash_read(addr + len - sizeof(buf), buf, sizeof(buf));
+        for (uint32_t i = 0; i < sizeof(buf); i++) {
+            if (buf[i] != 0xFF) return -1;
         }
     }
     return 0;
