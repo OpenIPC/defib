@@ -43,6 +43,32 @@ class TestBurnHelp:
         assert "--port" in output
 
 
+class TestPoePortOverride:
+    """`--poe-port` lets the user supply an explicit MikroTik ether port,
+    bypassing find_port_by_comment auto-discovery. Needed for /dev/ttyUSBN
+    paths that have no /dev/uart-<label> symlink (and whose basename
+    `ttyUSB2` won't prefix-match any interface comment).
+    """
+
+    def test_burn_help_documents_poe_port(self):
+        result = runner.invoke(app, ["burn", "--help"])
+        assert result.exit_code == 0
+        out = _strip_ansi(result.stdout)
+        assert "--poe-port" in out
+
+    def test_install_help_documents_poe_port(self):
+        result = runner.invoke(app, ["install", "--help"])
+        assert result.exit_code == 0
+        out = _strip_ansi(result.stdout)
+        assert "--poe-port" in out
+
+    def test_restore_help_documents_poe_port(self):
+        result = runner.invoke(app, ["restore", "--help"])
+        assert result.exit_code == 0
+        out = _strip_ansi(result.stdout)
+        assert "--poe-port" in out
+
+
 class TestPortsCommand:
     def test_ports_runs(self):
         result = runner.invoke(app, ["ports"])

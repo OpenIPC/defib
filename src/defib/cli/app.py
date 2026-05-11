@@ -19,6 +19,7 @@ def burn(
     send_break: bool = typer.Option(False, "-b", "--break", help="Send Ctrl-C after upload"),
     terminal: bool = typer.Option(False, "-t", "--terminal", help="Open serial terminal after upload"),
     power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via PoE (needs DEFIB_POE_* env vars)"),
+    poe_port_override: str = typer.Option("", "--poe-port", help="Explicit MikroTik ether port (e.g. ether3) — overrides comment-based auto-discovery. Requires --power-cycle."),
     output: str = typer.Option("human", "--output", help="Output mode: human, json, quiet"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
 ) -> None:
@@ -28,12 +29,12 @@ def burn(
     the appropriate U-Boot from OpenIPC releases.
     """
     import asyncio
-    asyncio.run(_burn_async(chip, file, port, send_break, terminal, power_cycle, output, debug))
+    asyncio.run(_burn_async(chip, file, port, send_break, terminal, power_cycle, poe_port_override, output, debug))
 
 
 async def _burn_async(
     chip: str, file: str, port: str, send_break: bool, terminal: bool,
-    power_cycle: bool, output: str, debug: bool,
+    power_cycle: bool, poe_port_override: str, output: str, debug: bool,
 ) -> None:
     import json as json_mod
     import logging
@@ -113,24 +114,29 @@ async def _burn_async(
             raise typer.Exit(1)
 
         if isinstance(power_controller, RouterOSController):
-            # Extract device label from serial port name for auto-discovery
-            # e.g. /dev/uart-IVGHP203Y-AF -> IVGHP203Y-AF
-            from pathlib import Path
-            port_basename = Path(port).name
-            device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
+            if poe_port_override:
+                poe_port = poe_port_override
+                if output == "human":
+                    console.print(f"PoE control: [cyan]{poe_port}[/cyan] (explicit) on [cyan]{power_controller._host}[/cyan]")
+            else:
+                # Extract device label from serial port name for auto-discovery
+                # e.g. /dev/uart-IVGHP203Y-AF -> IVGHP203Y-AF
+                from pathlib import Path
+                port_basename = Path(port).name
+                device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
 
-            try:
-                poe_port = await power_controller.find_port_by_comment(device_label)
-            except Exception as e:
-                if output == "json":
-                    print(json_mod.dumps({"event": "error", "message": str(e)}))
-                else:
-                    console.print(f"[red]PoE port discovery failed:[/red] {e}")
-                await power_controller.close()
-                raise typer.Exit(1)
+                try:
+                    poe_port = await power_controller.find_port_by_comment(device_label)
+                except Exception as e:
+                    if output == "json":
+                        print(json_mod.dumps({"event": "error", "message": str(e)}))
+                    else:
+                        console.print(f"[red]PoE port discovery failed:[/red] {e}")
+                    await power_controller.close()
+                    raise typer.Exit(1)
 
-            if output == "human":
-                console.print(f"PoE control: [cyan]{poe_port}[/cyan] on [cyan]{power_controller._host}[/cyan]")
+                if output == "human":
+                    console.print(f"PoE control: [cyan]{poe_port}[/cyan] on [cyan]{power_controller._host}[/cyan]")
         else:
             # Vectis (and any future single-port controller) has no port
             # discovery — pass an empty string so the recovery session
@@ -1654,6 +1660,7 @@ def install(
     firmware: str = typer.Option(..., "--firmware", help="OpenIPC firmware tarball (.tgz)"),
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial port"),
     power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via PoE"),
+    poe_port_override: str = typer.Option("", "--poe-port", help="Explicit MikroTik ether port (e.g. ether3) — overrides comment-based auto-discovery. Requires --power-cycle."),
     nic: str = typer.Option("", "--nic", help="Network interface for TFTP (auto-detect if empty)"),
     host_ip: str = typer.Option("192.168.1.10", "--host-ip", help="IP to assign to host NIC for TFTP"),
     device_ip: str = typer.Option("192.168.1.20", "--device-ip", help="IP for camera in U-Boot"),
@@ -1677,7 +1684,7 @@ def install(
     """
     import asyncio
     asyncio.run(_install_async(
-        chip, firmware, port, power_cycle, nic, host_ip, device_ip,
+        chip, firmware, port, power_cycle, poe_port_override, nic, host_ip, device_ip,
         tftp_port, nor_size, nand, wipe_env, output, debug,
     ))
 
@@ -1744,6 +1751,7 @@ async def _install_async(
     firmware_path: str,
     port: str,
     power_cycle: bool,
+    poe_port_override: str,
     nic: str,
     host_ip: str,
     device_ip: str,
@@ -1913,17 +1921,22 @@ async def _install_async(
             raise typer.Exit(1)
 
         if isinstance(power_controller, RouterOSController):
-            port_basename = Path(port).name
-            device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
-            try:
-                poe_port = await power_controller.find_port_by_comment(device_label)
-            except Exception as e:
-                console.print(f"[red]PoE port discovery failed:[/red] {e}")
-                await power_controller.close()
-                raise typer.Exit(1)
+            if poe_port_override:
+                poe_port = poe_port_override
+                if output == "human":
+                    console.print(f"  PoE: [cyan]{poe_port}[/cyan] (explicit)")
+            else:
+                port_basename = Path(port).name
+                device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
+                try:
+                    poe_port = await power_controller.find_port_by_comment(device_label)
+                except Exception as e:
+                    console.print(f"[red]PoE port discovery failed:[/red] {e}")
+                    await power_controller.close()
+                    raise typer.Exit(1)
 
-            if output == "human":
-                console.print(f"  PoE: [cyan]{poe_port}[/cyan]")
+                if output == "human":
+                    console.print(f"  PoE: [cyan]{poe_port}[/cyan]")
         else:
             poe_port = ""
             if output == "human":
@@ -2334,6 +2347,7 @@ def restore(
     device_ip: str = typer.Option("", "--device-ip", help="Device IP in U-Boot"),
     nic: str = typer.Option("", "--nic", help="Network interface for TFTP"),
     power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via PoE"),
+    poe_port_override: str = typer.Option("", "--poe-port", help="Explicit MikroTik ether port (e.g. ether3) — overrides comment-based auto-discovery. Requires --power-cycle."),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
 ) -> None:
@@ -2352,14 +2366,14 @@ def restore(
     import asyncio
     asyncio.run(_restore_async(
         chip, dump, port, uboot, flash_type, mtdparts, host_ip, device_ip, nic,
-        power_cycle, output, debug,
+        power_cycle, poe_port_override, output, debug,
     ))
 
 
 async def _restore_async(
     chip: str, dump: str, port: str, uboot_path: str, flash_type: str,
     mtdparts_arg: str, host_ip: str, device_ip: str, nic: str, power_cycle: bool,
-    output: str, debug: bool,
+    poe_port_override: str, output: str, debug: bool,
 ) -> None:
     import json as json_mod
     import logging
@@ -2517,18 +2531,23 @@ async def _restore_async(
             await power_controller.close()
             raise typer.Exit(1)
 
-        port_basename = Path(port).name
-        device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
-        try:
-            poe_port = await power_controller.find_port_by_comment(device_label)
-        except Exception as e:
-            console.print(f"[red]PoE port discovery failed:[/red] {e}")
-            if power_controller:
-                await power_controller.close()
-            raise typer.Exit(1)
+        if poe_port_override:
+            poe_port = poe_port_override
+            if output == "human":
+                console.print(f"  PoE: [cyan]{poe_port}[/cyan] (explicit)")
+        else:
+            port_basename = Path(port).name
+            device_label = port_basename.removeprefix("uart-") if port_basename.startswith("uart-") else port_basename
+            try:
+                poe_port = await power_controller.find_port_by_comment(device_label)
+            except Exception as e:
+                console.print(f"[red]PoE port discovery failed:[/red] {e}")
+                if power_controller:
+                    await power_controller.close()
+                raise typer.Exit(1)
 
-        if output == "human":
-            console.print(f"  PoE: [cyan]{poe_port}[/cyan]")
+            if output == "human":
+                console.print(f"  PoE: [cyan]{poe_port}[/cyan]")
 
     # --- Phase 1: Burn U-Boot to RAM ---
     if output == "human":
