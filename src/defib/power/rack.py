@@ -138,6 +138,30 @@ class RackController(PowerController):
         url = f"http://{self._host}:{self._port}/tftp"
         return await asyncio.to_thread(self._http_send_sync, "GET", url, None, timeout)
 
+    async def psram_can_fit(
+        self,
+        total_bytes: int,
+        headroom_bytes: int = 256 * 1024,
+    ) -> tuple[bool, dict[str, object]]:
+        """Best-effort: does the pod have a contiguous PSRAM block large
+        enough to stage ``total_bytes`` (plus ``headroom_bytes`` slack)?
+
+        Queries the pod's ``GET /tftp`` for ``psram_largest_free_block``
+        and compares.  Returns ``(fits, stats)``; on any transport error
+        returns ``(False, {})`` so the caller can treat that as "fall
+        back to host TFTP".
+
+        Used by ``defib install --tftp-via=auto`` to pick between pod and
+        host TFTP without making the user predict file sizes vs PSRAM.
+        """
+        try:
+            stats = await self.tftp_list()
+        except Exception:
+            return False, {}
+        raw = stats.get("psram_largest_free_block", 0)
+        largest = int(raw) if isinstance(raw, (int, float)) else 0
+        return largest >= total_bytes + headroom_bytes, stats
+
     @staticmethod
     def _http_send_sync(
         method: str, url: str, body: bytes | None, timeout: float,

@@ -2174,6 +2174,26 @@ async def _install_async(
         rootfs_name: rootfs_data,
     }
 
+    # --tftp-via=auto pre-flight: if the pod doesn't have enough
+    # contiguous PSRAM for the firmware, fall back to host TFTP.
+    # Surfaces "too-big rootfs" cleanly instead of OOMing the staging
+    # POST mid-way.  --tftp-via=pod stays strict (error on OOM, no
+    # silent fallback).
+    if use_pod_tftp and tftp_via == "auto":
+        assert isinstance(power_controller, RackController)
+        total_bytes = sum(len(d) for d in tftp_files.values())
+        fits, pod_stats = await power_controller.psram_can_fit(total_bytes)
+        if not fits:
+            _raw = pod_stats.get("psram_largest_free_block", 0)
+            largest = int(_raw) if isinstance(_raw, (int, float)) else 0
+            if output == "human":
+                console.print(
+                    f"  [yellow]Pod PSRAM has {largest // 1024} KB contiguous free, "
+                    f"need {total_bytes // 1024} KB for this install — falling back "
+                    f"to host TFTP.[/yellow]"
+                )
+            use_pod_tftp = False
+
     if not use_pod_tftp:
         # Host TFTP needs a NIC + host_ip; pod path needs neither.
         if not nic:
@@ -2892,6 +2912,24 @@ async def _restore_async(
         )
         await transport.close()
         raise typer.Exit(1)
+
+    # Auto-fallback: if the pod's PSRAM can't fit the dump, drop to
+    # host TFTP rather than OOMing mid-stage.  Explicit --tftp-via=pod
+    # stays strict.
+    if use_pod_tftp and tftp_via == "auto":
+        assert isinstance(power_controller, RackController)
+        total_bytes = sum(len(d) for _, d in partitions)
+        fits, pod_stats = await power_controller.psram_can_fit(total_bytes)
+        if not fits:
+            _raw = pod_stats.get("psram_largest_free_block", 0)
+            largest = int(_raw) if isinstance(_raw, (int, float)) else 0
+            if output == "human":
+                console.print(
+                    f"  [yellow]Pod PSRAM has {largest // 1024} KB contiguous free, "
+                    f"need {total_bytes // 1024} KB for this dump — falling back "
+                    f"to host TFTP.[/yellow]"
+                )
+            use_pod_tftp = False
 
     if use_pod_tftp:
         # Override host_ip + device_ip so they live on the pod's camera-
