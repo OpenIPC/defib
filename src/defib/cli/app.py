@@ -1727,6 +1727,14 @@ def install(
              "default is to preserve env so MACs aren't reset to the OpenIPC "
              "u-boot default 00:00:23:34:45:66).",
     ),
+    tftp_via: str = typer.Option(
+        "auto", "--tftp-via",
+        help="Where the camera fetches firmware from: "
+             "'host' (defib starts a host-side TFTP server — needs sudo/port-69), "
+             "'pod' (stage files in the rack pod's PSRAM and serve from the pod's "
+             "192.168.1.1 — no host setup, requires DEFIB_POWER_TYPE=rack), "
+             "'auto' (pod when power=rack, else host).",
+    ),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
 ) -> None:
@@ -1739,7 +1747,7 @@ def install(
     import asyncio
     asyncio.run(_install_async(
         chip, firmware, port, power_cycle, poe_port_override, nic, host_ip, device_ip,
-        tftp_port, nor_size, nand, wipe_env, output, debug,
+        tftp_port, nor_size, nand, wipe_env, tftp_via, output, debug,
     ))
 
 
@@ -1813,6 +1821,7 @@ async def _install_async(
     nor_size: int,
     nand: bool,
     wipe_env: bool,
+    tftp_via: str,
     output: str,
     debug: bool,
 ) -> None:
@@ -2135,18 +2144,28 @@ async def _install_async(
         if output == "human":
             console.print("  [green]SPI flash detected[/green]")
 
-    # --- Step 5: Start TFTP server + configure U-Boot networking ---
-    if not nic:
-        interfaces = list_interfaces()
-        if interfaces:
-            nic = interfaces[0]
-        else:
-            console.print("[red]No network interfaces found. Specify --nic.[/red]")
-            await transport.close()
-            raise typer.Exit(1)
-
-    if output == "human":
-        console.print(f"  NIC: [cyan]{nic}[/cyan], Host IP: [cyan]{host_ip}[/cyan]")
+    # --- Step 5: Pick a TFTP backend, stage / start, then drive U-Boot ---
+    #
+    # Two paths:
+    #   * pod    — stage firmware bytes in the rack pod's PSRAM via
+    #              RackController.tftp_put; camera fetches from the pod's
+    #              W5500 IP (192.168.1.1). Zero host setup; the pod is
+    #              already on the camera's local LAN.
+    #   * host   — defib starts an embedded TFTP server on the host's
+    #              `nic` at `host_ip`. Needs sudo / port-69 / NIC plumbing.
+    #
+    # `--tftp-via auto` picks pod when power=rack, host otherwise.
+    use_pod_tftp = (
+        tftp_via == "pod"
+        or (tftp_via == "auto" and isinstance(power_controller, RackController))
+    )
+    if tftp_via == "pod" and not isinstance(power_controller, RackController):
+        console.print(
+            "[red]--tftp-via pod requires DEFIB_POWER_TYPE=rack[/red] "
+            "(no rack pod to host TFTP)."
+        )
+        await transport.close()
+        raise typer.Exit(1)
 
     # TFTP files: U-Boot, kernel, rootfs
     tftp_files = {
@@ -2155,24 +2174,81 @@ async def _install_async(
         rootfs_name: rootfs_data,
     }
 
-    async with temporary_ip(nic, host_ip, "255.255.255.0"):
+    if not use_pod_tftp:
+        # Host TFTP needs a NIC + host_ip; pod path needs neither.
+        if not nic:
+            interfaces = list_interfaces()
+            if interfaces:
+                nic = interfaces[0]
+            else:
+                console.print("[red]No network interfaces found. Specify --nic.[/red]")
+                await transport.close()
+                raise typer.Exit(1)
         if output == "human":
-            console.print("  [green]IP assigned[/green]")
+            console.print(f"  NIC: [cyan]{nic}[/cyan], Host IP: [cyan]{host_ip}[/cyan]")
 
-        tftp_transport, tftp_protocol = await start_tftp_server(
-            files=tftp_files,
-            bind_addr=host_ip,
-            port=tftp_port,
-            done_count=3,  # U-Boot + kernel + rootfs
-        )
+    from contextlib import AsyncExitStack
+    async with AsyncExitStack() as stack:
+        # Set up the TFTP backend.  Both branches end up with:
+        #   serverip          — U-Boot's `setenv serverip` value
+        #   replace_in_tftp() — async hook to swap a file mid-flow
+        #                       (used by the UBI rootfs path below)
+        tftp_protocol = None  # only used by host path's UBI replace
+        if use_pod_tftp:
+            assert isinstance(power_controller, RackController)
+            if output == "human":
+                console.print(
+                    f"  [cyan]Staging {sum(len(d) for d in tftp_files.values()) // 1024} KB "
+                    f"in pod PSRAM via POST /tftp/<name>...[/cyan]"
+                )
+            for name, data in tftp_files.items():
+                await power_controller.tftp_put(name, data, timeout=180.0)
+            serverip = "192.168.1.1"
+            tftp_pod = power_controller
 
-        if output == "human":
-            console.print(f"  [green]TFTP server started on {host_ip}:{tftp_port}[/green]")
+            async def _aclose_pod_tftp() -> None:
+                try:
+                    await tftp_pod.tftp_clear()
+                except Exception:
+                    pass
 
+            stack.push_async_callback(_aclose_pod_tftp)
+
+            async def replace_in_tftp(name: str, data: bytes) -> None:
+                await tftp_pod.tftp_put(name, data, timeout=180.0)
+
+            if output == "human":
+                console.print(f"  [green]Pod TFTP ready on {serverip}:69[/green]")
+        else:
+            await stack.enter_async_context(
+                temporary_ip(nic, host_ip, "255.255.255.0")
+            )
+            if output == "human":
+                console.print("  [green]IP assigned[/green]")
+
+            tftp_transport, tftp_protocol = await start_tftp_server(
+                files=tftp_files,
+                bind_addr=host_ip,
+                port=tftp_port,
+                done_count=3,  # U-Boot + kernel + rootfs
+            )
+            stack.callback(tftp_transport.close)
+            serverip = host_ip
+
+            async def replace_in_tftp(name: str, data: bytes) -> None:
+                tftp_protocol._files[name] = data
+
+            if output == "human":
+                console.print(
+                    f"  [green]TFTP server started on {host_ip}:{tftp_port}[/green]"
+                )
+
+        # ── U-Boot console drive (identical for both backends, only
+        #    `serverip` and `replace_in_tftp` differ) ─────────────────
         try:
             # Configure U-Boot networking
             await _cmd(f"setenv ipaddr {device_ip}", timeout=3.0)
-            await _cmd(f"setenv serverip {host_ip}", timeout=3.0)
+            await _cmd(f"setenv serverip {serverip}", timeout=3.0)
 
             if output == "human":
                 console.print(f"  Device IP: [cyan]{device_ip}[/cyan]")
@@ -2281,8 +2357,9 @@ async def _install_async(
                         f" from {len(rootfs_data)} byte UBI image"
                     )
 
-                # Replace TFTP file with extracted UBIFS
-                tftp_protocol._files[rootfs_name] = ubifs_data
+                # Replace TFTP file with extracted UBIFS — works for
+                # both host (dict reassignment) and pod (HTTP repost).
+                await replace_in_tftp(rootfs_name, ubifs_data)
 
                 try:
                     resp = await _tftp_to_ram(rootfs_name, timeout=120.0)
@@ -2395,8 +2472,10 @@ async def _install_async(
                 console.print("\n  [bold]Resetting device...[/bold]")
             await _cmd("reset", timeout=3.0)
 
-        finally:
-            tftp_transport.close()
+        except Exception:
+            raise
+        # The AsyncExitStack handles closing the host TFTP transport and
+        # clearing pod TFTP state — no per-branch finally needed here.
 
     await transport.close()
     if power_controller:
