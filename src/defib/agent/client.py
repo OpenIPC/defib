@@ -125,6 +125,7 @@ def get_agent_binary(chip: str) -> Path | None:
         "hi3516av200": "hi3519v101",   # 3519v101 family, same memory map
         "hi3516cv610": "hi3516cv610",
         "hi3518ev200": "hi3518ev200",
+        "hi3520dv200": "hi3520dv200",  # V1-era, HISFC350 SPI controller
     }
 
     agent_name = chip_to_agent.get(chip.lower())
@@ -158,6 +159,9 @@ class FlashAgentClient:
         self._flash_size = 0
         self._ram_base = 0
         self._sector_size = 0x10000
+        # 0x14000000 is the FMC100 default; agent v3+ overrides via INFO so
+        # V1-era chips with HISFC350 (FLASH_MEM=0x58000000) work too.
+        self._flash_mem = 0x14000000
         self._current_baud = FALLBACK_BAUD
 
     @property
@@ -171,6 +175,11 @@ class FlashAgentClient:
     @property
     def ram_base(self) -> int:
         return self._ram_base
+
+    @property
+    def flash_mem(self) -> int:
+        """Memory-mapped flash window base — populated by ``get_info``."""
+        return self._flash_mem
 
     async def connect(self, timeout: float = 10.0) -> bool:
         """Wait for agent READY packet."""
@@ -239,6 +248,13 @@ class FlashAgentClient:
             caps = struct.unpack("<I", data[20:24])[0]
             result["agent_version"] = version
             result["capabilities"] = caps
+
+        # Agent v3+ reports its FLASH_MEM window so the host doesn't have
+        # to hardcode 0x14000000 (wrong on V1-era chips with HISFC350).
+        if len(data) >= 28:
+            flash_mem = struct.unpack("<I", data[24:28])[0]
+            self._flash_mem = flash_mem
+            result["flash_mem"] = flash_mem
 
         return result
 
@@ -669,7 +685,7 @@ class FlashAgentClient:
         empty_crc = zlib.crc32(b"\xFF" * sector_sz) & 0xFFFFFFFF
 
         sectors: list[SectorResult] = []
-        flash_base = 0x14000000  # FLASH_MEM
+        flash_base = self._flash_mem  # populated by get_info() above
 
         for i in range(num_sectors):
             addr = flash_base + i * sector_sz

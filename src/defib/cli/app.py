@@ -1101,7 +1101,6 @@ async def _agent_flash_async(
     )
 
     console = Console()
-    FLASH_MEM = 0x14000000
 
     # --- Load firmware file ---
     fw_path = Path(input_file)
@@ -1254,7 +1253,7 @@ async def _agent_flash_async(
     if verify:
         if output == "human":
             console.print("  Verifying CRC32...")
-        dev_crc = await client.crc32(FLASH_MEM, len(firmware))
+        dev_crc = await client.crc32(client.flash_mem, len(firmware))
         match = dev_crc == fw_crc
         if output == "human":
             if match:
@@ -1348,7 +1347,7 @@ async def _agent_info_async(port: str, output: str) -> None:
 @agent_app.command("read")
 def agent_read(
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial device (/dev/ttyUSB0), tcp://host:port, rfc2217://host:port, or socket:///path"),
-    addr: str = typer.Option(None, "-a", "--addr", help="Start address (hex, default: flash base 0x14000000)"),
+    addr: str = typer.Option(None, "-a", "--addr", help="Start address (hex, default: agent-reported flash base, typically 0x14000000)"),
     size: str = typer.Option(None, "-s", "--size", help="Size in bytes (or 1KB, 16MB, etc; default: auto-detect)"),
     output_file: str = typer.Option("flash_dump.bin", "-o", "--output", help="Output binary file"),
     verify: bool = typer.Option(True, "--verify/--no-verify", help="CRC32 verify after read"),
@@ -1390,7 +1389,7 @@ async def _agent_read_async(
             await transport.close()
             raise typer.Exit(1)
 
-    address = int(addr_str, 0) if addr_str is not None else 0x14000000
+    address = int(addr_str, 0) if addr_str is not None else client.flash_mem
     size = _parse_size(size_str) if size_str is not None else int(info["flash_size"])
 
     if output == "human":
@@ -1675,7 +1674,7 @@ async def _agent_scan_async(port: str, output_file: str, output: str) -> None:
 
         for i, sector in enumerate(scan_result.sectors):
             if sector.status in (SectorStatus.GOOD, SectorStatus.UNSTABLE):
-                flash_base = 0x14000000
+                flash_base = client.flash_mem
                 data = await client.read_memory(
                     flash_base + sector.address, sector_size, fast=True,
                 )
