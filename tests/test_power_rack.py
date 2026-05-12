@@ -506,3 +506,70 @@ class TestTftpStaging:
         ctrl = RackController(host="pod", port=8080)
         with pytest.raises(PowerControllerError, match="503"):
             await ctrl.tftp_put("rootfs", b"X" * 4096)
+
+
+class TestPsramCanFit:
+    """RackController.psram_can_fit — best-effort pre-flight check
+    used by --tftp-via=auto to pick pod vs host TFTP."""
+
+    @pytest.mark.asyncio
+    async def test_fits_with_headroom(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        body = (
+            b'{"files":[],"max_size_bytes":8388608,"max_slots":4,'
+            b'"psram_free_bytes":8000000,"psram_largest_free_block":7000000}'
+        )
+        ctrl = RackController(host="pod", port=8080)
+        with patched_urlopen(monkeypatch, body=body):
+            fits, stats = await ctrl.psram_can_fit(6 * 1024 * 1024)
+        assert fits is True
+        assert stats["psram_largest_free_block"] == 7000000
+
+    @pytest.mark.asyncio
+    async def test_does_not_fit_when_largest_block_too_small(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """OpenIPC nor-ultimate is ~10 MB; an N8R2 pod with 2 MB PSRAM
+        couldn't host it. Must say no clearly so auto-mode falls back."""
+        body = (
+            b'{"files":[],"max_size_bytes":1572864,"max_slots":4,'
+            b'"psram_free_bytes":1900000,"psram_largest_free_block":1700000}'
+        )
+        ctrl = RackController(host="pod", port=8080)
+        with patched_urlopen(monkeypatch, body=body):
+            fits, stats = await ctrl.psram_can_fit(10 * 1024 * 1024)
+        assert fits is False
+        assert stats["psram_largest_free_block"] == 1700000
+
+    @pytest.mark.asyncio
+    async def test_does_not_fit_when_headroom_eats_margin(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Exactly-equal block size must NOT pass — leave headroom for
+        the HTTP handler's transient scratch + lwip buffers."""
+        body = (
+            b'{"psram_largest_free_block":1048576}'   # 1 MiB exactly
+        )
+        ctrl = RackController(host="pod", port=8080)
+        with patched_urlopen(monkeypatch, body=body):
+            # default headroom = 256 KiB; total 1 MiB → needs 1.25 MiB
+            fits, _ = await ctrl.psram_can_fit(1024 * 1024)
+        assert fits is False
+
+    @pytest.mark.asyncio
+    async def test_pod_unreachable_returns_false(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Network error → treat as "doesn't fit" so the CLI cleanly
+        falls back to host instead of crashing on the pre-check."""
+        import urllib.error
+
+        def boom(req: Any, timeout: float | None = None) -> None:
+            raise urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(rack_mod.urllib.request, "urlopen", boom)
+        ctrl = RackController(host="pod", port=8080)
+        fits, stats = await ctrl.psram_can_fit(1024)
+        assert fits is False
+        assert stats == {}
