@@ -55,7 +55,9 @@
 #define SPI_CMD_WREN        0x06
 #define SPI_CMD_PP          0x02
 #define SPI_CMD_SE          0xD8
+#define SPI_CMD_READ        0x03   /* standard 3-byte READ */
 #define SPI_CMD_EN4B        0xB7
+#define SPI_CMD_EX4B        0xE9
 /* Macronix Extended Address Register (EAR): MX25L256-class chips keep
  * 3-byte address mode but use EAR bit 0 as the 25th address bit. WREAR
  * (0xC5) writes EAR. Vendor U-Boot's `SPI_BRWR=0x17` defines for this
@@ -204,6 +206,38 @@ int flash_init(flash_info_t *info) {
     /* Set timing to vendor defaults — bootrom leaves something usable
      * but vendor U-Boot reprograms this on every probe. */
     fmc_reg(HISFC350_TIMING) = HISFC350_TIMING_VAL;
+
+    /* Take the controller back to a known state we can drive. If we
+     * were loaded after vendor U-Boot's hisfc350 driver ran, it left
+     * us with:
+     *   - GLOBAL_CONFIG.ADDR_MODE_4B = 1 (4-byte controller mode)
+     *   - The chip in 4-byte address mode (EN4B was issued)
+     *   - BUS_CONFIG1 set up for DMA-mode QUAD I/O reads, with
+     *     READ_EN = 0 — the AHB read window at FLASH_MEM returns
+     *     bus garbage instead of flash content.
+     * Our driver uses 3-byte addressing + WREAR-based bank-switching
+     * for the high 16 MiB, so reset both controller and chip to 3-byte
+     * mode and enable a plain STD READ via the AHB window. */
+    /* (1) Force GLOBAL_CONFIG.ADDR_MODE_4B = 0. */
+    fmc_reg(HISFC350_GLOBAL_CONFIG) &= ~HISFC350_GLOBAL_CONFIG_ADDR_MODE_4B;
+    /* (2) Exit 4-byte mode on the chip (no-op if already in 3-byte). */
+    fmc_reg(HISFC350_CMD_INS) = SPI_CMD_EX4B;
+    fmc_reg(HISFC350_CMD_CONFIG) =
+        HISFC350_CMD_CONFIG_SEL_CS(1) |   /* try CS1 — chip is usually there */
+        HISFC350_CMD_CONFIG_START;
+    hisfc_wait_cmd();
+    fmc_reg(HISFC350_CMD_INS) = SPI_CMD_EX4B;
+    fmc_reg(HISFC350_CMD_CONFIG) =
+        HISFC350_CMD_CONFIG_SEL_CS(0) |
+        HISFC350_CMD_CONFIG_START;
+    hisfc_wait_cmd();
+    /* (3) Configure BUS_CONFIG1 for AHB-mapped STD READ: READ_EN=1,
+     * READ_INS=0x03, READ_IF_TYPE=STD, no dummy cycles. */
+    fmc_reg(HISFC350_BUS_CONFIG1) =
+        HISFC350_BUS_CONFIG1_READ_EN |
+        HISFC350_BUS_CONFIG1_READ_INS(SPI_CMD_READ) |
+        HISFC350_BUS_CONFIG1_READ_DUMMY_CNT(0) |
+        HISFC350_BUS_CONFIG1_READ_IF_TYPE(0);
 
     /* Probe both chip-selects. Vendor U-Boot scans from CS_MAX-1 down
      * to CS0 and binds the first that returns a valid JEDEC. Vendor
