@@ -1,3 +1,7 @@
 *.o
 *.elf
 *-padded.bin
+# Host-built unit-test binaries (built by `make test HOST_CC=gcc`).
+test_agent
+test_cobs_detail
+test_firmware_data

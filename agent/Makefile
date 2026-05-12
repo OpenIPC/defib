@@ -119,8 +119,39 @@ else ifeq ($(SOC),hi3519v101)
   WDT_BASE       = 0x12080000
   CRG_BASE       = 0x12010000
   SYSCTRL_REBOOT = 0x12020004
+else ifeq ($(SOC),hi3520dv200)
+  # V1-era DVR/NVR generation — Cortex-A9 single-core, 0x2xxxxxxx peripheral
+  # map, HISFC350 SPI controller (NOT the FMC100 used by V3+/V4+/V5/V6).
+  # UART_CLOCK = CFG_CLK_BUS / 2 (per vendor Linux mach-godarm/core.c
+  # uart_clk_init: busclk=396 MHz / 2 = 198 MHz). The bootrom hands us a
+  # UART running off a slow ~2 MHz reference (IBRD=1, FBRD=5), so uart_init
+  # must first clear UART_CKSEL bit 13 of CRG+0xE4 to switch UART to APB
+  # clock — only then can we hit baud rates above 115200.
+  # FLASH_MEM at 0x58000000 per vendor mach-godarm SPI_MEM_BASE;
+  # FMC_BASE at 0x10010000 (HISFC350 register block).
+  CPU_TYPE       = cortex-a9
+  UART_BASE      = 0x20080000
+  # The bootrom hands UART running off a slow ~2 MHz reference clock
+  # (IBRD=1 / FBRD=5 → 115200 baud). uart_init preserves those divisors
+  # so 115200 keeps working without any CRG poking. set_baud above
+  # 115200 cannot succeed at this clock (would need IBRD<1) and is
+  # rejected by the IBRD safety check. Switching to APB via vendor's
+  # `CRG+0xE4 bit 13` produced an unidentified clock rate that we
+  # couldn't decode at any standard baud — see GitHub issue tracking
+  # the high-baud TODO. UART_CLOCK is the vendor U-Boot value
+  # (CFG_CLK_BUS/4 per include/configs/hi3520d.h) but is unused while
+  # the bootrom-divisor preservation path is active.
+  UART_CLOCK     = 99000000
+  LOAD_ADDR      = 0x81000000
+  FLASH_MEM      = 0x58000000
+  FMC_BASE       = 0x10010000
+  RAM_BASE       = 0x80000000
+  WDT_BASE       = 0x20040000
+  CRG_BASE       = 0x20030000
+  SYSCTRL_REBOOT = 0x20050004
+  SPI_DRIVER     = hisfc350
 else
-  $(error Unknown SOC: $(SOC). Supported: hi3516ev300 hi3516ev200 gk7205v200 gk7205v300 hi3516cv300 hi3516cv500 hi3518ev200 hi3516cv610 hi3519v101)
+  $(error Unknown SOC: $(SOC). Supported: hi3516ev300 hi3516ev200 gk7205v200 gk7205v300 hi3516cv300 hi3516cv500 hi3518ev200 hi3516cv610 hi3519v101 hi3520dv200)
 endif
 
 # Per-SoC CPU. V3 chips (cv300) are ARM926EJ-S (ARMv5TEJ);
@@ -136,6 +167,7 @@ CFLAGS = -mcpu=$(CPU_TYPE) -marm -O2 -ffreestanding -nostdlib \
          -DUART_BASE=$(UART_BASE) -DUART_CLOCK=$(UART_CLOCK) $(CPU_FLAG) \
          -DFLASH_MEM=$(FLASH_MEM) -DFMC_BASE=$(FMC_BASE) -DRAM_BASE=$(RAM_BASE) -DWDT_BASE=$(WDT_BASE) \
          -DCRG_BASE=$(CRG_BASE) -DSYSCTRL_REBOOT=$(SYSCTRL_REBOOT) \
+         $(if $(UART_CKSEL_REG),-DUART_CKSEL_REG=$(UART_CKSEL_REG) -DUART_CKSEL_BIT=$(UART_CKSEL_BIT)) \
          -mno-unaligned-access -Wall -Wextra
 
 LDFLAGS = -nostdlib -T link.ld -Ttext=$(LOAD_ADDR) --defsym=LOAD_ADDR=$(LOAD_ADDR)
@@ -145,7 +177,17 @@ LDFLAGS = -nostdlib -T link.ld -Ttext=$(LOAD_ADDR) --defsym=LOAD_ADDR=$(LOAD_ADD
 # but linking it costs nothing.
 LIBGCC := $(shell $(CC) -mcpu=$(CPU_TYPE) -print-libgcc-file-name)
 
-SRCS_C = main.c uart.c protocol.c cobs.c spi_flash.c
+# SPI flash driver — default FMC100 (V3+/V4+/V5/V6 chips). V1-era chips
+# (hi3520dv200, hi3518ev100, hi3516cv100, hi3535) need HISFC350 instead.
+# Per-SoC stanza above sets SPI_DRIVER when needed.
+SPI_DRIVER ?= fmc100
+ifeq ($(SPI_DRIVER),fmc100)
+  SPI_FLASH_SRC = spi_flash.c
+else
+  SPI_FLASH_SRC = spi_flash_$(SPI_DRIVER).c
+endif
+
+SRCS_C = main.c uart.c protocol.c cobs.c $(SPI_FLASH_SRC)
 SRCS_S = startup.S
 OBJS = $(SRCS_S:.S=.o) $(SRCS_C:.c=.o)
 

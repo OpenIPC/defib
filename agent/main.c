@@ -100,18 +100,31 @@ static int addr_readable(uint32_t addr, uint32_t size) {
     /* RAM region: RAM_BASE to RAM_BASE + 128MB */
     if (addr >= RAM_BASE && (addr + size) <= (RAM_BASE + 128 * 1024 * 1024))
         return 1;
-    /* I/O register regions (CRG, FMC controller, system controller) */
+    /* I/O register regions — V3+/V4+ default whitelist. */
     if (addr >= 0x10000000 && (addr + size) <= 0x10001000) return 1; /* FMC regs */
     if (addr >= 0x12010000 && (addr + size) <= 0x12020000) return 1; /* CRG */
     if (addr >= 0x12020000 && (addr + size) <= 0x12030000) return 1; /* SYS_CTRL */
+    /* Per-SoC controller regions (FMC + CRG + UART) — covers V1-era
+     * chips where these don't sit in the default whitelist (e.g.
+     * hi3520dv200 has FMC at 0x10010000, CRG at 0x20030000, UART at
+     * 0x20080000). 4 KiB window per controller is enough for any
+     * HiSilicon SPI-flash controller. UART access is needed to
+     * verify what divisors the bootrom programmed. */
+    if (addr >= FMC_BASE  && (addr + size) <= (FMC_BASE  + 0x1000)) return 1;
+    if (addr >= CRG_BASE  && (addr + size) <= (CRG_BASE  + 0x1000)) return 1;
+    if (addr >= UART_BASE && (addr + size) <= (UART_BASE + 0x1000)) return 1;
     /* Flash memory-mapped window — only after flash_init succeeds */
     if (flash_readable && addr >= FLASH_MEM && (addr + size) <= (FLASH_MEM + 32 * 1024 * 1024))
         return 1;
     return 0;
 }
 
-/* Agent protocol version — increment on protocol changes */
-#define AGENT_VERSION       2
+/* Agent protocol version — increment on protocol changes.
+ *   v3 added: flash_mem at INFO bytes 24..27 (so the host knows which
+ *   memory-mapped flash window CMD_CRC32/CMD_READ should target on
+ *   SoCs where it isn't 0x14000000 — e.g. hi3520dv200 has it at
+ *   0x58000000). */
+#define AGENT_VERSION       3
 
 /* Capability flags — advertise supported features */
 #define CAP_FLASH_STREAM    (1 << 0)  /* CMD_FLASH_STREAM with double-buffer */
@@ -126,7 +139,7 @@ static int addr_readable(uint32_t addr, uint32_t size) {
                     CAP_SET_BAUD | CAP_REBOOT | CAP_SELFUPDATE | CAP_SCAN)
 
 static void handle_info(void) {
-    uint8_t resp[24];
+    uint8_t resp[28];
     /* JEDEC ID in first 4 bytes (3 bytes + padding) */
     resp[0] = flash_info.jedec_id[0];
     resp[1] = flash_info.jedec_id[1];
@@ -137,7 +150,8 @@ static void handle_info(void) {
     write_le32(&resp[12], flash_info.sector_size);  /* NOR=64K, NAND=128K */
     write_le32(&resp[16], AGENT_VERSION);
     write_le32(&resp[20], AGENT_CAPS);
-    proto_send(RSP_INFO, resp, 24);
+    write_le32(&resp[24], FLASH_MEM);
+    proto_send(RSP_INFO, resp, 28);
 }
 
 static void handle_read(const uint8_t *data, uint32_t len) {
@@ -153,8 +167,13 @@ static void handle_read(const uint8_t *data, uint32_t len) {
     }
 
     /* I/O registers require 32-bit word-aligned access (ldr not ldrb).
-     * RAM and flash can use byte access. */
-    int io_region = (addr >= 0x10000000 && addr < 0x13000000);
+     * RAM and flash can use byte access. Cover the V3+/V4+/V5/V6
+     * peripheral block (0x10000000..0x13000000) as well as the V1-era
+     * regions actually used by V1 SoCs (FMC, CRG, UART). */
+    int io_region = (addr >= 0x10000000 && addr < 0x13000000)
+                 || (addr >= FMC_BASE  && addr < FMC_BASE  + 0x1000)
+                 || (addr >= CRG_BASE  && addr < CRG_BASE  + 0x1000)
+                 || (addr >= UART_BASE && addr < UART_BASE + 0x1000);
 
     uint16_t seq = 0;
     uint32_t offset = 0;
@@ -693,19 +712,21 @@ static void handle_flash_stream(const uint8_t *data, uint32_t len) {
 
 /*
  * ARM32 position-independent trampoline (machine code).
- * Copies r2 bytes from r1 to r0, then branches to r0-r2 (original dst).
+ * Copies r2 bytes from r1 to r0, then branches to r0 (original dst).
  *
- *   mov r3, r0          @ save dst
- *   cmp r2, #0
- *   beq done
- * loop:
- *   ldrb r4, [r1], #1
- *   strb r4, [r0], #1
- *   subs r2, r2, #1
- *   bne loop
- * done:
- *   bx r3               @ jump to saved dst
+ * ARMv7-A variant additionally cleans D-cache and invalidates I-cache
+ * over the destination range before BX so the I-fetch unit pulls the
+ * just-written bytes from memory instead of stale lines from when the
+ * old agent occupied that address.  Without this, selfupdate either
+ * runs with stale instructions (silent crash, no UART) or — when both
+ * binaries happen to be byte-identical at the cached lines — works by
+ * coincidence.
+ *
+ * ARM926 (ARMv5TEJ) keeps the original short trampoline; if/when we
+ * actually exercise selfupdate on ARM926 boards we'll need the same
+ * treatment with V5 cache-op encodings.
  */
+#ifdef CPU_ARM926
 static const uint32_t trampoline_arm[] = {
     0xe1a03000,  /* mov  r3, r0       ; save dst  */
     0xe3520000,  /* cmp  r2, #0                    */
@@ -718,6 +739,36 @@ static const uint32_t trampoline_arm[] = {
     /* done: */
     0xe12fff13,  /* bx   r3           ; jump to dst */
 };
+#else
+/* ARMv7-A: copy + per-line DCCMVAU + ICIMVAU + DSB + ISB + BX.
+ * Source: agent/tramp_v7.S, assembled with arm-none-eabi-gcc -mcpu=cortex-a7.
+ * Walks the destination in 32-byte cache-line steps (smallest line size
+ * among supported ARMv7-A cores; over-walking is harmless). */
+static const uint32_t trampoline_arm[] = {
+    0xe1a03000,  /* mov  r3, r0           ; save dst                       */
+    0xe1a05002,  /* mov  r5, r2           ; save size                      */
+    0xe3520000,  /* cmp  r2, #0                                             */
+    0x0a000003,  /* beq  done                                               */
+    /* copy_loop: */
+    0xe4d14001,  /* ldrb r4, [r1], #1                                       */
+    0xe4c04001,  /* strb r4, [r0], #1                                       */
+    0xe2522001,  /* subs r2, r2, #1                                         */
+    0x1afffffb,  /* bne  copy_loop                                          */
+    /* done: */
+    0xe1a00003,  /* mov  r0, r3           ; restore dst start              */
+    0xe0836005,  /* add  r6, r3, r5       ; end = dst + size               */
+    0xe3c0001f,  /* bic  r0, r0, #31      ; round down to cache line       */
+    /* cache_loop: */
+    0xee070f3b,  /* mcr  p15, 0, r0, c7, c11, 1   ; DCCMVAU                */
+    0xee070f35,  /* mcr  p15, 0, r0, c7, c5, 1    ; ICIMVAU                */
+    0xe2800020,  /* add  r0, r0, #32                                        */
+    0xe1500006,  /* cmp  r0, r6                                             */
+    0xbafffffa,  /* blt  cache_loop                                         */
+    0xf57ff04f,  /* dsb  sy                                                 */
+    0xf57ff06f,  /* isb  sy                                                 */
+    0xe12fff13,  /* bx   r3                                                 */
+};
+#endif
 
 /*
  * CMD_SELFUPDATE: receive new agent binary, verify, copy and jump.
@@ -778,6 +829,27 @@ static void handle_selfupdate(const uint8_t *data, uint32_t len) {
     volatile uint32_t *tramp_dst = (volatile uint32_t *)(RAM_BASE + 0x200);
     for (uint32_t i = 0; i < sizeof(trampoline_arm) / sizeof(uint32_t); i++)
         tramp_dst[i] = trampoline_arm[i];
+
+    /* CRITICAL: writes above land in D-cache. Without explicit cache
+     * maintenance the CPU's I-fetch at RAM_BASE+0x200 reads stale memory
+     * contents (whatever was there before — typically zeros) instead of
+     * the trampoline bytes, and execution branches into garbage.
+     * Clean D-cache for the trampoline range to push writes to memory,
+     * then invalidate the entire I-cache so new fetches hit memory. */
+#ifndef CPU_ARM926
+    {
+        uintptr_t start = (uintptr_t)tramp_dst & ~31u;
+        uintptr_t end = (uintptr_t)tramp_dst + sizeof(trampoline_arm);
+        for (uintptr_t a = start; a < end; a += 32) {
+            asm volatile("mcr p15, 0, %0, c7, c11, 1" :: "r"(a) : "memory");
+        }
+        asm volatile("dsb" ::: "memory");
+        asm volatile("mcr p15, 0, %0, c7, c5, 0" :: "r"(0) : "memory");  /* ICIALLU */
+        asm volatile("mcr p15, 0, %0, c7, c5, 6" :: "r"(0) : "memory");  /* BPIALL */
+        asm volatile("dsb" ::: "memory");
+        asm volatile("isb" ::: "memory");
+    }
+#endif
 
     void (*tramp)(uint32_t, uint32_t, uint32_t) =
         (void (*)(uint32_t, uint32_t, uint32_t))(void *)(RAM_BASE + 0x200);

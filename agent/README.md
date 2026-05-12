@@ -78,15 +78,30 @@ Requires `arm-none-eabi-gcc` (Arch: `pacman -S arm-none-eabi-gcc arm-none-eabi-n
 | hi3516cv500 | 0x12100000 | 0x14000000 | 0x80000000 | 0x81000000 |
 | hi3518ev200 | 0x12100000 | 0x14000000 | 0x80000000 | 0x81000000 |
 | hi3516cv610 | 0x11040000 | 0x14000000 | 0x40000000 | 0x41000000 |
+| hi3519v101 | 0x12100000 | 0x14000000 | 0x80000000 | 0x81000000 |
+| hi3520dv200 | 0x20080000 | 0x58000000 | 0x80000000 | 0x81000000 |
 
 Addresses from [qemu-hisilicon](https://github.com/OpenIPC/LoTool) hardware definitions.
 
+`hi3520dv200` is a V1-era DVR/NVR SoC: Cortex-A9 (single core), `0x2xxxxxxx`
+peripheral map, and a HISFC350 SPI flash controller (NOT the FMC100 used by
+all other supported SoCs). The HISFC350 driver lives in
+`spi_flash_hisfc350.c` and is selected via `SPI_DRIVER=hisfc350` in the
+per-SoC Makefile stanza.
+
 ## Agent Binary Details
 
-- **Size**: ~4 KB code + 1 KB CRC32 table = ~5 KB total
+- **Size**: ~4 KB code + 1 KB CRC32 table = ~5 KB total (HISFC350 build is
+  somewhat larger because of the bank-switching machinery)
 - **Runs bare-metal**: no OS, no U-Boot, no libc
-- **UART**: ARM PrimeCell PL011 (polled I/O, 115200 8N1)
-- **Flash**: HiSilicon FMC controller (memory-mapped read, register write/erase)
+- **UART**: ARM PrimeCell PL011 (polled I/O, 115200 8N1). On hi3520dv200 the
+  bootrom hands UART running off a slow ~2 MHz reference; we preserve those
+  divisors at startup so 115200 keeps working without any CRG poking.
+- **Flash**: HiSilicon FMC controller (default) — memory-mapped read,
+  register write/erase. V1-era chips (hi3520dv200) use the HISFC350
+  controller instead, with the same external API (`flash_read`,
+  `flash_erase_sector`, `flash_write_page`, ...) so `main.c` is
+  controller-agnostic.
 - **Protocol**: COBS framing + CRC-32 per packet
 
 ### Startup sequence
