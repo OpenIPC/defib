@@ -585,7 +585,15 @@ class FlashAgentClient:
 
         payload = struct.pack("<II", addr, size)
         await send_packet(self._transport, CMD_CRC32, payload)
-        timeout = max(10.0, 5.0 + size / (1024 * 1024))
+        # AHB STD READ on V1-era SoCs (hi3520dv200 / HISFC350) tops out at
+        # ~150 KB/s when the agent walks flash via the memory-mapped window,
+        # so a 4 MiB CRC takes ~27 s. The old `5 + size/MiB` formula timed
+        # out at 10 s for anything under ~5 MiB and led to misdiagnosed
+        # "agent stopped responding" failures even though the device was
+        # still computing the CRC and the response was on its way.
+        # Assume a conservative 100 KB/s and a 15 s baseline so V3+/V4+
+        # chips (DMA reads, multi-MB/s) still get plenty of headroom.
+        timeout = max(15.0, 5.0 + size / (100 * 1024))
         cmd, data = await recv_response(self._transport, timeout=timeout)
         if cmd != RSP_CRC32 or len(data) < 4:
             raise RuntimeError("CRC32 response invalid")
