@@ -20,6 +20,7 @@
 #define CMD_FLASH_PROGRAM 0x0A
 #define CMD_FLASH_STREAM  0x0B
 #define CMD_MARK_BAD      0x0C  /* NAND only: write 0x00 to OOB[0] of page 0 of a block */
+#define CMD_MEMBW         0x0D  /* DDR bandwidth test (ARMv7 only): see handle_membw */
 
 /* Responses (device → host) */
 #define RSP_INFO    0x81
@@ -28,6 +29,7 @@
 #define RSP_CRC32   0x84
 #define RSP_READY   0x85
 #define RSP_SCAN    0x86
+#define RSP_MEMBW   0x87
 
 /* ACK status codes */
 #define ACK_OK          0x00

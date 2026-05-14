@@ -123,8 +123,10 @@ static int addr_readable(uint32_t addr, uint32_t size) {
  *   v3 added: flash_mem at INFO bytes 24..27 (so the host knows which
  *   memory-mapped flash window CMD_CRC32/CMD_READ should target on
  *   SoCs where it isn't 0x14000000 — e.g. hi3520dv200 has it at
- *   0x58000000). */
-#define AGENT_VERSION       3
+ *   0x58000000).
+ *   v4 added: CMD_MEMBW for bare-metal DDR bandwidth measurement
+ *   (ARMv7 only; ACK_FLASH_ERROR on ARMv5). */
+#define AGENT_VERSION       4
 
 /* Capability flags — advertise supported features */
 #define CAP_FLASH_STREAM    (1 << 0)  /* CMD_FLASH_STREAM with double-buffer */
@@ -134,9 +136,15 @@ static int addr_readable(uint32_t addr, uint32_t size) {
 #define CAP_REBOOT          (1 << 4)  /* CMD_REBOOT */
 #define CAP_SELFUPDATE      (1 << 5)  /* CMD_SELFUPDATE */
 #define CAP_SCAN            (1 << 6)  /* CMD_SCAN */
+#ifndef CPU_ARM926
+#define CAP_MEMBW           (1 << 7)  /* CMD_MEMBW (ARMv7 PMU cycle counter) */
+#else
+#define CAP_MEMBW           0
+#endif
 
 #define AGENT_CAPS (CAP_FLASH_STREAM | CAP_SECTOR_BITMAP | CAP_PAGE_SKIP | \
-                    CAP_SET_BAUD | CAP_REBOOT | CAP_SELFUPDATE | CAP_SCAN)
+                    CAP_SET_BAUD | CAP_REBOOT | CAP_SELFUPDATE | CAP_SCAN | \
+                    CAP_MEMBW)
 
 static void handle_info(void) {
     uint8_t resp[28];
@@ -238,6 +246,202 @@ static void handle_crc32_cmd(const uint8_t *data, uint32_t len) {
     uint8_t resp[4];
     write_le32(resp, c);
     proto_send(RSP_CRC32, resp, 4);
+}
+
+/*
+ * CMD_MEMBW: DDR bandwidth test. ARMv7 (Cortex-A7) only.
+ *
+ * Request:  [size:4LE][iters:4LE][addr:4LE]
+ *   size = 0  → 4 MiB default; otherwise must be 256B-aligned, ≤ 16 MiB
+ *   iters = 0 → 8 default; max 256
+ *   addr = 0  → RAM_BASE + MEMBW_SCRATCH_OFF (auto-pick)
+ *
+ * Response: [base:4LE][size:4LE][iters:4LE][timer_hz:4LE]
+ *           [memset_ticks:4LE][read_ticks:4LE][memcpy_ticks:4LE][cpu_arch:4LE]
+ *
+ *   timer_hz = CCNT frequency in Hz, calibrated against the architectural
+ *              generic timer; 0 if CNTFRQ wasn't set up. Host can still
+ *              compute cycles/byte (CPU-clock-invariant) when timer_hz==0.
+ *
+ * Cache state: MMU is on with DDR mapped as write-back / write-allocate
+ * (see startup.S page-table fill). Test runs cached — apples-to-apples
+ * with userspace memcpy/memset, with the buffer sized well above L1+L2.
+ */
+#ifndef CPU_ARM926
+static inline void pmccntr_init(void) {
+    uint32_t v;
+    asm volatile("mrc p15, 0, %0, c9, c12, 0" : "=r"(v));
+    v |= (1u << 0);            /* E: enable all counters */
+    v |= (1u << 2);            /* C: reset CCNT */
+    asm volatile("mcr p15, 0, %0, c9, c12, 0" :: "r"(v));
+    asm volatile("mcr p15, 0, %0, c9, c12, 1" :: "r"(0x80000000u));
+    asm volatile("isb");
+}
+
+static inline uint32_t pmccntr_read(void) {
+    uint32_t v;
+    asm volatile("isb\n\t"
+                 "mrc p15, 0, %0, c9, c13, 0" : "=r"(v));
+    return v;
+}
+
+/* Calibrate CCNT (CPU cycles) against CNTPCT (architectural timer, fixed
+ * frequency from CNTFRQ). Returns CCNT ticks per second, or 0 if CNTFRQ
+ * wasn't initialised by an earlier boot stage. */
+static uint32_t pmccntr_calibrate_hz(void) {
+    uint32_t cntfrq;
+    asm volatile("mrc p15, 0, %0, c14, c0, 0" : "=r"(cntfrq));
+    /* Sanity: most hi-silicon BL1 sets this to 24 MHz. Anything outside
+     * 1 MHz..100 MHz is almost certainly an uninitialised register. */
+    if (cntfrq < 1000000u || cntfrq > 100000000u) return 0;
+
+    uint32_t lo0, hi0, lo1, hi1;
+    asm volatile("mrrc p15, 0, %0, %1, c14" : "=r"(lo0), "=r"(hi0));
+    uint32_t target = cntfrq / 100;   /* 10 ms window */
+    pmccntr_init();
+    uint32_t c0 = pmccntr_read();
+    do {
+        asm volatile("mrrc p15, 0, %0, %1, c14" : "=r"(lo1), "=r"(hi1));
+    } while ((lo1 - lo0) < target);
+    uint32_t c1 = pmccntr_read();
+    return (c1 - c0) * 100u;
+}
+
+/* Write 8 words per stm — 32 B per loop iteration. r4-r11 are AAPCS
+ * callee-saved; listing them as clobbers makes GCC push/pop them in
+ * the prologue. */
+static void __attribute__((noinline)) membw_memset(uint32_t addr, uint32_t bytes) {
+    asm volatile(
+        "mov r4, %[v]\n\t"
+        "mov r5, %[v]\n\t"
+        "mov r6, %[v]\n\t"
+        "mov r7, %[v]\n\t"
+        "mov r8, %[v]\n\t"
+        "mov r9, %[v]\n\t"
+        "mov r10, %[v]\n\t"
+        "mov r11, %[v]\n\t"
+        "1:\n\t"
+        "stmia %[p]!, {r4, r5, r6, r7, r8, r9, r10, r11}\n\t"
+        "cmp %[p], %[end]\n\t"
+        "blo 1b\n\t"
+        : [p] "+r"(addr)
+        : [end] "r"(addr + bytes), [v] "r"(0xA5A5A5A5u)
+        : "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11",
+          "cc", "memory"
+    );
+}
+
+/* Read 8 words per ldm. No store — pure read bandwidth. */
+static void __attribute__((noinline)) membw_read(uint32_t addr, uint32_t bytes) {
+    asm volatile(
+        "1:\n\t"
+        "ldmia %[p]!, {r4, r5, r6, r7, r8, r9, r10, r11}\n\t"
+        "cmp %[p], %[end]\n\t"
+        "blo 1b\n\t"
+        : [p] "+r"(addr)
+        : [end] "r"(addr + bytes)
+        : "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11",
+          "cc", "memory"
+    );
+}
+
+/* Copy 8 words per ldm/stm pair — 32 B in, 32 B out per iteration. */
+static void __attribute__((noinline)) membw_memcpy(uint32_t dst, uint32_t src, uint32_t bytes) {
+    asm volatile(
+        "1:\n\t"
+        "ldmia %[s]!, {r4, r5, r6, r7, r8, r9, r10, r11}\n\t"
+        "stmia %[d]!, {r4, r5, r6, r7, r8, r9, r10, r11}\n\t"
+        "cmp %[s], %[end]\n\t"
+        "blo 1b\n\t"
+        : [s] "+r"(src), [d] "+r"(dst)
+        : [end] "r"(src + bytes)
+        : "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11",
+          "cc", "memory"
+    );
+}
+#endif /* !CPU_ARM926 */
+
+#define MAX_MEMBW_SIZE    (16u * 1024u * 1024u)
+/* Agent footprint guard: protect [AGENT_LOAD_ADDR - 64 KB, AGENT_LOAD_ADDR
+ * + 8 MiB) from the test buffer. The lower margin covers the 16 KB stack
+ * that lives below _start; the upper margin (8 MiB) is generous head-room
+ * for .text/.data/.bss including the 16 KB-aligned page table. The default
+ * scratch sits at AGENT_LOAD_ADDR + 8 MiB so even 16 MiB × memcpy (32 MiB
+ * total span) fits inside the 128 MiB cached DDR window. */
+#define MEMBW_AGENT_GUARD_LO  ((uint32_t)AGENT_LOAD_ADDR - 0x10000u)
+#define MEMBW_AGENT_GUARD_HI  ((uint32_t)AGENT_LOAD_ADDR + 0x800000u)
+#define MEMBW_DEFAULT_ADDR    ((uint32_t)AGENT_LOAD_ADDR + 0x800000u)
+
+static void handle_membw(const uint8_t *data, uint32_t len) {
+#ifdef CPU_ARM926
+    (void)data; (void)len;
+    /* ARMv5 (ARM926EJ-S) has a different PMU register layout. Out of
+     * scope — the motivating use case (gk7205v300 DDR fabric audit) is
+     * ARMv7. */
+    proto_send_ack(ACK_FLASH_ERROR);
+#else
+    if (len < 12) { proto_send_ack(ACK_CRC_ERROR); return; }
+
+    uint32_t size  = read_le32(&data[0]);
+    uint32_t iters = read_le32(&data[4]);
+    uint32_t addr  = read_le32(&data[8]);
+
+    if (size == 0)  size  = 4u * 1024u * 1024u;
+    if (iters == 0) iters = 8;
+    if (addr == 0)  addr  = MEMBW_DEFAULT_ADDR;
+
+    if (iters > 256 || size > MAX_MEMBW_SIZE || (size & 0xFFu) != 0) {
+        proto_send_ack(ACK_FLASH_ERROR); return;
+    }
+    /* Fit dst = addr + size and src = addr inside the cached DDR
+     * window (128 MiB from RAM_BASE per startup.S page-table fill). */
+    if (addr < RAM_BASE) { proto_send_ack(ACK_FLASH_ERROR); return; }
+    uint32_t off = addr - RAM_BASE;
+    if (off + 2u * size > 128u * 1024u * 1024u) {
+        proto_send_ack(ACK_FLASH_ERROR); return;
+    }
+    /* Reject scratch ranges that would overlap the agent's own footprint
+     * (its code, stack, page table). memcpy would otherwise overwrite
+     * the running agent and the device would hang. */
+    uint32_t scratch_end = addr + 2u * size;
+    if (scratch_end > MEMBW_AGENT_GUARD_LO &&
+        addr        < MEMBW_AGENT_GUARD_HI) {
+        proto_send_ack(ACK_FLASH_ERROR); return;
+    }
+
+    uint32_t timer_hz = pmccntr_calibrate_hz();
+
+    uint32_t t0, t1;
+
+    pmccntr_init();
+    t0 = pmccntr_read();
+    for (uint32_t i = 0; i < iters; i++) membw_memset(addr, size);
+    t1 = pmccntr_read();
+    uint32_t memset_ticks = t1 - t0;
+
+    pmccntr_init();
+    t0 = pmccntr_read();
+    for (uint32_t i = 0; i < iters; i++) membw_read(addr, size);
+    t1 = pmccntr_read();
+    uint32_t read_ticks = t1 - t0;
+
+    pmccntr_init();
+    t0 = pmccntr_read();
+    for (uint32_t i = 0; i < iters; i++) membw_memcpy(addr + size, addr, size);
+    t1 = pmccntr_read();
+    uint32_t memcpy_ticks = t1 - t0;
+
+    uint8_t resp[32];
+    write_le32(&resp[0],  addr);
+    write_le32(&resp[4],  size);
+    write_le32(&resp[8],  iters);
+    write_le32(&resp[12], timer_hz);
+    write_le32(&resp[16], memset_ticks);
+    write_le32(&resp[20], read_ticks);
+    write_le32(&resp[24], memcpy_ticks);
+    write_le32(&resp[28], 1);   /* cpu_arch: 1 = ARMv7 Cortex-A */
+    proto_send(RSP_MEMBW, resp, sizeof(resp));
+#endif
 }
 
 /* Forward declaration */
@@ -1130,6 +1334,9 @@ int main(void) {
                 break;
             case CMD_MARK_BAD:
                 handle_mark_bad(cmd_buf, data_len);
+                break;
+            case CMD_MEMBW:
+                handle_membw(cmd_buf, data_len);
                 break;
             case CMD_SET_BAUD:
                 handle_set_baud(cmd_buf, data_len);
