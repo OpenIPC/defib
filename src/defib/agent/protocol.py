@@ -16,6 +16,7 @@ Commands (host → device):
   0x07  SELFUPDATE — Update agent: addr(4B LE) + size(4B LE) + crc32(4B LE)
   0x08  SET_BAUD   — Change baud rate: baud(4B LE)
   0x09  SCAN       — Scan flash health
+  0x0D  MEMBW      — DDR bandwidth test (ARMv7 only): size(4B) + iters(4B) + addr(4B)
 
 Responses (device → host):
   0x81  INFO_RSP — chip_id(4B) + flash_size(4B) + ram_base(4B) + sector_size(4B) + version(4B) + caps(4B)
@@ -24,6 +25,9 @@ Responses (device → host):
   0x84  CRC32_RSP— crc32(4B LE)
   0x85  READY    — Agent is running and ready
   0x86  SCAN_RSP — scan results
+  0x87  MEMBW_RSP— base(4B) + size(4B) + iters(4B) + timer_hz(4B)
+                 + memset_ticks(4B) + read_ticks(4B) + memcpy_ticks(4B)
+                 + cpu_arch(4B)
 """
 
 from __future__ import annotations
@@ -47,6 +51,7 @@ CMD_SCAN = 0x09
 CMD_FLASH_PROGRAM = 0x0A
 CMD_FLASH_STREAM = 0x0B
 CMD_MARK_BAD = 0x0C  # NAND only: synthesize a bad-block marker (OOB[0] = 0x00)
+CMD_MEMBW = 0x0D  # DDR bandwidth test (ARMv7 only)
 
 # Responses
 RSP_INFO = 0x81
@@ -55,6 +60,7 @@ RSP_ACK = 0x83
 RSP_CRC32 = 0x84
 RSP_READY = 0x85
 RSP_SCAN = 0x86
+RSP_MEMBW = 0x87
 
 # ACK status
 ACK_OK = 0x00

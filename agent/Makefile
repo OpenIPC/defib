@@ -167,6 +167,7 @@ CFLAGS = -mcpu=$(CPU_TYPE) -marm -O2 -ffreestanding -nostdlib \
          -DUART_BASE=$(UART_BASE) -DUART_CLOCK=$(UART_CLOCK) $(CPU_FLAG) \
          -DFLASH_MEM=$(FLASH_MEM) -DFMC_BASE=$(FMC_BASE) -DRAM_BASE=$(RAM_BASE) -DWDT_BASE=$(WDT_BASE) \
          -DCRG_BASE=$(CRG_BASE) -DSYSCTRL_REBOOT=$(SYSCTRL_REBOOT) \
+         -DAGENT_LOAD_ADDR=$(LOAD_ADDR) \
          $(if $(UART_CKSEL_REG),-DUART_CKSEL_REG=$(UART_CKSEL_REG) -DUART_CKSEL_BIT=$(UART_CKSEL_BIT)) \
          -mno-unaligned-access -Wall -Wextra
 

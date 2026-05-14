@@ -705,3 +705,132 @@ class TestWrite:
 
         cmd, resp = await recv_packet(transport, timeout=1.0)
         assert cmd == RSP_ACK and resp[0] == ACK_CRC_ERROR
+
+
+class TestMembw:
+    """End-to-end tests for FlashAgentClient.membw via MockTransport."""
+
+    def _membw_response(
+        self,
+        addr: int = 0x40400000,
+        size: int = 4 * 1024 * 1024,
+        iters: int = 8,
+        timer_hz: int = 1_000_000_000,
+        memset_ticks: int = 8_000_000,
+        read_ticks: int = 60_000_000,
+        memcpy_ticks: int = 16_000_000,
+        cpu_arch: int = 1,
+    ) -> bytes:
+        from defib.agent.protocol import RSP_MEMBW
+        payload = struct.pack(
+            "<IIIIIIII",
+            addr, size, iters, timer_hz,
+            memset_ticks, read_ticks, memcpy_ticks, cpu_arch,
+        )
+        return make_device_packet(RSP_MEMBW, payload)
+
+    @pytest.mark.asyncio
+    async def test_parses_response_fields(self):
+        from defib.transport.mock import MockTransport
+        from defib.agent.client import FlashAgentClient
+        from defib.agent.protocol import CMD_MEMBW, parse_packet
+
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(make_device_packet(RSP_READY, b"DEFIB"))
+
+        client = FlashAgentClient(t)
+        assert await client.connect(timeout=1.0)
+
+        # wait_for_ready drains leftover after parsing READY, so queue
+        # the membw response only once the client is connected.
+        t.enqueue_rx(self._membw_response())
+
+        result = await client.membw(size_bytes=4 * 1024 * 1024, iters=8)
+        assert result.addr == 0x40400000
+        assert result.size_bytes == 4 * 1024 * 1024
+        assert result.iters == 8
+        assert result.timer_hz == 1_000_000_000
+        assert result.memset_ticks == 8_000_000
+        assert result.read_ticks == 60_000_000
+        assert result.memcpy_ticks == 16_000_000
+
+        # Request packet went out with the right opcode and payload shape.
+        sent = t.all_tx_data
+        frame = sent.rstrip(b"\x00").split(b"\x00")[-1]
+        cmd, data = parse_packet(frame)
+        assert cmd == CMD_MEMBW
+        size, iters, addr = struct.unpack("<III", data)
+        assert size == 4 * 1024 * 1024
+        assert iters == 8
+        assert addr == 0
+
+    @pytest.mark.asyncio
+    async def test_mbps_and_cycles_per_byte(self):
+        from defib.transport.mock import MockTransport
+        from defib.agent.client import FlashAgentClient
+
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(make_device_packet(RSP_READY, b"DEFIB"))
+        client = FlashAgentClient(t)
+        assert await client.connect(timeout=1.0)
+
+        t.enqueue_rx(self._membw_response(
+            size=4 * 1024 * 1024,
+            iters=8,
+            timer_hz=1_000_000_000,
+            memset_ticks=8_000_000,
+            read_ticks=60_000_000,
+            memcpy_ticks=16_000_000,
+        ))
+        r = await client.membw()
+
+        # 4 MiB × 8 iters = 33,554,432 bytes total. 8,000,000 ticks at
+        # 1 GHz = 0.008 s. → 33554432 / 0.008 / 1e6 ≈ 4194.3 MB/s.
+        assert r.cycles_per_byte(r.memset_ticks) == pytest.approx(
+            8_000_000 / 33_554_432, rel=1e-9
+        )
+        mbps = r.mbps(r.memset_ticks)
+        assert mbps is not None
+        assert mbps == pytest.approx(33_554_432 / 0.008 / 1e6, rel=1e-6)
+
+        # memcpy write amplification = 2× (R+W traffic).
+        mbps_cpy = r.mbps(r.memcpy_ticks, write_amp=2)
+        assert mbps_cpy == pytest.approx(
+            2 * 33_554_432 / (16_000_000 / 1_000_000_000) / 1e6, rel=1e-6
+        )
+
+    @pytest.mark.asyncio
+    async def test_timer_hz_zero_means_mbps_unavailable(self):
+        from defib.transport.mock import MockTransport
+        from defib.agent.client import FlashAgentClient
+
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(make_device_packet(RSP_READY, b"DEFIB"))
+        client = FlashAgentClient(t)
+        assert await client.connect(timeout=1.0)
+
+        t.enqueue_rx(self._membw_response(timer_hz=0))
+        r = await client.membw()
+
+        assert r.timer_hz == 0
+        assert r.mbps(r.memset_ticks) is None
+        # cycles/byte is still meaningful (CPU-clock-invariant)
+        assert r.cycles_per_byte(r.memset_ticks) > 0
+
+    @pytest.mark.asyncio
+    async def test_armv5_rejection_raises(self):
+        """ARMv5 agent (or invalid params) returns RSP_ACK with FLASH_ERROR.
+        Host should raise a clear error, not silently fall through."""
+        from defib.agent.protocol import ACK_OK as _ACK_OK  # noqa: F401
+        from defib.transport.mock import MockTransport
+        from defib.agent.client import FlashAgentClient
+        from defib.agent.protocol import RSP_ACK as _RSP_ACK
+
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(make_device_packet(RSP_READY, b"DEFIB"))
+        client = FlashAgentClient(t)
+        assert await client.connect(timeout=1.0)
+
+        t.enqueue_rx(make_device_packet(_RSP_ACK, bytes([0x02])))  # ACK_FLASH_ERROR
+        with pytest.raises(RuntimeError, match="rejected"):
+            await client.membw()

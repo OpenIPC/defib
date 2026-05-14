@@ -449,6 +449,79 @@ static void test_cobs_roundtrip_all_crc_patterns(void) {
 }
 
 /*
+ * CMD_MEMBW request framing: host sends [size:4LE][iters:4LE][addr:4LE].
+ * The handler runs on ARM hardware (CCNT register), but we can verify
+ * the request and response packets round-trip through proto_send/recv
+ * with the right shape — that's what catches wire-format mismatches
+ * between agent C and host Python.
+ */
+static void test_proto_membw_request_framing(void) {
+    mock_reset();
+
+    /* Host → device: 12-byte payload */
+    uint8_t req[12];
+    uint32_t size = 4u * 1024u * 1024u;
+    uint32_t iters = 8;
+    uint32_t addr = 0x40400000u;
+    req[0]  = (size  >> 0) & 0xFF;  req[1]  = (size  >> 8) & 0xFF;
+    req[2]  = (size  >> 16) & 0xFF; req[3]  = (size  >> 24) & 0xFF;
+    req[4]  = (iters >> 0) & 0xFF;  req[5]  = (iters >> 8) & 0xFF;
+    req[6]  = (iters >> 16) & 0xFF; req[7]  = (iters >> 24) & 0xFF;
+    req[8]  = (addr  >> 0) & 0xFF;  req[9]  = (addr  >> 8) & 0xFF;
+    req[10] = (addr  >> 16) & 0xFF; req[11] = (addr  >> 24) & 0xFF;
+
+    proto_send(CMD_MEMBW, req, 12);
+
+    memcpy(mock_rx, mock_tx, mock_tx_len);
+    mock_rx_len = mock_tx_len;
+    mock_rx_pos = 0;
+
+    uint8_t buf[MAX_PAYLOAD + 16];
+    uint32_t len = 0;
+    uint8_t cmd = proto_recv(buf, &len, 1000);
+    ASSERT(cmd == CMD_MEMBW, "membw request: command opcode");
+    ASSERT(len == 12, "membw request: payload length");
+    ASSERT(memcmp(buf, req, 12) == 0, "membw request: payload bytes");
+}
+
+static void test_proto_membw_response_framing(void) {
+    mock_reset();
+
+    /* Device → host: 32-byte response.  Build with synthetic values that
+     * exercise all 8 little-endian word fields. */
+    uint8_t resp[32];
+    uint32_t fields[8] = {
+        0x40400000u,   /* base */
+        4u << 20,      /* size = 4 MiB */
+        8u,            /* iters */
+        24000000u,     /* timer_hz */
+        123456u,       /* memset_ticks */
+        654321u,       /* read_ticks */
+        999999u,       /* memcpy_ticks */
+        1u,            /* cpu_arch */
+    };
+    for (int i = 0; i < 8; i++) {
+        resp[i*4 + 0] = (fields[i] >> 0)  & 0xFF;
+        resp[i*4 + 1] = (fields[i] >> 8)  & 0xFF;
+        resp[i*4 + 2] = (fields[i] >> 16) & 0xFF;
+        resp[i*4 + 3] = (fields[i] >> 24) & 0xFF;
+    }
+
+    proto_send(RSP_MEMBW, resp, 32);
+
+    memcpy(mock_rx, mock_tx, mock_tx_len);
+    mock_rx_len = mock_tx_len;
+    mock_rx_pos = 0;
+
+    uint8_t buf[MAX_PAYLOAD + 16];
+    uint32_t len = 0;
+    uint8_t cmd = proto_recv(buf, &len, 1000);
+    ASSERT(cmd == RSP_MEMBW, "membw response: command opcode");
+    ASSERT(len == 32, "membw response: payload length");
+    ASSERT(memcmp(buf, resp, 32) == 0, "membw response: payload bytes");
+}
+
+/*
  * page_is_ff helper: verify it correctly identifies all-0xFF pages
  * and rejects pages with even a single non-0xFF byte.
  */
@@ -548,6 +621,8 @@ int main(void) {
     test_proto_recv_bad_crc();
     test_proto_max_payload();
     test_proto_multiple_packets();
+    test_proto_membw_request_framing();
+    test_proto_membw_response_framing();
 
     printf("Cross-compatibility:\n");
     test_cobs_matches_python();

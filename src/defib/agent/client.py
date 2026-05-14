@@ -21,6 +21,7 @@ from defib.agent.protocol import (
     CMD_FLASH_STREAM,
     CMD_INFO,
     CMD_MARK_BAD,
+    CMD_MEMBW,
     CMD_READ,
     CMD_SCAN,
     CMD_SELFUPDATE,
@@ -30,6 +31,7 @@ from defib.agent.protocol import (
     RSP_CRC32,
     RSP_DATA,
     RSP_INFO,
+    RSP_MEMBW,
     RSP_READY,
     RSP_SCAN,
     recv_packet,
@@ -58,6 +60,35 @@ class SectorResult:
     address: int
     status: SectorStatus
     crc32: int
+
+
+@dataclass(frozen=True)
+class MembwResult:
+    """Result of a CMD_MEMBW bandwidth test.
+
+    ticks fields are CCNT (CPU cycle) totals across `iters` passes.
+    `timer_hz` is the calibrated CCNT frequency (= CPU clock) — when 0,
+    the agent couldn't read CNTFRQ and only the CPU-clock-invariant
+    cycles/byte metric is meaningful.
+    """
+
+    addr: int
+    size_bytes: int
+    iters: int
+    timer_hz: int
+    memset_ticks: int
+    read_ticks: int
+    memcpy_ticks: int
+
+    def cycles_per_byte(self, ticks: int, write_amp: int = 1) -> float:
+        return ticks / (self.size_bytes * self.iters * write_amp)
+
+    def mbps(self, ticks: int, write_amp: int = 1) -> float | None:
+        if self.timer_hz == 0 or ticks == 0:
+            return None
+        bytes_total = self.size_bytes * self.iters * write_amp
+        seconds = ticks / self.timer_hz
+        return bytes_total / seconds / 1_000_000
 
 
 @dataclass
@@ -217,6 +248,7 @@ class FlashAgentClient:
     CAP_REBOOT = 1 << 4
     CAP_SELFUPDATE = 1 << 5
     CAP_SCAN = 1 << 6
+    CAP_MEMBW = 1 << 7
 
     async def get_info(self) -> dict[str, int | str]:
         """Request device info from the agent."""
@@ -604,6 +636,70 @@ class FlashAgentClient:
         local_crc = zlib.crc32(data) & 0xFFFFFFFF
         device_crc = await self.crc32(addr, len(data))
         return local_crc == device_crc
+
+    async def membw(
+        self,
+        size_bytes: int = 4 * 1024 * 1024,
+        iters: int = 8,
+        addr: int = 0,
+    ) -> MembwResult:
+        """Run a DDR bandwidth test in the agent (ARMv7 only).
+
+        Tests memset / read-scan / memcpy bandwidth against a scratch DDR
+        buffer using ARM ldmia/stmia kernels. Cache is on (write-back /
+        write-allocate), buffer is sized well above L1+L2 so DDR is the
+        bottleneck.
+
+        Args:
+            size_bytes: per-iteration buffer size; must be 256B-aligned,
+                ≤ 16 MiB. 0 → agent default (4 MiB).
+            iters: passes per op; 0 → agent default (8), max 256.
+            addr: physical base of the scratch buffer; 0 → agent picks
+                a safe location above its own footprint.
+
+        Returns:
+            MembwResult with ticks per op and (if CNTFRQ is set) a
+            calibrated CCNT frequency for converting to MB/s.
+
+        Raises:
+            RuntimeError if the agent rejects the command (ARMv5 chip
+            or invalid parameters).
+        """
+        self._clear_rx_buffers()
+
+        payload = struct.pack("<III", size_bytes, iters, addr)
+        await send_packet(self._transport, CMD_MEMBW, payload)
+
+        # Worst case: 16 MiB × 256 iters × 3 ops at ~200 MB/s = ~60 s.
+        # The defaults (4 MiB × 8 iters) on a 1 GHz core finish in well
+        # under a second. Pad generously since the agent doesn't stream
+        # progress for this command.
+        nominal_bytes = max(size_bytes, 4 * 1024 * 1024) * max(iters, 8) * 3
+        timeout = max(30.0, 5.0 + nominal_bytes / (50 * 1024 * 1024))
+
+        cmd, data = await recv_response(self._transport, timeout=timeout)
+        if cmd == RSP_ACK:
+            raise RuntimeError(
+                "Agent rejected CMD_MEMBW (unsupported on ARMv5 chips like "
+                "hi3516cv300, or invalid parameters)"
+            )
+        if cmd != RSP_MEMBW or len(data) < 32:
+            raise RuntimeError(
+                f"Unexpected membw response: cmd=0x{cmd:02x} len={len(data)}"
+            )
+
+        base, size, it, hz, m_ticks, r_ticks, c_ticks, _arch = struct.unpack(
+            "<IIIIIIII", data[:32]
+        )
+        return MembwResult(
+            addr=base,
+            size_bytes=size,
+            iters=it,
+            timer_hz=hz,
+            memset_ticks=m_ticks,
+            read_ticks=r_ticks,
+            memcpy_ticks=c_ticks,
+        )
 
     async def scan_flash(
         self,

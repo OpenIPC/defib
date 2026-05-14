@@ -1335,7 +1335,7 @@ async def _agent_info_async(port: str, output: str) -> None:
                 (1 << 0, "flash_stream"), (1 << 1, "sector_bitmap"),
                 (1 << 2, "page_skip"), (1 << 3, "set_baud"),
                 (1 << 4, "reboot"), (1 << 5, "selfupdate"),
-                (1 << 6, "scan"),
+                (1 << 6, "scan"), (1 << 7, "membw"),
             ]
             for bit, name in cap_map:
                 if caps & bit:
@@ -1695,6 +1695,114 @@ async def _agent_scan_async(port: str, output_file: str, output: str) -> None:
             console.print(f"\n[green]Saved:[/green] {output_file} ({len(recoverable)} bytes)")
 
     await transport.close()
+
+
+@agent_app.command("membw")
+def agent_membw(
+    port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial device (/dev/ttyUSB0), tcp://host:port, rfc2217://host:port, or socket:///path"),
+    size: str = typer.Option("4MB", "-s", "--size", help="Buffer size per iteration (e.g. 4MB, 1024KB)"),
+    iters: int = typer.Option(8, "-n", "--iters", help="Iterations per op (max 256)"),
+    addr: str = typer.Option("0", "-a", "--addr", help="Base address in DDR (hex; 0 = agent picks)"),
+    output: str = typer.Option("human", "--output", help="Output mode: human, json"),
+) -> None:
+    """Measure DDR memory bandwidth via the bare-metal agent.
+
+    Tests memset / read-scan / memcpy throughput against a scratch DDR
+    region. Useful for isolating "DDR fabric" from "Linux software stack"
+    when comparing firmwares (e.g. OpenIPC vs vendor U-Boot on the same
+    silicon). ARMv7 chips only (V4/V5/V6 family).
+    """
+    import asyncio
+    asyncio.run(_agent_membw_async(port, size, iters, addr, output))
+
+
+async def _agent_membw_async(
+    port: str, size_str: str, iters: int, addr_str: str, output: str,
+) -> None:
+    import json as json_mod
+
+    from rich.console import Console
+
+    from defib.agent.client import FlashAgentClient
+    from defib.transport.serial_platform import (
+        create_transport, normalize_port_name,
+    )
+
+    console = Console()
+    size_bytes = _parse_size(size_str)
+    addr = int(addr_str, 0)
+
+    transport = await create_transport(normalize_port_name(port))
+    client = FlashAgentClient(transport)
+
+    if not await client.connect(timeout=5.0):
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": "Agent not responding"}))
+        else:
+            console.print("[red]Agent not responding.[/red] Upload agent first with 'defib agent upload'.")
+        await transport.close()
+        raise typer.Exit(1)
+
+    try:
+        result = await client.membw(size_bytes=size_bytes, iters=iters, addr=addr)
+    except RuntimeError as e:
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": str(e)}))
+        else:
+            console.print(f"[red]membw failed:[/red] {e}")
+        await transport.close()
+        raise typer.Exit(1)
+
+    await transport.close()
+
+    _print_membw(console, result, output)
+
+
+def _print_membw(console, result, output: str) -> None:  # type: ignore[no-untyped-def]
+    import json as json_mod
+
+    def _record(ticks: int, write_amp: int = 1) -> dict[str, float | int | None]:
+        return {
+            "ticks": ticks,
+            "cycles_per_byte": result.cycles_per_byte(ticks, write_amp),
+            "mbps": result.mbps(ticks, write_amp),
+        }
+
+    if output == "json":
+        print(json_mod.dumps({
+            "addr": result.addr,
+            "size_bytes": result.size_bytes,
+            "iters": result.iters,
+            "timer_hz": result.timer_hz,
+            "memset": _record(result.memset_ticks),
+            "read":   _record(result.read_ticks),
+            "memcpy": _record(result.memcpy_ticks, write_amp=2),
+        }))
+        return
+
+    console.print(
+        f"[bold]DDR bandwidth[/bold] @ 0x{result.addr:08x} "
+        f"({result.size_bytes >> 20} MiB × {result.iters} iters"
+        + (f", CCNT={result.timer_hz / 1e6:.1f} MHz" if result.timer_hz else "")
+        + ")"
+    )
+
+    def line(label: str, ticks: int, write_amp: int = 1) -> None:
+        cpb = result.cycles_per_byte(ticks, write_amp)
+        mb = result.mbps(ticks, write_amp)
+        mbs = f"[cyan]{mb:7.1f}[/cyan] MB/s" if mb is not None else "    n/a    "
+        console.print(
+            f"  {label:<7}: {mbs}  ({cpb:6.3f} cyc/B, {ticks:>10} ticks)"
+        )
+
+    line("memset", result.memset_ticks)
+    line("read",   result.read_ticks)
+    line("memcpy", result.memcpy_ticks, write_amp=2)
+    if result.timer_hz == 0:
+        console.print(
+            "[yellow]CNTFRQ not initialised by boot stage — MB/s unavailable. "
+            "Compare cycles/byte across firmwares (CPU-clock-invariant).[/yellow]"
+        )
 
 
 def _parse_size(s: str) -> int:
