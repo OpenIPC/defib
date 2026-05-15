@@ -318,12 +318,28 @@ class FlashAgentClient:
         await send_packet(self._transport, CMD_READ, payload)
 
         received = bytearray()
+        # Track the 16-bit seq prefix the agent stamps on every RSP_DATA
+        # (`pkt[0..1] = seq` in agent/main.c handle_read). Without this,
+        # a COBS-CRC-rejected packet was silently dropped by recv_packet
+        # and read_memory returned short data with no error — see kaeru
+        # `agent-read-silent-packet-loss-on-long-uart-streams-2026-05-15`.
+        expected_seq = 0
         while True:
             cmd, data = await recv_packet(self._transport, timeout=60.0)
             if cmd == RSP_READY:
                 continue
             elif cmd == RSP_DATA and len(data) > 2:
+                seq = data[0] | (data[1] << 8)
+                if seq != expected_seq:
+                    raise RuntimeError(
+                        f"Read packet seq gap at offset {len(received)} "
+                        f"(addr={addr + len(received):#010x}): expected "
+                        f"seq={expected_seq}, got seq={seq}; likely UART "
+                        f"corruption on a long stream. Try a smaller read "
+                        f"or a lower baud."
+                    )
                 received.extend(data[2:])
+                expected_seq = (expected_seq + 1) & 0xFFFF
                 if on_progress:
                     on_progress(len(received), size)
             elif cmd == RSP_ACK:
@@ -333,6 +349,14 @@ class FlashAgentClient:
                     raise RuntimeError(
                         f"Read rejected by agent: status=0x{status:02x} "
                         f"({detail}); addr={addr:#010x} size={size}"
+                    )
+                # Final size check — catches the case where the agent
+                # ACKs early but we never saw a seq gap (shouldn't happen
+                # with the seq-check above, but cheap insurance).
+                if len(received) != size:
+                    raise RuntimeError(
+                        f"Read returned {len(received)} bytes but agent "
+                        f"ACKed for {size}; addr={addr:#010x}"
                     )
                 break
             else:

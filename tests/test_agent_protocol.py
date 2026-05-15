@@ -871,3 +871,79 @@ class TestReadCrcRejection:
         t.enqueue_rx(make_device_packet(RSP_ACK, bytes([ACK_FLASH_ERROR])))
         with pytest.raises(RuntimeError, match="CRC32 rejected"):
             await client.crc32(0x10100000, 64)
+
+
+class TestReadMemorySeqValidation:
+    """When recv_packet silently drops a CRC-invalid RSP_DATA packet
+    mid-stream during a long read (e.g. UART corruption on a multi-MB
+    eMMC dump), read_memory must NOT return short data and pretend
+    success. It must spot the gap via the seq prefix the agent stamps
+    on every RSP_DATA and raise loudly so the caller can chunk + retry."""
+
+    @pytest.mark.asyncio
+    async def test_normal_sequential_seq_passes(self):
+        # seq=0,1,2 followed by ACK_OK — must succeed cleanly.
+        from defib.transport.mock import MockTransport
+        from defib.agent.client import FlashAgentClient
+
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(make_device_packet(RSP_READY, b"DEFIB"))
+        client = FlashAgentClient(t)
+        assert await client.connect(timeout=1.0)
+
+        # 3 packets of 4 bytes each => 12 bytes total
+        for seq in range(3):
+            seq_bytes = struct.pack("<H", seq)
+            payload = bytes([seq * 4, seq * 4 + 1, seq * 4 + 2, seq * 4 + 3])
+            t.enqueue_rx(make_device_packet(RSP_DATA, seq_bytes + payload))
+        t.enqueue_rx(make_device_packet(RSP_ACK, bytes([ACK_OK])))
+
+        data = await client.read_memory(0x80000000, 12, fast=False)
+        assert data == bytes(range(12))
+
+    @pytest.mark.asyncio
+    async def test_seq_gap_raises(self):
+        # seq=0 then seq=2 — packet 1 was dropped by recv_packet (CRC fail).
+        # Without the seq check the client would silently return 8 bytes;
+        # with it, we raise.
+        from defib.transport.mock import MockTransport
+        from defib.agent.client import FlashAgentClient
+
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(make_device_packet(RSP_READY, b"DEFIB"))
+        client = FlashAgentClient(t)
+        assert await client.connect(timeout=1.0)
+
+        t.enqueue_rx(make_device_packet(
+            RSP_DATA, struct.pack("<H", 0) + b"AAAA"
+        ))
+        t.enqueue_rx(make_device_packet(
+            RSP_DATA, struct.pack("<H", 2) + b"CCCC"
+        ))
+        t.enqueue_rx(make_device_packet(RSP_ACK, bytes([ACK_OK])))
+
+        with pytest.raises(RuntimeError, match="seq gap"):
+            await client.read_memory(0x80000000, 12, fast=False)
+
+    @pytest.mark.asyncio
+    async def test_size_mismatch_at_ack_raises(self):
+        # No seq gap, but agent ACKs after fewer bytes than the host asked
+        # for. Real-hardware bug surfaced when the agent's handle_read
+        # short-circuited; client now fails loudly instead of returning
+        # truncated data.
+        from defib.transport.mock import MockTransport
+        from defib.agent.client import FlashAgentClient
+
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(make_device_packet(RSP_READY, b"DEFIB"))
+        client = FlashAgentClient(t)
+        assert await client.connect(timeout=1.0)
+
+        # Only 8 bytes delivered, but client asked for 16
+        t.enqueue_rx(make_device_packet(
+            RSP_DATA, struct.pack("<H", 0) + b"AAAABBBB"
+        ))
+        t.enqueue_rx(make_device_packet(RSP_ACK, bytes([ACK_OK])))
+
+        with pytest.raises(RuntimeError, match="Read returned 8 bytes but agent ACKed for 16"):
+            await client.read_memory(0x80000000, 16, fast=False)
