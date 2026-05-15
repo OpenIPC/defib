@@ -11,6 +11,7 @@ import pytest
 from defib.agent.protocol import (
     ACK_OK,
     ACK_CRC_ERROR,
+    ACK_FLASH_ERROR,
     CMD_INFO,
     CMD_READ,
     CMD_SELFUPDATE,
@@ -831,6 +832,42 @@ class TestMembw:
         client = FlashAgentClient(t)
         assert await client.connect(timeout=1.0)
 
-        t.enqueue_rx(make_device_packet(_RSP_ACK, bytes([0x02])))  # ACK_FLASH_ERROR
+        t.enqueue_rx(make_device_packet(_RSP_ACK, bytes([ACK_FLASH_ERROR])))
         with pytest.raises(RuntimeError, match="rejected"):
             await client.membw()
+
+
+class TestReadCrcRejection:
+    """When the agent rejects a CMD_READ / CMD_CRC32 (e.g. addr outside
+    addr_readable whitelist), the client must surface a clear error
+    rather than silently returning empty bytes or a generic 'invalid'."""
+
+    @pytest.mark.asyncio
+    async def test_read_memory_raises_on_flash_error_ack(self):
+        from defib.transport.mock import MockTransport
+        from defib.agent.client import FlashAgentClient
+
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(make_device_packet(RSP_READY, b"DEFIB"))
+        client = FlashAgentClient(t)
+        assert await client.connect(timeout=1.0)
+
+        # Agent immediately rejects with ACK_FLASH_ERROR (e.g. whitelist miss)
+        t.enqueue_rx(make_device_packet(RSP_ACK, bytes([ACK_FLASH_ERROR])))
+        with pytest.raises(RuntimeError, match="Read rejected"):
+            # Use fast=False to skip baud-switch path
+            await client.read_memory(0x10100000, 64, fast=False)
+
+    @pytest.mark.asyncio
+    async def test_crc32_raises_on_flash_error_ack(self):
+        from defib.transport.mock import MockTransport
+        from defib.agent.client import FlashAgentClient
+
+        t = MockTransport(flush_clears_buffer=False)
+        t.enqueue_rx(make_device_packet(RSP_READY, b"DEFIB"))
+        client = FlashAgentClient(t)
+        assert await client.connect(timeout=1.0)
+
+        t.enqueue_rx(make_device_packet(RSP_ACK, bytes([ACK_FLASH_ERROR])))
+        with pytest.raises(RuntimeError, match="CRC32 rejected"):
+            await client.crc32(0x10100000, 64)
