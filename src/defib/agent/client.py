@@ -143,7 +143,13 @@ FALLBACK_BAUD = 115200        # Always works
 
 
 def get_agent_binary(chip: str) -> Path | None:
-    """Get the path to the pre-compiled agent binary for a chip."""
+    """Get the path to the pre-compiled agent binary for a chip.
+
+    Accepts an optional ``:variant`` suffix (e.g. ``hi3516av300:emmc``);
+    the variant only affects DDR init, not the agent binary, so we strip
+    it before the lookup.
+    """
+    chip = chip.split(":", 1)[0]
     chip_to_agent = {
         "hi3516ev300": "hi3516ev300",
         "gk7205v200": "gk7205v200",

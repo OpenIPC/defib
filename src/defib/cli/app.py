@@ -942,6 +942,58 @@ agent_app = typer.Typer(help="Flash agent commands (fast binary protocol)")
 app.add_typer(agent_app, name="agent")
 
 
+def _agent_not_responding_message(chip: str, uboot_address: int | None = None) -> str:
+    """Build the diagnostic shown when boot protocol uploads complete but the
+    agent never sends READY.
+
+    The single most common cause we've seen is a board-variant DDR mismatch:
+    defib's per-chip DDR init (PRESTEP0/DDRSTEP0) is calibrated for one
+    board, the bootrom faithfully jumps to the agent's load address, but
+    DDR isn't actually backed there so the CPU fetches garbage and hangs
+    silently with no UART output. The diagnostic surfaces the board-variant
+    fix path first and falls back to the vendor-U-Boot loadx manual route.
+    """
+    from defib.profiles.loader import list_variants, parse_chip_variant
+
+    base_chip, current_variant = parse_chip_variant(chip)
+    variants = list_variants(base_chip)
+    addr = f"0x{uboot_address:08x}" if uboot_address is not None else "<uboot_address>"
+
+    lines = [
+        "Boot-protocol upload completed but the agent never sent READY.",
+        "",
+        "Most common cause: the chip profile's DDR init (PRESTEP0/DDRSTEP0)",
+        "doesn't match this board's DDR layout. The bootrom faithfully calls",
+        f"the agent at {addr}, but DDR isn't backed there, so the CPU",
+        "fetches garbage and hangs silently (no UART output).",
+        "",
+    ]
+    suggested = [v for v in variants if v != current_variant]
+    if suggested:
+        lines.append(f"Known board variants for {base_chip}: {', '.join(variants)}")
+        lines.append(f"  Try: defib agent upload -c {base_chip}:{suggested[0]} ...")
+        lines.append("")
+    elif variants:
+        lines.append(
+            f"You already specified variant '{current_variant}' — no other "
+            f"variants are declared for {base_chip}."
+        )
+        lines.append("")
+    else:
+        lines.append(f"No board variants declared for {base_chip}.")
+        lines.append("")
+
+    lines.extend([
+        "Manual workaround (vendor U-Boot must be intact in flash):",
+        "  1. power-cycle the camera",
+        "  2. hold Ctrl-C to break U-Boot autoboot",
+        f"  3. at the U-Boot prompt: loady {addr}",
+        "  4. YMODEM-send agent-<chip>.bin",
+        f"  5. go {addr}",
+    ])
+    return "\n".join(lines)
+
+
 @agent_app.command("upload")
 def agent_upload(
     chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
@@ -1052,10 +1104,16 @@ async def _agent_upload_async(chip: str, port: str, output: str) -> None:
         elif output == "json":
             print(json_mod.dumps({"event": "ready", **info}))
     else:
+        diag = _agent_not_responding_message(chip, profile.uboot_address)
         if output == "json":
-            print(json_mod.dumps({"event": "error", "message": "Agent not responding"}))
+            print(json_mod.dumps({
+                "event": "error",
+                "message": "Agent not responding",
+                "diagnostic": diag,
+            }))
         else:
             console.print("[red]Agent not responding[/red]")
+            console.print(diag)
         raise typer.Exit(1)
 
     await transport.close()
@@ -1188,11 +1246,16 @@ async def _agent_flash_async(
 
     client = FlashAgentClient(transport, chip)
     if not await client.connect(timeout=10.0):
-        msg = "Agent not responding"
+        diag = _agent_not_responding_message(chip, profile.uboot_address)
         if output == "json":
-            print(json_mod.dumps({"event": "error", "message": msg}))
+            print(json_mod.dumps({
+                "event": "error",
+                "message": "Agent not responding",
+                "diagnostic": diag,
+            }))
         else:
-            console.print(f"[red]{msg}[/red]")
+            console.print("[red]Agent not responding[/red]")
+            console.print(diag)
         await transport.close()
         raise typer.Exit(1)
 
