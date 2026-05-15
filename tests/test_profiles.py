@@ -198,11 +198,80 @@ class TestBoardVariants:
         assert p.ddr_step_data == bytes([9] * 64)
         assert list_variants("dv300_alias", tmp_path) == ["emmc"]
 
-    def test_real_av300_profile_still_loads(self):
-        """Smoke test: real shipped profile (no variants today) keeps working."""
+    def test_real_av300_base_still_loads(self):
+        """Smoke test: real shipped profile loads without a variant."""
         p = load_profile("hi3516av300", PROFILES_DIR)
         assert p.name == "hi3516av300"
         assert p.uboot_address == 0x81000000
+        # Base profile has no SPL_BLOB — that's variant-specific
+        assert p.spl_data is None
+
+    def test_real_av300_emmc_variant_loads_spl_blob(self):
+        """The shipped hi3516av300:emmc variant carries a vendor SPL blob
+        extracted from a working eMMC board. Validates that the variant
+        merging + SPL_BLOB resolution actually loads bytes from disk."""
+        p = load_profile("hi3516av300:emmc", PROFILES_DIR)
+        assert p.name == "hi3516av300"
+        assert p.spl_blob == "hi3516av300-emmc-spl.bin"
+        assert p.spl_data is not None
+        # Vendor SPL starts with an ARM `b` instruction at offset 0
+        # (same as any reasonable boot ROM payload).
+        assert p.spl_data[:4] == bytes.fromhex("150800ea")
+        # SPL extracted at 0x5000 (above the gzip boundary at ~0x5220)
+        assert len(p.spl_data) == 0x5000
+
+
+class TestSplBlob:
+    """SPL_BLOB lets a profile (typically a board variant) ship pre-built
+    SPL bytes instead of relying on the OpenIPC firmware download."""
+
+    @pytest.fixture
+    def chip_with_spl_blob(self, tmp_path: Path) -> Path:
+        (tmp_path / "test-spl.bin").write_bytes(b"\xAA" * 1024)
+        profile = {
+            "name": "blobchip",
+            "DDRSTEP0": [0] * 64,
+            "ADDRESS": ["0x0", "0x0", "0x0"],
+            "FILELEN": ["0x0", "0x0"],
+            "STEPLEN": ["0x0", "0x0"],
+            "SPL_BLOB": "test-spl.bin",
+        }
+        (tmp_path / "blobchip.json").write_text(json.dumps(profile))
+        return tmp_path
+
+    def test_loader_reads_blob_bytes(self, chip_with_spl_blob: Path):
+        p = load_profile("blobchip", chip_with_spl_blob)
+        assert p.spl_data == b"\xAA" * 1024
+
+    def test_missing_blob_raises(self, tmp_path: Path):
+        profile = {
+            "name": "badblob",
+            "DDRSTEP0": [0] * 64,
+            "ADDRESS": ["0x0", "0x0", "0x0"],
+            "FILELEN": ["0x0", "0x0"],
+            "STEPLEN": ["0x0", "0x0"],
+            "SPL_BLOB": "does-not-exist.bin",
+        }
+        (tmp_path / "badblob.json").write_text(json.dumps(profile))
+        with pytest.raises(FileNotFoundError, match="SPL_BLOB"):
+            load_profile("badblob", tmp_path)
+
+    def test_blob_via_variant(self, tmp_path: Path):
+        """Most realistic case: SPL_BLOB declared inside a variant block."""
+        (tmp_path / "v-spl.bin").write_bytes(b"\x11" * 4096)
+        profile = {
+            "name": "chip",
+            "DDRSTEP0": [0] * 64,
+            "ADDRESS": ["0x0", "0x0", "0x0"],
+            "FILELEN": ["0x0", "0x0"],
+            "STEPLEN": ["0x0", "0x0"],
+            "variants": {"emmc": {"SPL_BLOB": "v-spl.bin"}},
+        }
+        (tmp_path / "chip.json").write_text(json.dumps(profile))
+        base = load_profile("chip", tmp_path)
+        assert base.spl_data is None
+        variant = load_profile("chip:emmc", tmp_path)
+        assert variant.spl_data == b"\x11" * 4096
 
 
 class TestVariantStrippingInLookups:

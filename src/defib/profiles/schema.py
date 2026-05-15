@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class SoCProfile(BaseModel):
@@ -44,6 +44,26 @@ class SoCProfile(BaseModel):
             "the chip's actual SRAM ceiling."
         ),
     )
+    spl_blob: str | None = Field(
+        default=None, alias="SPL_BLOB",
+        description=(
+            "Optional filename (resolved relative to the profile JSON's "
+            "directory) of a pre-built SPL binary to upload as the SPL stage "
+            "instead of slicing it from the downloaded U-Boot. Used by board "
+            "variants where the OpenIPC SPL doesn't bring DDR up correctly — "
+            "e.g. eMMC-equipped hi3516av300 boards. The loader reads the file "
+            "and stores its bytes on `_spl_data`; callers access them via the "
+            "`spl_data` property."
+        ),
+    )
+    # Bytes of the SPL_BLOB, populated by the loader (not in JSON, not
+    # validated by pydantic). None if `spl_blob` is unset.
+    _spl_data: bytes | None = PrivateAttr(default=None)
+
+    @property
+    def spl_data(self) -> bytes | None:
+        """Pre-built SPL bytes if the profile declares an `SPL_BLOB`."""
+        return self._spl_data
 
     @property
     def ddr_step_address(self) -> int:

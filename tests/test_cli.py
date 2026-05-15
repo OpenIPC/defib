@@ -194,18 +194,26 @@ class TestAgentNotRespondingDiagnostic:
 
     def test_mentions_ddr_init_root_cause(self):
         from defib.cli.app import _agent_not_responding_message
-        msg = _agent_not_responding_message("hi3516av300", 0x81000000)
+        msg = _agent_not_responding_message("hi3516ev300", 0x41000000)
         assert "DDR" in msg
         # Surfaces the actual address so the user can match it against
         # what they see on the wire.
-        assert "0x81000000" in msg
+        assert "0x41000000" in msg
 
     def test_no_variants_path(self):
         from defib.cli.app import _agent_not_responding_message
-        msg = _agent_not_responding_message("hi3516av300", 0x81000000)
-        # Shipped profile has no variants today; message should say so
+        # hi3516ev300 ships with no variants — message should say so
         # rather than pretending one exists.
+        msg = _agent_not_responding_message("hi3516ev300", 0x41000000)
         assert "No board variants declared" in msg
+
+    def test_when_variants_exist_for_real_shipped_chip(self):
+        # hi3516av300 ships with the `emmc` variant.
+        from defib.cli.app import _agent_not_responding_message
+        msg = _agent_not_responding_message("hi3516av300", 0x81000000)
+        assert "emmc" in msg
+        # And a concrete next-command nudge
+        assert "defib agent upload -c hi3516av300:emmc" in msg
 
     def test_mentions_vendor_uboot_loadx_fallback(self):
         from defib.cli.app import _agent_not_responding_message
@@ -214,7 +222,8 @@ class TestAgentNotRespondingDiagnostic:
         assert "go 0x81000000" in msg
 
     def test_when_variants_exist_lists_them(self, monkeypatch):
-        # Pretend the chip ships with two variants
+        # Pretend a chip ships with two variants; this exercises the
+        # multi-variant formatting independently of what's shipped.
         import defib.cli.app as cli_app
         from defib.profiles import loader
         monkeypatch.setattr(

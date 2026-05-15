@@ -90,7 +90,19 @@ def load_profile(chip_name: str, profiles_dir: Path | None = None) -> SoCProfile
                 )
             # Variant entries override matching top-level keys
             data.update(variants[variant])
-        return SoCProfile.model_validate(data)
+        profile = SoCProfile.model_validate(data)
+
+        # Resolve SPL_BLOB if declared. Path is relative to the profile JSON's
+        # directory. Done here (not in pydantic) so the schema stays I/O-free.
+        if profile.spl_blob:
+            blob_path = profile_path.parent / profile.spl_blob
+            if not blob_path.exists():
+                raise FileNotFoundError(
+                    f"SPL_BLOB '{profile.spl_blob}' for chip '{current}' not "
+                    f"found at {blob_path}"
+                )
+            profile._spl_data = blob_path.read_bytes()
+        return profile
 
     raise ValueError(f"Alias chain too deep for chip: {chip_name}")
 
