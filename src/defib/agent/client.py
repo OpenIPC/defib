@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from defib.agent.protocol import (
+    ACK_FLASH_ERROR,
     ACK_OK,
     CMD_CRC32,
     CMD_ERASE,
@@ -320,6 +321,13 @@ class FlashAgentClient:
                 if on_progress:
                     on_progress(len(received), size)
             elif cmd == RSP_ACK:
+                status = data[0] if data else 0
+                if status != ACK_OK:
+                    detail = "outside agent's readable whitelist or flash read failed" if status == ACK_FLASH_ERROR else "agent error"
+                    raise RuntimeError(
+                        f"Read rejected by agent: status=0x{status:02x} "
+                        f"({detail}); addr={addr:#010x} size={size}"
+                    )
                 break
             else:
                 raise RuntimeError(f"Unexpected response: cmd=0x{cmd:02x}")
@@ -627,6 +635,13 @@ class FlashAgentClient:
         # chips (DMA reads, multi-MB/s) still get plenty of headroom.
         timeout = max(15.0, 5.0 + size / (100 * 1024))
         cmd, data = await recv_response(self._transport, timeout=timeout)
+        if cmd == RSP_ACK:
+            status = data[0] if data else 0
+            detail = "outside agent's readable whitelist or flash read failed" if status == ACK_FLASH_ERROR else "agent error"
+            raise RuntimeError(
+                f"CRC32 rejected by agent: status=0x{status:02x} "
+                f"({detail}); addr={addr:#010x} size={size}"
+            )
         if cmd != RSP_CRC32 or len(data) < 4:
             raise RuntimeError("CRC32 response invalid")
         return int(struct.unpack("<I", data[:4])[0])

@@ -62,9 +62,10 @@ RSP_READY = 0x85
 RSP_SCAN = 0x86
 RSP_MEMBW = 0x87
 
-# ACK status
+# ACK status (must match agent/protocol.h)
 ACK_OK = 0x00
 ACK_CRC_ERROR = 0x01
+ACK_FLASH_ERROR = 0x02
 
 FRAME_DELIMITER = 0x00
 MAX_PACKET_SIZE = 1100  # Max COBS-encoded packet size
