@@ -365,7 +365,21 @@ class RouterOSController(PowerController):
 
     async def power_on(self, port: str) -> None:
         restore_mode = self._saved_poe_out.pop(port, "forced-on")
-        logger.info("PoE ON: %s on %s (restoring %s)", port, self._host, restore_mode)
+        # power_off saves whatever the port's poe-out was BEFORE we turned
+        # it off. If the port was already off (e.g. recovering a camera
+        # that's been parked), the saved "previous" state is "off" — and
+        # restoring it would defeat the purpose of power_on entirely.
+        # Promote to forced-on so the port actually comes up.
+        if restore_mode == "off":
+            logger.info(
+                "PoE ON: %s on %s (saved state was 'off' — promoting to "
+                "'forced-on')", port, self._host,
+            )
+            restore_mode = "forced-on"
+        else:
+            logger.info(
+                "PoE ON: %s on %s (restoring %s)", port, self._host, restore_mode,
+            )
         await self._set_poe(port, restore_mode)
 
     async def power_cycle(self, port: str, off_duration: float = 5.0) -> None:
