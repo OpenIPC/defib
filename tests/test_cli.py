@@ -186,3 +186,42 @@ class TestReplayCommand:
         data = json.loads(result.stdout)
         assert data["chip"] == "json_test"
         assert data["records"] == 1
+
+
+class TestAgentNotRespondingDiagnostic:
+    """The diagnostic shown when boot-protocol upload completes but no
+    READY frame arrives — most often a board-variant DDR mismatch."""
+
+    def test_mentions_ddr_init_root_cause(self):
+        from defib.cli.app import _agent_not_responding_message
+        msg = _agent_not_responding_message("hi3516av300", 0x81000000)
+        assert "DDR" in msg
+        # Surfaces the actual address so the user can match it against
+        # what they see on the wire.
+        assert "0x81000000" in msg
+
+    def test_no_variants_path(self):
+        from defib.cli.app import _agent_not_responding_message
+        msg = _agent_not_responding_message("hi3516av300", 0x81000000)
+        # Shipped profile has no variants today; message should say so
+        # rather than pretending one exists.
+        assert "No board variants declared" in msg
+
+    def test_mentions_vendor_uboot_loadx_fallback(self):
+        from defib.cli.app import _agent_not_responding_message
+        msg = _agent_not_responding_message("hi3516av300", 0x81000000)
+        assert "loady" in msg
+        assert "go 0x81000000" in msg
+
+    def test_when_variants_exist_lists_them(self, monkeypatch):
+        # Pretend the chip ships with two variants
+        import defib.cli.app as cli_app
+        from defib.profiles import loader
+        monkeypatch.setattr(
+            loader, "list_variants", lambda *a, **kw: ["emmc", "nor"],
+        )
+        msg = cli_app._agent_not_responding_message("hi3516av300", 0x81000000)
+        assert "emmc" in msg
+        assert "nor" in msg
+        # And a concrete next-command nudge
+        assert "defib agent upload -c hi3516av300:" in msg

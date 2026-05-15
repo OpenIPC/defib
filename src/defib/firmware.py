@@ -58,8 +58,15 @@ def get_cache_dir() -> Path:
     return cache_dir
 
 
+def _strip_variant(chip: str) -> str:
+    """Drop the optional ``:variant`` suffix — U-Boot binaries are per-chip,
+    not per-board, so any variant suffix is irrelevant for firmware lookup."""
+    return chip.split(":", 1)[0]
+
+
 def firmware_url(chip: str) -> str | None:
     """Get the OpenIPC download URL for a chip, or None if unavailable."""
+    chip = _strip_variant(chip)
     name = CHIP_TO_FIRMWARE.get(chip, chip)
     if name in AVAILABLE_FIRMWARE:
         return f"{OPENIPC_BASE_URL}/u-boot-{name}-universal.bin"
@@ -73,6 +80,7 @@ def has_firmware(chip: str) -> bool:
 
 def get_cached_path(chip: str) -> Path | None:
     """Get the path to cached firmware, or None if not cached."""
+    chip = _strip_variant(chip)
     name = CHIP_TO_FIRMWARE.get(chip, chip)
     path = get_cache_dir() / f"u-boot-{name}-universal.bin"
     if path.exists() and path.stat().st_size > 0:
@@ -126,6 +134,7 @@ def download_firmware(
         return cached
 
     # Download
+    chip = _strip_variant(chip)
     name = CHIP_TO_FIRMWARE.get(chip, chip)
     dest = get_cache_dir() / f"u-boot-{name}-universal.bin"
     logger.info("Downloading firmware from %s", url)
