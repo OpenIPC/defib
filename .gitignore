@@ -17,3 +17,6 @@ venv/
 .hypothesis/
 *.log
 *.bin
+# Profile board-variant SPL blobs are tracked; the global *.bin rule
+# above otherwise hides them.
+!src/defib/profiles/data/*.bin

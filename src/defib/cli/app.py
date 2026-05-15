@@ -1046,11 +1046,19 @@ async def _agent_upload_async(chip: str, port: str, output: str) -> None:
     # accordingly. Pre-truncating to profile.spl_max_size hides the real
     # boundary on chips where the OpenIPC SPL is larger than the HiTool
     # reference (e.g. hi3516av200's SVB-enabled SPL is 0x6800, not 0x4F00).
-    spl_data = cached_fw.read_bytes()
+    # If the profile (or board variant) ships a pre-built SPL blob, use
+    # that instead — needed on boards where the OpenIPC SPL doesn't bring
+    # DDR up (e.g. eMMC-equipped hi3516av300 cameras).
+    if profile.spl_data is not None:
+        spl_data = profile.spl_data
+        spl_source = f"profile SPL_BLOB ({len(spl_data)} bytes)"
+    else:
+        spl_data = cached_fw.read_bytes()
+        spl_source = f"full U-Boot ({len(spl_data)} bytes — boundary auto-detected)"
 
     if output == "human":
         console.print(f"Agent: [cyan]{agent_path.name}[/cyan] ({len(agent_data)} bytes)")
-        console.print(f"SPL: full U-Boot ({len(spl_data)} bytes — boundary auto-detected)")
+        console.print(f"SPL: {spl_source}")
         console.print("\n[yellow]Power-cycle the camera now![/yellow]\n")
 
     transport = await create_transport(normalize_port_name(port))
@@ -1196,7 +1204,13 @@ async def _agent_flash_async(
     # Pass full u-boot; _send_spl detects the actual SPL boundary so chips
     # where OpenIPC SPL is larger than HiTool's profile_max (e.g. av200's
     # SVB-enabled SPL = 0x6800 vs profile_max = 0x4F00) get the right size.
-    spl_data = cached_fw.read_bytes()
+    # If the profile (or board variant) ships a pre-built SPL blob, use
+    # that instead — needed on boards where the OpenIPC SPL doesn't bring
+    # DDR up (e.g. eMMC-equipped hi3516av300 cameras).
+    if profile.spl_data is not None:
+        spl_data = profile.spl_data
+    else:
+        spl_data = cached_fw.read_bytes()
 
     if output == "human":
         console.print(f"Firmware: [cyan]{fw_path.name}[/cyan] ({len(firmware)} bytes, CRC {fw_crc:#010x})")
