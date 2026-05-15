@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include "uart.h"
+#include "emmc_himci.h"
 #include "protocol.h"
 #include "spi_flash.h"
 
@@ -113,8 +114,27 @@ static int addr_readable(uint32_t addr, uint32_t size) {
     if (addr >= FMC_BASE  && (addr + size) <= (FMC_BASE  + 0x1000)) return 1;
     if (addr >= CRG_BASE  && (addr + size) <= (CRG_BASE  + 0x1000)) return 1;
     if (addr >= UART_BASE && (addr + size) <= (UART_BASE + 0x1000)) return 1;
-    /* Flash memory-mapped window — only after flash_init succeeds */
-    if (flash_readable && addr >= FLASH_MEM && (addr + size) <= (FLASH_MEM + 32 * 1024 * 1024))
+#ifdef EMMC_BASE
+    /* DesignWare MMC host controller registers — needed to drive the eMMC
+     * reader (CMD/CMDARG/RESP0..3/RINTSTS/STATUS/FIFO at 0x000..0x200). */
+    if (addr >= EMMC_BASE && (addr + size) <= (EMMC_BASE + 0x1000)) return 1;
+#endif
+#ifdef IO_CTRL0_BASE
+    /* I/O pinmux block, used by configure_emmc_pins. */
+    if (addr >= IO_CTRL0_BASE && (addr + size) <= (IO_CTRL0_BASE + 0x1000)) return 1;
+#endif
+#if defined(BOOTROM_BASE) && defined(BOOTROM_SIZE)
+    /* Mask ROM at chip-defined base — needed to read the bootrom's
+     * pinmux table baked into ROM. Read-only, safe to expose. */
+    if (addr >= BOOTROM_BASE && (addr + size) <= (BOOTROM_BASE + BOOTROM_SIZE))
+        return 1;
+#endif
+    /* Flash memory-mapped window — only after flash_init succeeds.
+     * Window size matches the identified medium: SPI NOR is typically
+     * 8-32 MiB (sub-32-bit), eMMC can be GiB but is clipped at 4 GiB-1
+     * to fit a uint32_t. */
+    if (flash_readable && addr >= FLASH_MEM &&
+        (uint64_t)(addr - FLASH_MEM) + size <= (uint64_t)flash_info.size)
         return 1;
     return 0;
 }
@@ -187,9 +207,31 @@ static void handle_read(const uint8_t *data, uint32_t len) {
     uint32_t offset = 0;
     uint8_t pkt[MAX_PAYLOAD];
 
+    int emmc_path = 0;
+#ifdef EMMC_BASE
+    if (flash_readable && flash_info.flash_type == FLASH_TYPE_EMMC
+        && addr >= FLASH_MEM
+        && (uint64_t)(addr - FLASH_MEM) + size <= (uint64_t)flash_info.size) {
+        /* MVP eMMC read: block-aligned only. addr - FLASH_MEM = LBA byte
+         * offset; both that offset and `size` must be 512-byte aligned.
+         * uint64_t arithmetic above because FLASH_MEM + flash_info.size
+         * would overflow uint32_t when capacity approaches 4 GiB. */
+        uint32_t lba_off = addr - FLASH_MEM;
+        if ((lba_off & 511u) || (size & 511u)) {
+            proto_send_ack(ACK_FLASH_ERROR);
+            return;
+        }
+        emmc_path = 1;
+    }
+#endif
+
     while (offset < size) {
         uint32_t chunk = size - offset;
         if (chunk > MAX_PAYLOAD - 2) chunk = MAX_PAYLOAD - 2;
+#ifdef EMMC_BASE
+        /* eMMC streams block-by-block; cap chunk at one block. */
+        if (emmc_path && chunk > 512) chunk = 512;
+#endif
 
         pkt[0] = (seq >> 0) & 0xFF;
         pkt[1] = (seq >> 8) & 0xFF;
@@ -202,8 +244,19 @@ static void handle_read(const uint8_t *data, uint32_t len) {
                 for (uint32_t j = 0; j < 4 && (i + j) < chunk; j++)
                     pkt[2 + i + j] = (val >> ((byte_off + j) * 8)) & 0xFF;
             }
+#ifdef EMMC_BASE
+        } else if (emmc_path) {
+            /* eMMC: read one block via CMD17 + FIFO drain. */
+            uint8_t blk[512];
+            uint32_t block_no = (addr - FLASH_MEM + offset) / 512u;
+            if (emmc_read_block(block_no, blk) != 0) {
+                proto_send_ack(ACK_FLASH_ERROR);
+                return;
+            }
+            for (uint32_t i = 0; i < chunk; i++) pkt[2 + i] = blk[i];
+#endif
         } else if (flash_readable && addr >= FLASH_MEM &&
-                   (addr + size) <= (FLASH_MEM + flash_info.size)) {
+                   (uint64_t)(addr - FLASH_MEM) + size <= (uint64_t)flash_info.size) {
             /* Register-based flash read — boot mode window wraps at 1MB */
             uint8_t tmp[MAX_PAYLOAD];
             flash_read(addr - FLASH_MEM + offset, tmp, chunk);
@@ -1272,6 +1325,25 @@ int main(void) {
     if (flash_init(&flash_info) == 0) {
         flash_readable = 1;
     }
+
+#ifdef EMMC_BASE
+    /* If no SPI flash was identified (JEDEC ID came back 0/0xFF/0xFF or the
+     * FMC controller wasn't on the expected version), try the eMMC reader.
+     * Read-only MVP: identifies the card and exposes a linear LBA window
+     * through the FLASH_MEM virtual address so CMD_READ can dump blocks. */
+    if (!flash_readable && emmc_init() == 0) {
+        flash_info.jedec_id[0] = emmc_cid[0];   /* MID */
+        flash_info.jedec_id[1] = emmc_cid[1];
+        flash_info.jedec_id[2] = emmc_cid[2];
+        flash_info.size        = (uint32_t)(emmc_capacity_bytes > 0xFFFFFFFFu
+                                            ? 0xFFFFFFFFu
+                                            : emmc_capacity_bytes);
+        flash_info.sector_size = 512;
+        flash_info.page_size   = 512;
+        flash_info.flash_type  = FLASH_TYPE_EMMC;
+        flash_readable = 1;
+    }
+#endif
 
     proto_send_ready();
 

@@ -85,6 +85,16 @@ else ifeq ($(SOC),hi3516cv500)
   WDT_BASE       = 0x12051000
   CRG_BASE       = 0x12010000
   SYSCTRL_REBOOT = 0x12020004
+  # eMMC controller (Synopsys DesignWare MMC host @ 0x10100000) and the
+  # IO pinmux block live outside the default I/O whitelist; the per-SoC
+  # define opens them up for the eMMC reader.  See agent/main.c.
+  EMMC_BASE      = 0x10100000
+  IO_CTRL0_BASE  = 0x10ff0000
+  SYSCTRL_BASE   = 0x12020000
+  # Bootrom mask ROM (64 KiB at 0x04000000) — read-only, holds the
+  # pinmux table the bootrom's configure_emmc_pins reads at 0x7d98.
+  BOOTROM_BASE   = 0x04000000
+  BOOTROM_SIZE   = 0x10000
 else ifeq ($(SOC),hi3518ev200)
   UART_BASE      = 0x12100000
   UART_CLOCK     = 24000000
@@ -168,6 +178,10 @@ CFLAGS = -mcpu=$(CPU_TYPE) -marm -O2 -ffreestanding -nostdlib \
          -DFLASH_MEM=$(FLASH_MEM) -DFMC_BASE=$(FMC_BASE) -DRAM_BASE=$(RAM_BASE) -DWDT_BASE=$(WDT_BASE) \
          -DCRG_BASE=$(CRG_BASE) -DSYSCTRL_REBOOT=$(SYSCTRL_REBOOT) \
          -DAGENT_LOAD_ADDR=$(LOAD_ADDR) \
+         $(if $(EMMC_BASE),-DEMMC_BASE=$(EMMC_BASE)) \
+         $(if $(IO_CTRL0_BASE),-DIO_CTRL0_BASE=$(IO_CTRL0_BASE)) \
+         $(if $(SYSCTRL_BASE),-DSYSCTRL_BASE=$(SYSCTRL_BASE)) \
+         $(if $(BOOTROM_BASE),-DBOOTROM_BASE=$(BOOTROM_BASE) -DBOOTROM_SIZE=$(BOOTROM_SIZE)) \
          $(if $(UART_CKSEL_REG),-DUART_CKSEL_REG=$(UART_CKSEL_REG) -DUART_CKSEL_BIT=$(UART_CKSEL_BIT)) \
          -mno-unaligned-access -Wall -Wextra
 
@@ -188,7 +202,7 @@ else
   SPI_FLASH_SRC = spi_flash_$(SPI_DRIVER).c
 endif
 
-SRCS_C = main.c uart.c protocol.c cobs.c $(SPI_FLASH_SRC)
+SRCS_C = main.c uart.c protocol.c cobs.c $(SPI_FLASH_SRC) $(if $(EMMC_BASE),emmc_himci.c)
 SRCS_S = startup.S
 OBJS = $(SRCS_S:.S=.o) $(SRCS_C:.c=.o)
 

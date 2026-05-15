@@ -33,6 +33,7 @@
 /* Flash type */
 #define FLASH_TYPE_NOR  0
 #define FLASH_TYPE_NAND 1
+#define FLASH_TYPE_EMMC 2  /* SD/eMMC over DesignWare MMC host */
 
 /* Flash info */
 typedef struct {
