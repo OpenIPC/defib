@@ -53,7 +53,9 @@ def find_protocol(chip_name: str) -> Type[BootProtocol]:
     """
     _load_entry_points()
 
-    chip_lower = chip_name.lower()
+    # Strip any ``:variant`` suffix — protocol selection keys on base chip
+    # (variant overrides DDR/SPL details, not the boot protocol family).
+    chip_lower = chip_name.lower().split(":", 1)[0]
     for cls in _registry:
         if cls.matches(chip_lower):
             return cls
