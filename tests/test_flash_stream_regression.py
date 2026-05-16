@@ -311,8 +311,137 @@ class TestSectorBitmap:
 
 
 # ---------------------------------------------------------------------------
+# Bug 7: write_flash bitmap hardcoded to 32 bytes — crashed at sector 256
+# Symptom (real hardware, hi3520dv200 + 32 MiB NOR):
+#   `defib agent flash` with a 32 MiB input ran for ~9 min, wrote ~9.5 MiB,
+#   then crashed with `IndexError: bytearray index out of range` at
+#   `bitmap[s // 8]` for s=256. The agent had already begun erasing
+#   sectors per the (short) bitmap it received; the host crash left the
+#   boot partition wiped (U-Boot gone, device falls back to bootrom
+#   fastboot markers on power-on). The bricking-by-iteration-bug is what
+#   this test prevents.
+# Fix: bitmap = bytearray((num_sectors + 7) // 8) — agent already indexes
+# bitmap[s/8] from the wire payload, so any length the host sends works.
+# ---------------------------------------------------------------------------
+
+class TestWriteFlashBitmapSizing:
+    """Reproduces the bricking bug from 2026-05-16 on hi3520dv200."""
+
+    @staticmethod
+    def _build_bitmap_OLD_BUGGY(num_sectors: int, has_data) -> bytearray:
+        """The old hardcoded-32-byte version. Crashes at s>=256."""
+        bitmap = bytearray(32)
+        for s in range(num_sectors):
+            if has_data(s):
+                bitmap[s // 8] |= 1 << (s % 8)
+        return bitmap
+
+    @staticmethod
+    def _build_bitmap_FIXED(num_sectors: int, has_data) -> bytearray:
+        """Replica of the post-fix construction in
+        ``defib.agent.client.write_flash`` — bitmap sized for any
+        sector count."""
+        bitmap = bytearray((num_sectors + 7) // 8)
+        for s in range(num_sectors):
+            if has_data(s):
+                bitmap[s // 8] |= 1 << (s % 8)
+        return bitmap
+
+    def test_old_buggy_crashes_at_sector_256(self):
+        """Lock in the reproduction: the old code IndexErrors at s=256."""
+        with pytest.raises(IndexError):
+            self._build_bitmap_OLD_BUGGY(num_sectors=257, has_data=lambda s: True)
+
+    def test_old_buggy_crashes_for_32mb_flash(self):
+        """32 MiB / 64 KiB sectors = 512 sectors — half the flash never
+        even reaches the loop with the old code."""
+        # 32 MiB NOR with 64 KiB sectors
+        num_sectors = (32 * 1024 * 1024) // 0x10000
+        assert num_sectors == 512
+        with pytest.raises(IndexError):
+            self._build_bitmap_OLD_BUGGY(num_sectors, has_data=lambda s: True)
+
+    def test_fixed_works_at_256_sector_boundary(self):
+        """257 sectors: just past the old 32-byte (=256-bit) ceiling."""
+        bitmap = self._build_bitmap_FIXED(num_sectors=257, has_data=lambda s: True)
+        assert len(bitmap) == 33  # ceil(257/8)
+        for s in range(257):
+            assert bitmap[s // 8] & (1 << (s % 8)), f"sector {s} bit unset"
+
+    def test_fixed_works_for_full_32mb_flash(self):
+        """The actual case that bricked the board: 512 sectors, all data."""
+        num_sectors = 512
+        bitmap = self._build_bitmap_FIXED(num_sectors, has_data=lambda s: True)
+        assert len(bitmap) == 64
+        for s in range(num_sectors):
+            assert bitmap[s // 8] & (1 << (s % 8)), f"sector {s} bit unset"
+
+    def test_fixed_sizes_bitmap_tightly(self):
+        """Bitmap is exactly ceil(num_sectors / 8) bytes — no wasted space."""
+        for n in [1, 7, 8, 9, 64, 127, 128, 129, 255, 256, 257, 512, 1024]:
+            bitmap = self._build_bitmap_FIXED(n, has_data=lambda s: False)
+            assert len(bitmap) == (n + 7) // 8, (
+                f"num_sectors={n}: expected {(n+7)//8} bytes, got {len(bitmap)}"
+            )
+
+    def test_real_write_flash_constructs_correct_bitmap(self):
+        """End-to-end: import the actual write_flash bitmap-construction
+        path and run it against a 17 MiB (= 257-sector) firmware blob.
+        This exercises the exact code that crashed on hardware."""
+        import asyncio
+        from unittest.mock import MagicMock
+        from defib.agent.client import FlashAgentClient
+
+        # 17 MiB: 1 sector of 0xAA + 0xFF padding ... + 1 sector of 0xBB
+        sector_sz = 0x10000
+        data = bytearray(b'\xff' * (257 * sector_sz))
+        data[0:sector_sz] = b'\xaa' * sector_sz
+        data[256 * sector_sz:] = b'\xbb' * sector_sz
+
+        # Capture the FLASH_STREAM payload defib sends — we only care that
+        # bitmap construction succeeds; abort the actual transfer after.
+        transport = MagicMock()
+        client = FlashAgentClient(transport, "hi3520dv200")
+        client._current_baud = 115200  # skip baud switch
+        client._sector_size = sector_sz
+
+        sent_packets = []
+
+        async def fake_send_packet(t, cmd, payload=b''):
+            sent_packets.append((cmd, bytes(payload)))
+
+        async def fake_recv_response(t, timeout=5.0):
+            from defib.agent.protocol import RSP_ACK, ACK_OK
+            # Reject so the function exits cleanly after the bitmap is built
+            return RSP_ACK, bytes([ACK_OK ^ 1])
+
+        import defib.agent.client as client_mod
+        orig_send = client_mod.send_packet
+        orig_recv = client_mod.recv_response
+        client_mod.send_packet = fake_send_packet
+        client_mod.recv_response = fake_recv_response
+        try:
+            asyncio.run(client.write_flash(0, bytes(data), fast=False))
+        finally:
+            client_mod.send_packet = orig_send
+            client_mod.recv_response = orig_recv
+
+        # The first packet defib sends is CMD_FLASH_STREAM with the bitmap
+        assert sent_packets, "no packets sent — bitmap construction crashed"
+        cmd, payload = sent_packets[0]
+        assert cmd == CMD_FLASH_STREAM
+        # Header is 12 bytes (addr/size/crc); rest is the bitmap
+        bitmap = payload[12:]
+        # 257 sectors → 33 bytes (would be 32 with the old bug, missing sector 256)
+        assert len(bitmap) == 33, f"expected 33-byte bitmap, got {len(bitmap)}"
+        # Sectors 0 and 256 carry data
+        assert bitmap[0] & 0x01, "sector 0 bit missing"
+        assert bitmap[32] & 0x01, "sector 256 bit missing (this is the bug)"
+
+
+# ---------------------------------------------------------------------------
 # Bug 5: CMD_FLASH_STREAM payload format
-# Agent expects 44 bytes: [addr:4][size:4][crc:4][bitmap:32]
+# Agent expects ≥ 44 bytes: [addr:4][size:4][crc:4][bitmap:(num_sectors+7)/8]
 # ---------------------------------------------------------------------------
 
 class TestFlashStreamPayload:
@@ -356,6 +485,54 @@ class TestFlashStreamPayload:
         # Sectors 128-255 should be clear
         for s in range(128, 256):
             assert not (got_bitmap[s // 8] & (1 << (s % 8)))
+
+
+# ---------------------------------------------------------------------------
+# Bug 8 (sibling of Bug 7, agent-side): CMD_FLASH_STREAM rejected short
+# payloads with ACK_CRC_ERROR (`if (len < 44)`). Once the host became
+# size-aware (Bug 7 fix), small-flash writes started failing — defib sent
+# 12 + 16 = 28 B for an 8 MiB image and the agent rejected it as malformed.
+# Agent must accept ≥ 12 + ceil(num_sectors_implied_by_size / 8) bytes.
+# ---------------------------------------------------------------------------
+
+class TestFlashStreamVariableBitmap:
+    """Wire-format expectations for the variable-bitmap-length payload."""
+
+    def _bitmap_bytes(self, total_bytes: int, sector_sz: int = 0x10000) -> int:
+        num_sectors = (total_bytes + sector_sz - 1) // sector_sz
+        return (num_sectors + 7) // 8
+
+    def test_8mb_flash_uses_16_byte_bitmap(self):
+        """8 MiB / 64 KiB = 128 sectors → 16 B bitmap (not 32)."""
+        assert self._bitmap_bytes(8 * 1024 * 1024) == 16
+
+    def test_32mb_flash_uses_64_byte_bitmap(self):
+        """32 MiB / 64 KiB = 512 sectors → 64 B bitmap (not 32)."""
+        assert self._bitmap_bytes(32 * 1024 * 1024) == 64
+
+    def test_payload_size_8mb(self):
+        """8 MiB flash → 12 (header) + 16 (bitmap) = 28 B payload."""
+        bitmap = bytearray(16)
+        for s in range(128):
+            bitmap[s // 8] |= 1 << (s % 8)
+        payload = struct.pack("<III", 0, 8 * 1024 * 1024, 0) + bytes(bitmap)
+        assert len(payload) == 28
+        # Round-trip through COBS framing
+        pkt = build_packet(CMD_FLASH_STREAM, payload)
+        cmd, data = parse_packet(pkt[:-1])
+        assert cmd == CMD_FLASH_STREAM and len(data) == 28
+        assert data[12:] == bytes(bitmap)
+
+    def test_payload_size_32mb(self):
+        """32 MiB flash → 12 + 64 = 76 B payload."""
+        bitmap = bytearray(64)
+        for s in range(512):
+            bitmap[s // 8] |= 1 << (s % 8)
+        payload = struct.pack("<III", 0, 32 * 1024 * 1024, 0) + bytes(bitmap)
+        assert len(payload) == 76
+        pkt = build_packet(CMD_FLASH_STREAM, payload)
+        cmd, data = parse_packet(pkt[:-1])
+        assert cmd == CMD_FLASH_STREAM and len(data) == 76
 
 
 # ---------------------------------------------------------------------------
