@@ -571,9 +571,16 @@ class FlashAgentClient:
         sector_sz = self._sector_size or 0x10000
         num_sectors = (total + sector_sz - 1) // sector_sz
 
-        # Build sector bitmap: bit=1 if sector has non-0xFF data
+        # Build sector bitmap: bit=1 if sector has non-0xFF data. Size must
+        # hold num_sectors bits — a hardcoded 32-byte length crashed mid-flash
+        # with IndexError at s=256 on real hardware (32 MiB NOR / 64 KiB
+        # sectors = 512 sectors), aborting the host loop after the agent had
+        # already started erasing — verified bricking on hi3520dv200 by
+        # wiping U-Boot before recovery. The agent indexes bitmap[s/8] from
+        # the wire payload, so any size we send is fine on the agent side
+        # (matching agent-side dynamic-length check landed alongside).
         ff_sector = b'\xff' * sector_sz
-        bitmap = bytearray(32)
+        bitmap = bytearray((num_sectors + 7) // 8)
         for s in range(num_sectors):
             sector_data = data[s * sector_sz : (s + 1) * sector_sz]
             if sector_data != ff_sector[:len(sector_data)]:

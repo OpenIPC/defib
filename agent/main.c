@@ -833,13 +833,18 @@ static int erase_and_program(uint32_t addr, const uint8_t *buf,
 }
 
 static void handle_flash_stream(const uint8_t *data, uint32_t len) {
-    if (len < 44) { proto_send_ack(ACK_CRC_ERROR); return; }
+    /* Header is 12 B (addr/size/crc). Bitmap length depends on size — the
+     * host sends ceil(num_sectors/8) bytes. Earlier versions hardcoded a
+     * 32 B bitmap (max 256 sectors) on both sides; once the host became
+     * size-aware (and started sending shorter bitmaps for sub-16 MiB
+     * writes), this check rejected legitimate small flashes as CRC errors. */
+    if (len < 12) { proto_send_ack(ACK_CRC_ERROR); return; }
     if (!flash_readable) { proto_send_ack(ACK_FLASH_ERROR); return; }
 
     uint32_t flash_addr = read_le32(&data[0]);
     uint32_t size = read_le32(&data[4]);
     uint32_t expected_crc = read_le32(&data[8]);
-    const uint8_t *bitmap = &data[12];  /* 32-byte sector bitmap */
+    const uint8_t *bitmap = &data[12];  /* sector bitmap, (num_sectors+7)/8 bytes */
 
     if (size == 0 || flash_addr + size > flash_info.size) {
         proto_send_ack(ACK_FLASH_ERROR);
@@ -849,6 +854,14 @@ static void handle_flash_stream(const uint8_t *data, uint32_t len) {
     uint32_t sector_sz = flash_info.sector_size;
     uint32_t page_sz = flash_info.page_size;
     uint32_t num_sectors = (size + sector_sz - 1) / sector_sz;
+
+    /* Now that we know num_sectors, verify the wire payload actually
+     * carries enough bitmap bytes. */
+    uint32_t expected_bitmap_bytes = (num_sectors + 7) / 8;
+    if (len < 12 + expected_bitmap_bytes) {
+        proto_send_ack(ACK_CRC_ERROR);
+        return;
+    }
 
     /* Double buffer: receive into one while erasing+programming the other.
      * Each buffer must be at least sector_sz bytes — NAND sectors are
