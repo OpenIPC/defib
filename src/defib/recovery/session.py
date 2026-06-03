@@ -124,7 +124,19 @@ class RecoverySession:
                     ),
                 ))
 
-            # Power cycle
+            # Power-cycle + handshake, ordered for the protocol style:
+            #
+            # - Frame-blast (HiSiliconStandard) is REACTIVE — the bootrom
+            #   emits 0x20 markers after reset and waits for 0xAA replies,
+            #   so reset first, start handshake right after.
+            # - Proactive blast (HiSiliconV500, HiSiliconCV6xx) requires
+            #   magic to already be streaming when the bootrom's UART
+            #   listen window opens (~tens of ms after reset release).
+            #   Start the handshake task BEFORE triggering reset; the
+            #   manual-reset path below already does this implicitly by
+            #   blasting while waiting for the human to power-cycle.
+            import asyncio as _asyncio
+
             if self._power is not None and self._poe_port is not None:
                 label = self._poe_port or self._power.name()
                 if on_log:
@@ -138,60 +150,72 @@ class RecoverySession:
                         message=f"Power-cycling {label}...",
                     ))
 
-                try:
-                    await self._power.power_cycle(self._poe_port)
-                except Exception as e:
-                    elapsed = (time.monotonic() - start_time) * 1000
-                    if on_log:
-                        on_log(LogEvent(level="error", message=f"Power cycle failed: {e}"))
-                    return RecoveryResult(
-                        success=False,
-                        error=f"Power cycle failed: {e}",
-                        elapsed_ms=elapsed,
-                    )
-
-                # Drain stale bytes — but skip on frame-blast chips because
-                # the bootrom emits the 0x20 markers we need to catch
-                # within ~tens of ms of reset.  The marker-based handshake
-                # below filters non-marker bytes itself, so a separate
-                # quiet-line drain just eats the catch window.
                 if frame_blast:
+                    try:
+                        await self._power.power_cycle(self._poe_port)
+                    except Exception as e:
+                        elapsed = (time.monotonic() - start_time) * 1000
+                        if on_log:
+                            on_log(LogEvent(level="error", message=f"Power cycle failed: {e}"))
+                        return RecoveryResult(
+                            success=False,
+                            error=f"Power cycle failed: {e}",
+                            elapsed_ms=elapsed,
+                        )
+                    # Frame-blast filters non-marker bytes itself; a flush
+                    # is enough, a quiet-line drain would eat the catch
+                    # window.
                     await transport.flush_input()
-                else:
-                    discarded = await transport.drain_until_silent(
-                        quiet_period=0.5, max_wait=5.0,
-                    )
-                    if discarded and on_log:
+                    if on_progress:
+                        on_progress(ProgressEvent(
+                            stage=Stage.POWER_CYCLE, bytes_sent=1, bytes_total=1,
+                            message="Power cycle complete",
+                        ))
+                    if on_log:
                         on_log(LogEvent(
                             level="info",
-                            message=f"Drained {discarded} stale bytes from serial",
+                            message=f"Listening for 0x20 markers + flooding 0xAA for {self.chip}",
                         ))
+                    handshake_task = _asyncio.create_task(
+                        protocol.handshake(transport, on_progress)
+                    )
+                    handshake = await handshake_task
+                else:
+                    await transport.flush_input()
+                    if on_log:
+                        on_log(LogEvent(
+                            level="info",
+                            message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
+                        ))
+                    handshake_task = _asyncio.create_task(
+                        protocol.handshake(transport, on_progress)
+                    )
+                    # Yield so the blaster gets its first frames onto the
+                    # wire before the bootrom's listen window opens.
+                    await _asyncio.sleep(0.05)
+                    try:
+                        await self._power.power_cycle(self._poe_port)
+                    except Exception as e:
+                        handshake_task.cancel()
+                        try:
+                            await handshake_task
+                        except BaseException:
+                            pass
+                        elapsed = (time.monotonic() - start_time) * 1000
+                        if on_log:
+                            on_log(LogEvent(level="error", message=f"Power cycle failed: {e}"))
+                        return RecoveryResult(
+                            success=False,
+                            error=f"Power cycle failed: {e}",
+                            elapsed_ms=elapsed,
+                        )
+                    if on_progress:
+                        on_progress(ProgressEvent(
+                            stage=Stage.POWER_CYCLE, bytes_sent=1, bytes_total=1,
+                            message="Power cycle complete",
+                        ))
+                    handshake = await handshake_task
 
-                if on_progress:
-                    on_progress(ProgressEvent(
-                        stage=Stage.POWER_CYCLE, bytes_sent=1, bytes_total=1,
-                        message="Power cycle complete",
-                    ))
-
-            # Handshake.  Frame-blast chips (e.g. hi3516cv300) historically
-            # skipped this and relied on send_firmware's HEAD-blast, but
-            # that approach catches U-Boot's character echo on healthy
-            # boards: the camera autoboots, U-Boot echoes our 0xAA back,
-            # and the protocol mistakes the echo for a bootrom ACK.  The
-            # marker-based handshake (with continuous_ack flooding 0xAA)
-            # is strictly more robust because it requires actually seeing
-            # the bootrom's 0x20 markers as proof of download mode.
-            if frame_blast and self._power is not None and self._poe_port is not None:
-                if on_log:
-                    on_log(LogEvent(
-                        level="info",
-                        message=f"Listening for 0x20 markers + flooding 0xAA for {self.chip}",
-                    ))
-                import asyncio as _asyncio
-                handshake_task = _asyncio.create_task(
-                    protocol.handshake(transport, on_progress)
-                )
-                handshake = await handshake_task
             elif frame_blast:
                 # No power control — fall back to deferred frame-blast
                 # inside send_firmware (manual reset path).
@@ -201,18 +225,6 @@ class RecoverySession:
                         message=f"Using sendFrameForStart handshake for {self.chip}",
                     ))
                 handshake = HandshakeResult(success=True, message="Frame-blast (deferred)")
-            elif self._power is not None and self._poe_port is not None:
-                # Power-cycle mode with 0x20→0xAA handshake: flood 0xAA
-                if on_log:
-                    on_log(LogEvent(
-                        level="info",
-                        message=f"Starting {self._protocol_cls.name()} handshake for {self.chip}",
-                    ))
-                import asyncio as _asyncio
-                handshake_task = _asyncio.create_task(
-                    protocol.handshake(transport, on_progress)
-                )
-                handshake = await handshake_task
             else:
                 # Manual power cycling — just start handshake and wait
                 if on_log:
