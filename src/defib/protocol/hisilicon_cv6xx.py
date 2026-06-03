@@ -122,6 +122,25 @@ def parse_cv6xx_boot(file_data: bytes) -> CV6xxBootParts:
     )
 
 
+def wrap_cv6xx_payload(header_source: bytes, payload: bytes) -> bytes:
+    """Wrap an arbitrary blob in the CV6xx U-Boot header.
+
+    The CV6xx bootrom validates the U-Boot magic at byte 0 and reads
+    the code-offset field at byte 8 (= 0x400) to decide where to jump
+    inside the loaded blob. ``header_source`` is the uboot_data section
+    of a valid composite boot file (e.g. ``parse_cv6xx_boot(blob).uboot_data``);
+    we reuse its 1024-byte header verbatim and patch only the payload
+    length field at byte 36. Callers must link the payload at
+    ``UBOOT_LOAD_ADDR + 0x400`` so its first instruction lands where
+    the bootrom jumps.
+    """
+    if len(header_source) < 1024:
+        raise ValueError("header_source must be at least 1024 bytes")
+    header = bytearray(header_source[:1024])
+    struct.pack_into("<I", header, 36, len(payload))
+    return bytes(header) + payload
+
+
 def build_ddr_table(parts: CV6xxBootParts, board_id: int = 0) -> bytes:
     """Build the DDR initialization table for a specific board ID."""
     mapping = parts.board_mapping
@@ -327,6 +346,7 @@ class HiSiliconCV6xx(BootProtocol):
         transport: Transport,
         firmware: bytes,
         on_progress: Callable[[ProgressEvent], None] | None = None,
+        uboot_override: bytes | None = None,
     ) -> RecoveryResult:
         stages: list[Stage] = []
 
@@ -336,9 +356,11 @@ class HiSiliconCV6xx(BootProtocol):
         except ProtocolError as e:
             return RecoveryResult(success=False, error=str(e))
 
+        uboot_payload = uboot_override if uboot_override is not None else parts.uboot_data
+
         logger.info(
             "CV6xx boot file: GSL=%d bytes, DDR tables=%d (size=%d), U-Boot=%d bytes",
-            len(parts.gsl_data), parts.table_count, parts.table_size, len(parts.uboot_data),
+            len(parts.gsl_data), parts.table_count, parts.table_size, len(uboot_payload),
         )
 
         # 1. Send GSL
@@ -406,9 +428,10 @@ class HiSiliconCV6xx(BootProtocol):
         ))
         stages.append(Stage.DDR_TRAINING)
 
-        # 5. Send U-Boot
+        # 5. Send U-Boot (or the override payload, e.g. a flash agent
+        #    wrapped via wrap_cv6xx_payload using the composite's header).
         if not await self._send_data_to_bootrom(
-            transport, parts.uboot_data, UBOOT_LOAD_ADDR,
+            transport, uboot_payload, UBOOT_LOAD_ADDR,
             Stage.UBOOT, on_progress,
         ):
             return RecoveryResult(

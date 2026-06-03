@@ -122,10 +122,20 @@
 #define NAND_PAGE_SIZE   2048
 #define NAND_BLOCK_SIZE  (64 * NAND_PAGE_SIZE)   /* 128 KiB */
 
-/* CRG register for FMC clock — CRG_BASE is per-SoC (set via -DCRG_BASE=...) */
-#define REG_FMC_CRG         (*(volatile uint32_t *)(CRG_BASE + 0x0144))
-#define FMC_CLK_ENABLE      (1 << 1)
-#define FMC_SOFT_RESET      (1 << 0)
+/* CRG register for FMC clock — CRG_BASE + per-family offset and bit
+ * positions. The V3/V4 default (offset 0x0144, clock-enable on bit 1,
+ * soft-reset on bit 0) is overridden via Makefile for chips where the
+ * CRG layout differs — notably CV6xx (offset 0x3F40, clock-enable bit
+ * 4) which moved every peripheral CRG entry. */
+#ifndef FMC_CRG_OFFSET
+#define FMC_CRG_OFFSET      0x0144
+#endif
+#ifndef FMC_CRG_CLK_BIT
+#define FMC_CRG_CLK_BIT     1
+#endif
+#define REG_FMC_CRG         (*(volatile uint32_t *)(CRG_BASE + FMC_CRG_OFFSET))
+#define FMC_CLK_ENABLE      (1u << FMC_CRG_CLK_BIT)
+#define FMC_SOFT_RESET      (1u << 0)
 
 /* SPI timing: TCSH=6 [15:12], TCSS=6 [11:8], TSHSL=0xF [7:0] */
 #define SPI_TIMING_VAL      ((6 << 12) | (6 << 8) | 0xF)  /* 0x660F */
@@ -142,20 +152,40 @@ static void fmc_wait_ready(void);
 static void spi_wait_wip(void);
 
 /* Mode switching: normal mode for register commands, boot mode for reads */
-/* I/O pad configuration base for SPI flash pins */
-#define IO_BASE  0x100C0000
-#define io_reg(off) (*(volatile uint32_t *)(IO_BASE + (off)))
+/* I/O pad configuration base for SPI flash pins.  Per-family override
+ * via -DSPI_PIN_BASE=...; default targets V3/V4 chips. */
+#ifndef SPI_PIN_BASE
+#define SPI_PIN_BASE  0x100C0000
+#endif
+#define io_reg(off) (*(volatile uint32_t *)(SPI_PIN_BASE + (off)))
 
 static void fmc_enter_normal(void) {
     /* Full FMC init for register-mode operations (matching U-Boot) */
 
-    /* Configure SPI flash I/O pads (SPL may have left them in boot-mode config) */
+    /* Configure SPI flash I/O pads (SPL may have left them in boot-mode
+     * config).  CV6xx moved the pinctrl block from 0x100C0000 to
+     * 0x10260000 and uses different register offsets + values; the
+     * dimerr/u-boot-hi3516cv610 driver fmc_hi3516cv610.c is the source
+     * of truth for the CV6xx values. */
+#ifdef SPI_PINS_CV6XX
+    /* CV6xx layout (per drivers/mtd/fmc_hi3516cv610.c, 3.3V single-CS):
+     * 0x0C MOSI_IO0, 0x10 CLK, 0x14 HOLD_IO3, 0x18 CS0,
+     * 0x1C MISO_IO1, 0x20 WP_IO2. */
+    io_reg(0x0C) = 0x1261;  /* sfc_mosi_io0 */
+    io_reg(0x10) = 0x1291;  /* sfc_clk      */
+    io_reg(0x14) = 0x1161;  /* sfc_hold_io3 */
+    io_reg(0x18) = 0x1131;  /* sfc_cs0      */
+    io_reg(0x1C) = 0x1261;  /* sfc_miso_io1 */
+    io_reg(0x20) = 0x12E1;  /* sfc_wp_io2   */
+#else
+    /* V3/V4 layout (hi3516ev300 / cv500 / gk7205 / ...) */
     io_reg(0x14) = 0x401;  /* sfc_clk */
     io_reg(0x18) = 0x461;  /* sfc_hold_io0 */
     io_reg(0x1C) = 0x461;  /* sfc_miso_io1 */
     io_reg(0x20) = 0x461;  /* sfc_wp_io2 */
     io_reg(0x24) = 0x461;  /* sfc_mosi_io3 */
     io_reg(0x28) = 0x461;  /* sfc_csn */
+#endif
 
     fmc_reg(FMC_CFG) = 0x1821;  /* OP_MODE_NORMAL | bootrom defaults */
     fmc_reg(FMC_SPI_TIMING_CFG) = SPI_TIMING_VAL;

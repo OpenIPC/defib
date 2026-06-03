@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import typer
 
 app = typer.Typer(
@@ -999,13 +1001,19 @@ def agent_upload(
     chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial device (/dev/ttyUSB0), tcp://host:port, rfc2217://host:port, or socket:///path"),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
+    file: str | None = typer.Option(None, "-f", "--file", help="CV6xx composite boot file (GSL+DDR+U-Boot); required for CV6xx, ignored for other protocols"),
+    power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via configured controller (DEFIB_POWER_TYPE)"),
 ) -> None:
     """Upload flash agent to device via boot protocol (requires power-cycle)."""
     import asyncio
-    asyncio.run(_agent_upload_async(chip, port, output))
+    asyncio.run(_agent_upload_async(chip, port, output, file, power_cycle))
 
 
-async def _agent_upload_async(chip: str, port: str, output: str) -> None:
+async def _agent_upload_async(
+    chip: str, port: str, output: str,
+    composite_path: str | None = None,
+    power_cycle: bool = False,
+) -> None:
     import json as json_mod
 
     from rich.console import Console
@@ -1013,7 +1021,9 @@ async def _agent_upload_async(chip: str, port: str, output: str) -> None:
     from defib.agent.client import FlashAgentClient, get_agent_binary
     from defib.firmware import get_cached_path
     from defib.profiles.loader import load_profile
+    from defib.protocol.hisilicon_cv6xx import HiSiliconCV6xx
     from defib.protocol.hisilicon_standard import HiSiliconStandard
+    from defib.protocol.registry import find_protocol
     from defib.recovery.events import ProgressEvent
     from defib.transport.serial_platform import (
         create_transport, normalize_port_name,
@@ -1033,7 +1043,27 @@ async def _agent_upload_async(chip: str, port: str, output: str) -> None:
 
     agent_data = agent_path.read_bytes()
 
-    # Get real SPL from cached U-Boot
+    # Dispatch on protocol family. CV6xx fastboot expects a single
+    # composite (GSL + DDR + U-Boot-shaped) blob — the agent ships in
+    # place of the U-Boot section, wrapped in a 1024-byte header so the
+    # bootrom jumps to LOAD_ADDR + 0x400 where the agent's first
+    # instruction is linked.
+    protocol_cls = find_protocol(chip)
+    if protocol_cls is HiSiliconCV6xx:
+        await _agent_upload_cv6xx(
+            chip=chip,
+            port=port,
+            output=output,
+            console=console,
+            agent_path=agent_path,
+            agent_data=agent_data,
+            composite_path=composite_path,
+            power_cycle=power_cycle,
+        )
+        return
+
+    # HiSiliconStandard / V500 path — needs SoC profile for the SPL+agent
+    # two-stage upload.
     profile = load_profile(chip)
     cached_fw = get_cached_path(chip)
     if not cached_fw:
@@ -1125,6 +1155,149 @@ async def _agent_upload_async(chip: str, port: str, output: str) -> None:
         raise typer.Exit(1)
 
     await transport.close()
+
+
+async def _agent_upload_cv6xx(
+    *,
+    chip: str,
+    port: str,
+    output: str,
+    console: Any,
+    agent_path: Any,
+    agent_data: bytes,
+    composite_path: str | None,
+    power_cycle: bool,
+) -> None:
+    """CV6xx fastboot agent upload — single-composite, no separate SPL."""
+    import asyncio
+    import json as json_mod
+
+    from defib.agent.client import FlashAgentClient
+    from defib.power.factory import power_controller_from_env
+    from defib.power.vectis import VectisController
+    from defib.protocol.hisilicon_cv6xx import (
+        HiSiliconCV6xx, parse_cv6xx_boot, wrap_cv6xx_payload,
+    )
+    from defib.recovery.events import ProgressEvent
+    from defib.transport.rfc2217 import Rfc2217Transport
+    from defib.transport.serial_platform import (
+        create_transport, normalize_port_name,
+    )
+
+    if not composite_path:
+        msg = (
+            f"CV6xx chip '{chip}' needs a composite boot file (GSL+DDR+U-Boot) "
+            "to derive the bootrom-loadable header — pass it via -f/--file."
+        )
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": msg}))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        raise typer.Exit(2)
+
+    composite = open(composite_path, "rb").read()
+    try:
+        parts = parse_cv6xx_boot(composite)
+    except Exception as e:
+        msg = f"Failed to parse composite '{composite_path}': {e}"
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": msg}))
+        else:
+            console.print(f"[red]{msg}[/red]")
+        raise typer.Exit(2)
+
+    wrapped = wrap_cv6xx_payload(parts.uboot_data, agent_data)
+
+    if output == "human":
+        console.print(f"Agent: [cyan]{agent_path.name}[/cyan] ({len(agent_data)} bytes)")
+        console.print(f"Composite: [cyan]{composite_path}[/cyan] ({len(composite)} bytes)")
+        console.print(f"Wrapped payload: {len(wrapped)} bytes (1024 B header + agent)")
+
+    power = power_controller_from_env() if power_cycle else None
+
+    transport = await create_transport(normalize_port_name(port))
+    if power is not None and isinstance(power, VectisController) and isinstance(transport, Rfc2217Transport):
+        power.attach_transport(transport)
+
+    protocol = HiSiliconCV6xx()
+
+    def on_progress(e: ProgressEvent) -> None:
+        if e.message:
+            if output == "human":
+                console.print(f"  {e.message}")
+            elif output == "json":
+                print(json_mod.dumps({"event": "progress", "message": e.message}), flush=True)
+
+    # Spawn handshake before reset — same ordering as RecoverySession's
+    # proactive-blast path (see #109).
+    if output == "human" and power is not None:
+        console.print(f"Power-cycling via {power.name()}...")
+    elif output == "human":
+        console.print("\n[yellow]Power-cycle the camera now![/yellow]\n")
+
+    await transport.flush_input()
+    hs_task = asyncio.create_task(protocol.handshake(transport, on_progress))
+    if power is not None:
+        await asyncio.sleep(0.05)
+        try:
+            await power.power_cycle("")
+        except Exception as e:
+            hs_task.cancel()
+            try:
+                await hs_task
+            except BaseException:
+                pass
+            if output == "json":
+                print(json_mod.dumps({"event": "error", "message": f"Power cycle failed: {e}"}))
+            else:
+                console.print(f"[red]Power cycle failed:[/red] {e}")
+            await transport.close()
+            raise typer.Exit(1)
+
+    hs = await hs_task
+    if not hs.success:
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": "Handshake failed"}))
+        else:
+            console.print("[red]Handshake failed[/red]")
+        await transport.close()
+        raise typer.Exit(1)
+
+    result = await protocol.send_firmware(
+        transport, composite, on_progress, uboot_override=wrapped,
+    )
+    if not result.success:
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": result.error or "Upload failed"}))
+        else:
+            console.print(f"[red]Upload failed:[/red] {result.error}")
+        await transport.close()
+        raise typer.Exit(1)
+
+    if output == "human":
+        console.print("[green]Agent uploaded![/green] Waiting for READY...")
+
+    client = FlashAgentClient(transport, chip)
+    ready = await client.connect(timeout=10.0)
+    if ready:
+        info = await client.get_info()
+        if output == "human":
+            console.print("[green bold]Agent ready![/green bold]")
+            console.print(f"  RAM: 0x{info.get('ram_base', 0):08x}")
+            console.print(f"  Flash: {int(info.get('flash_size', 0)) // 1024}KB")
+        elif output == "json":
+            print(json_mod.dumps({"event": "ready", **info}))
+    else:
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": "Agent not responding"}))
+        else:
+            console.print("[red]Agent not responding[/red]")
+        await transport.close()
+        raise typer.Exit(1)
+
+    await transport.close()
+    if power is not None:
+        await power.close()
 
 
 @agent_app.command("flash")
