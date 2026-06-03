@@ -122,52 +122,56 @@ def _recv_packet_sync(port: object, timeout: float) -> tuple[int, bytes]:
     import time
     portbuf = _get_port_buf(port)
     frame = bytearray()
-    old_timeout = port.timeout  # type: ignore[attr-defined]
     deadline = time.monotonic() + timeout
 
-    try:
-        while time.monotonic() < deadline:
-            # Get next chunk of data: from portbuf first, then from port
-            if portbuf:
-                data = bytes(portbuf)
-                portbuf.clear()
+    # NOTE: do NOT mutate ``port.timeout`` inside this loop.  On
+    # pyserial 3.5's RFC 2217 backend, the timeout setter invokes
+    # ``_reconfigure_port`` which re-sends every port parameter
+    # (baud, parity, stop bits, data bits, control, flow control) as
+    # a TELNET sub-negotiation — that's multiple network round-trips
+    # per call and dominates throughput on Vectis/ser2net bridges.
+    # We rely on the small fixed timeout (e.g. 10 ms) the transport
+    # set once at open, and enforce the overall ``timeout`` here
+    # against the deadline instead.
+
+    while time.monotonic() < deadline:
+        # Get next chunk of data: from portbuf first, then from port
+        if portbuf:
+            data = bytes(portbuf)
+            portbuf.clear()
+        else:
+            waiting = port.in_waiting  # type: ignore[attr-defined]
+            if waiting > 0:
+                data = port.read(waiting)  # type: ignore[attr-defined]
             else:
-                waiting = port.in_waiting  # type: ignore[attr-defined]
-                if waiting > 0:
-                    data = port.read(waiting)  # type: ignore[attr-defined]
-                else:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    port.timeout = min(remaining, 0.1)  # type: ignore[attr-defined]
-                    data = port.read(1)  # type: ignore[attr-defined]
+                # port.read() blocks up to the port's pre-set timeout
+                # (Rfc2217Transport._PYSERIAL_READ_QUANTUM = 10 ms).
+                # When no byte arrives within that quantum it returns
+                # b"" and we loop to recheck the overall deadline.
+                data = port.read(1)  # type: ignore[attr-defined]
 
-            if not data:
-                continue
+        if not data:
+            continue
 
-            for i, byte in enumerate(data):
-                if byte == 0x00:
-                    if frame:
-                        try:
-                            result = parse_packet(bytes(frame))
-                            # Stash ONLY bytes after this delimiter
-                            # (complete unprocessed data for next call)
-                            remaining_bytes = data[i + 1:]
-                            if remaining_bytes:
-                                portbuf.extend(remaining_bytes)
-                            frame.clear()
-                            return result
-                        except ValueError:
-                            pass
+        for i, byte in enumerate(data):
+            if byte == 0x00:
+                if frame:
+                    try:
+                        result = parse_packet(bytes(frame))
+                        # Stash ONLY bytes after this delimiter
+                        # (complete unprocessed data for next call)
+                        remaining_bytes = data[i + 1:]
+                        if remaining_bytes:
+                            portbuf.extend(remaining_bytes)
                         frame.clear()
-                else:
-                    frame.append(byte)
-                    if len(frame) > MAX_PACKET_SIZE:
-                        frame.clear()
-    finally:
-        # Do NOT stash partial frame data — that causes corruption
-        # when the next call concatenates it with new bytes.
-        port.timeout = old_timeout  # type: ignore[attr-defined]
+                        return result
+                    except ValueError:
+                        pass
+                    frame.clear()
+            else:
+                frame.append(byte)
+                if len(frame) > MAX_PACKET_SIZE:
+                    frame.clear()
 
     raise TransportTimeout(f"No packet received within {timeout}s")
 
