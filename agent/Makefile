@@ -127,6 +127,11 @@ else ifeq ($(SOC),hi3516cv610)
   SYSCTRL_REBOOT    = 0x11020004
   FMC_CRG_OFFSET    = 0x3F40
   FMC_CRG_CLK_BIT   = 4
+  # CV6xx moved the SPI pinctrl block from 0x100C0000 to 0x10260000
+  # and changed register offsets + pad-drive values. The values come
+  # from the dimerr u-boot-hi3516cv6xx fork (drivers/mtd/fmc_hi3516cv610.c).
+  SPI_PIN_BASE      = 0x10260000
+  SPI_PINS_CV6XX    = 1
 else ifeq ($(SOC),hi3519v101)
   # V3A generation (3519v101 family: hi3519v101, hi3516av200) — Cortex-A7
   # with V3-era peripheral addresses (UART 0x12100000, WDT 0x12080000)
@@ -197,6 +202,8 @@ CFLAGS = -mcpu=$(CPU_TYPE) -marm -O2 -ffreestanding -nostdlib \
          $(if $(UART_CKSEL_REG),-DUART_CKSEL_REG=$(UART_CKSEL_REG) -DUART_CKSEL_BIT=$(UART_CKSEL_BIT)) \
          $(if $(FMC_CRG_OFFSET),-DFMC_CRG_OFFSET=$(FMC_CRG_OFFSET)) \
          $(if $(FMC_CRG_CLK_BIT),-DFMC_CRG_CLK_BIT=$(FMC_CRG_CLK_BIT)) \
+         $(if $(SPI_PIN_BASE),-DSPI_PIN_BASE=$(SPI_PIN_BASE)) \
+         $(if $(SPI_PINS_CV6XX),-DSPI_PINS_CV6XX=1) \
          -mno-unaligned-access -Wall -Wextra
 
 LDFLAGS = -nostdlib -T link.ld -Ttext=$(LOAD_ADDR) --defsym=LOAD_ADDR=$(LOAD_ADDR)
