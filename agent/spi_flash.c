@@ -122,10 +122,20 @@
 #define NAND_PAGE_SIZE   2048
 #define NAND_BLOCK_SIZE  (64 * NAND_PAGE_SIZE)   /* 128 KiB */
 
-/* CRG register for FMC clock — CRG_BASE is per-SoC (set via -DCRG_BASE=...) */
-#define REG_FMC_CRG         (*(volatile uint32_t *)(CRG_BASE + 0x0144))
-#define FMC_CLK_ENABLE      (1 << 1)
-#define FMC_SOFT_RESET      (1 << 0)
+/* CRG register for FMC clock — CRG_BASE + per-family offset and bit
+ * positions. The V3/V4 default (offset 0x0144, clock-enable on bit 1,
+ * soft-reset on bit 0) is overridden via Makefile for chips where the
+ * CRG layout differs — notably CV6xx (offset 0x3F40, clock-enable bit
+ * 4) which moved every peripheral CRG entry. */
+#ifndef FMC_CRG_OFFSET
+#define FMC_CRG_OFFSET      0x0144
+#endif
+#ifndef FMC_CRG_CLK_BIT
+#define FMC_CRG_CLK_BIT     1
+#endif
+#define REG_FMC_CRG         (*(volatile uint32_t *)(CRG_BASE + FMC_CRG_OFFSET))
+#define FMC_CLK_ENABLE      (1u << FMC_CRG_CLK_BIT)
+#define FMC_SOFT_RESET      (1u << 0)
 
 /* SPI timing: TCSH=6 [15:12], TCSS=6 [11:8], TSHSL=0xF [7:0] */
 #define SPI_TIMING_VAL      ((6 << 12) | (6 << 8) | 0xF)  /* 0x660F */

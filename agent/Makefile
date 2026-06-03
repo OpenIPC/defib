@@ -106,15 +106,27 @@ else ifeq ($(SOC),hi3518ev200)
   CRG_BASE       = 0x12010000
   SYSCTRL_REBOOT = 0x12020004
 else ifeq ($(SOC),hi3516cv610)
-  UART_BASE      = 0x11040000
-  UART_CLOCK     = 24000000
-  LOAD_ADDR      = 0x41000000
-  FLASH_MEM      = 0x14000000
-  FMC_BASE       = 0x10000000
-  RAM_BASE       = 0x40000000
-  WDT_BASE       = 0x12030000
-  CRG_BASE       = 0x12010000
-  SYSCTRL_REBOOT = 0x12020004
+  # CV6xx family (cv608, cv610, dv500, dv500). The CV6xx fastboot
+  # bootrom treats the final-stage payload as U-Boot and parses its
+  # 1024-byte header: the code_offset field at byte 8 is 0x400, so
+  # the bootrom jumps to load_addr + 0x400. The agent must therefore
+  # be linked at 0x41000000 + 0x400 = 0x41000400 to match where its
+  # first instruction actually lands after the wrap.
+  # CRG/peripheral block moved to 0x11xxxxxx; FMC clock control sits
+  # at CRG+0x3F40 with the enable on bit 4 (not CRG+0x144/bit1 like
+  # V3/V4 chips). UART0 confirms the 0x11xxxxxx range from the
+  # vendor user guide and from the running kernel's earlycon arg.
+  UART_BASE         = 0x11040000
+  UART_CLOCK        = 24000000
+  LOAD_ADDR         = 0x41000400
+  FLASH_MEM         = 0x0F000000
+  FMC_BASE          = 0x10000000
+  RAM_BASE          = 0x40000000
+  WDT_BASE          = 0x11030000
+  CRG_BASE          = 0x11010000
+  SYSCTRL_REBOOT    = 0x11020004
+  FMC_CRG_OFFSET    = 0x3F40
+  FMC_CRG_CLK_BIT   = 4
 else ifeq ($(SOC),hi3519v101)
   # V3A generation (3519v101 family: hi3519v101, hi3516av200) — Cortex-A7
   # with V3-era peripheral addresses (UART 0x12100000, WDT 0x12080000)
@@ -183,6 +195,8 @@ CFLAGS = -mcpu=$(CPU_TYPE) -marm -O2 -ffreestanding -nostdlib \
          $(if $(SYSCTRL_BASE),-DSYSCTRL_BASE=$(SYSCTRL_BASE)) \
          $(if $(BOOTROM_BASE),-DBOOTROM_BASE=$(BOOTROM_BASE) -DBOOTROM_SIZE=$(BOOTROM_SIZE)) \
          $(if $(UART_CKSEL_REG),-DUART_CKSEL_REG=$(UART_CKSEL_REG) -DUART_CKSEL_BIT=$(UART_CKSEL_BIT)) \
+         $(if $(FMC_CRG_OFFSET),-DFMC_CRG_OFFSET=$(FMC_CRG_OFFSET)) \
+         $(if $(FMC_CRG_CLK_BIT),-DFMC_CRG_CLK_BIT=$(FMC_CRG_CLK_BIT)) \
          -mno-unaligned-access -Wall -Wextra
 
 LDFLAGS = -nostdlib -T link.ld -Ttext=$(LOAD_ADDR) --defsym=LOAD_ADDR=$(LOAD_ADDR)
