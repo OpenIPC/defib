@@ -26,6 +26,7 @@ AVAILABLE_FIRMWARE: set[str] = {
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
     "hi3516av100", "hi3516av200", "hi3516av300",
     "hi3516cv100", "hi3516cv200", "hi3516cv300", "hi3516cv500",
+    "hi3516cv608", "hi3516cv610",
     "hi3516dv100", "hi3516dv200", "hi3516dv300",
     "hi3516ev100", "hi3516ev200", "hi3516ev300",
     "hi3518av100", "hi3518cv100", "hi3518ev100", "hi3518ev200", "hi3518ev300",

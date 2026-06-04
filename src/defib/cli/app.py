@@ -2381,12 +2381,17 @@ async def _install_async(
     if not use_rack_fastboot:
         transport = await create_transport(normalize_port_name(port))
 
-        # Vectis: share the TCP transport for Ctrl+P delivery (see burn).
+        # Vectis: share the TCP transport for RTS/DTR delivery (see burn).
+        # Vectis only allows one TCP client; if we don't attach the live
+        # transport here, the controller's standalone path opens a SECOND
+        # connection which evicts the recovery session's first one mid-flow
+        # and kills its reader thread with SerialException.
         if power_controller is not None:
             from defib.power.vectis import VectisController
+            from defib.transport.rfc2217 import Rfc2217Transport
             from defib.transport.socket import SocketTransport
             if isinstance(power_controller, VectisController) and isinstance(
-                transport, SocketTransport
+                transport, (Rfc2217Transport, SocketTransport)
             ):
                 power_controller.attach_transport(transport)
 
