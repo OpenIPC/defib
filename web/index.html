@@ -470,7 +470,9 @@ async function cv6xxSendFirmware(firmware) {
 let selectedPort = null;
 let firmwareData = null;
 
-// Chips with pre-built u-boot on OpenIPC
+// Fallback list of chips with pre-built u-boot on OpenIPC, used only when the
+// release metadata can't be fetched (offline, or api.github.com rate limit).
+// The live asset list from parseReleaseAssets() takes precedence.
 const OPENIPC_FIRMWARE = new Set([
   "gk7202v300","gk7205v200","gk7205v300","gk7605v100",
   "hi3516av100","hi3516av200","hi3516av300",
@@ -478,21 +480,32 @@ const OPENIPC_FIRMWARE = new Set([
   "hi3516dv100","hi3516dv200","hi3516dv300",
   "hi3516ev100","hi3516ev200","hi3516ev300",
   "hi3518av100","hi3518cv100","hi3518ev100","hi3518ev200","hi3518ev300",
-  "hi3519v101","t40a","t40n","t40xp",
+  "hi3519v101","hi3520dv200","hi3536cv100","hi3536dv100",
+  "t40a","t40n","t40xp",
 ]);
-const CHIP_FW_ALIAS = {"hi3518ev201":"hi3518ev200","gk7201v200":"gk7205v200","gk7201v300":"gk7205v200"};
 
-function fwNameForChip(chip) {
-  return CHIP_FW_ALIAS[chip] || chip;
+// chip → {name, url, size, sha256}, populated from the release API on load.
+let fwAssets = null;
+
+async function loadFirmwareIndex() {
+  if (fwAssets) return fwAssets;
+  const resp = await fetch(FW_RELEASE_API, { headers: { Accept: 'application/vnd.github+json' } });
+  if (!resp.ok) throw new Error(`release metadata: HTTP ${resp.status}`);
+  fwAssets = parseReleaseAssets(await resp.json());
+  return fwAssets;
 }
 
 function hasFirmware(chip) {
-  return OPENIPC_FIRMWARE.has(fwNameForChip(chip));
+  const name = fwNameForChip(chip);
+  return fwAssets ? fwAssets.has(name) : OPENIPC_FIRMWARE.has(name);
 }
 
-function fwUrl(chip) {
-  const name = fwNameForChip(chip);
-  return `https://github.com/OpenIPC/firmware/releases/download/latest/u-boot-${name}-universal.bin`;
+async function sha256Hex(bytes) {
+  // SubtleCrypto needs a secure context; present wherever WebSerial is, but
+  // absent when index.html is opened over file://.
+  if (!(globalThis.crypto && crypto.subtle)) return null;
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return bytesToHex(new Uint8Array(digest));
 }
 
 async function downloadFirmware() {
@@ -503,20 +516,58 @@ async function downloadFirmware() {
   btn.disabled = true;
   btn.textContent = 'Downloading...';
   status.textContent = '';
+
+  const name = fwNameForChip(chip);
+  let meta = null;
   try {
-    const resp = await fetch(fwUrl(chip));
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const blob = await resp.blob();
-    firmwareData = new Uint8Array(await blob.arrayBuffer());
-    status.textContent = `✓ ${(firmwareData.length / 1024).toFixed(0)} KB`;
-    btn.textContent = 'Re-download';
-    updateStartButton();
+    meta = (await loadFirmwareIndex()).get(name) || null;
   } catch (e) {
-    status.textContent = '';
-    btn.textContent = 'Download failed — retry?';
-    log('Firmware download failed: ' + e.message, 'error');
+    log(`Could not read release metadata (${e.message}) — downloading without checksum verification`, 'warn');
   }
+  const url = meta ? meta.url : `${FW_DIRECT_BASE}/u-boot-${name}-universal.bin`;
+  if (meta && !meta.sha256) {
+    log('Release metadata has no SHA-256 for this asset — falling back to a size check', 'warn');
+  }
+
+  // GitHub blocks direct browser downloads (#113), so proxies are tried in
+  // turn; each candidate's bytes are checked against the digest from
+  // api.github.com before they are accepted.
+  const failures = [];
+  for (const src of fwSourceUrls(url)) {
+    try {
+      btn.textContent = `Downloading via ${src.name}...`;
+      const resp = await fetch(src.url);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      const actualSha = await sha256Hex(bytes);
+      const check = verifyFirmwareBytes(bytes, meta, actualSha);
+      if (!check.ok) throw new Error(check.reason);
+
+      firmwareData = bytes;
+      status.textContent = `✓ ${(bytes.length / 1024).toFixed(0)} KB`;
+      btn.textContent = 'Re-download';
+      btn.disabled = false;
+      if (meta && meta.sha256 && actualSha) {
+        log(`Downloaded ${meta.name} via ${src.name} — SHA-256 verified`, 'info');
+      } else {
+        log(`Downloaded ${bytes.length} bytes via ${src.name} (unverified)`, 'warn');
+      }
+      updateStartButton();
+      return;
+    } catch (e) {
+      failures.push(`${src.name}: ${e.message}`);
+    }
+  }
+
+  status.textContent = '';
+  btn.textContent = 'Download failed — retry?';
   btn.disabled = false;
+  log('U-Boot download failed — every source was rejected:', 'error');
+  for (const f of failures) log(`  ${f}`, 'dim');
+  log('GitHub no longer sends CORS headers for release assets, so the browser', 'info');
+  log('cannot fetch them directly. Download the file manually and select it below:', 'info');
+  log(`  ${url}`, 'info');
+  if (meta && meta.sha256) log(`  expected SHA-256: ${meta.sha256}`, 'dim');
 }
 
 function onChipChanged() {
@@ -558,6 +609,11 @@ function initChipSelector() {
   for (const c of unique) sel.innerHTML += `<option value="${c}">${c}</option>`;
   document.getElementById('chip-count').textContent = `(${unique.length} supported)`;
   sel.onchange = onChipChanged;
+  // Warm the release index so availability reflects what OpenIPC actually
+  // publishes today rather than the hardcoded fallback list. Refresh only if
+  // nothing has been loaded yet — onChipChanged() clears firmwareData, and
+  // this must not discard an image the user already downloaded or picked.
+  loadFirmwareIndex().then(() => { if (!firmwareData) onChipChanged(); }, () => {});
 }
 
 async function selectPort() {

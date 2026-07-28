@@ -138,11 +138,138 @@ function parseCv6xxBoot(data) {
 const V500_SOCS = new Set(["gk7205v500","gk7205v510","gk7205v530","xm7205v500","xm7205v510","xm7205v530"]);
 const CV6XX_SOCS = new Set(["hi3516cv608","hi3516cv610","hi3516cv613","hi3516dv500","hi3519dv500"]);
 
+// ================================================================
+// OpenIPC U-Boot asset resolution
+//
+// GitHub release assets cannot be fetched from a browser: the
+// download URL 302s to release-assets.githubusercontent.com, which
+// sends no Access-Control-Allow-Origin, so the redirect is blocked
+// (issue #113). The bytes therefore have to come through a public
+// CORS proxy, which is untrusted — it can return anything.
+//
+// api.github.com *is* CORS-enabled and publishes a SHA-256 digest
+// for every asset, so we take the hash over the trusted channel and
+// verify the proxied bytes against it. A proxy that substitutes,
+// truncates or rate-limits is caught before anything is flashed.
+// ================================================================
+
+const FW_RELEASE_API =
+  'https://api.github.com/repos/OpenIPC/firmware/releases/tags/latest';
+const FW_DIRECT_BASE =
+  'https://github.com/OpenIPC/firmware/releases/download/latest';
+
+// Asset name → chip, e.g. u-boot-hi3516ev300-universal.bin → hi3516ev300
+const FW_ASSET_RE = /^u-boot-(.+)-universal\.bin$/;
+
+// Chip aliases: chips whose U-Boot binary is published under another name.
+const CHIP_FW_ALIAS = {
+  "hi3518ev201": "hi3518ev200",
+  "gk7201v200": "gk7205v200",
+  "gk7201v300": "gk7205v200",
+  "gk7205v210": "gk7205v200",
+};
+
+function fwNameForChip(chip) {
+  // Drop any ":variant" suffix — U-Boot binaries are per-chip, not per-board.
+  const base = String(chip).split(':', 1)[0];
+  return CHIP_FW_ALIAS[base] || base;
+}
+
+/**
+ * Build chip → {name, url, size, sha256} from a GitHub release API response.
+ * Only u-boot-*-universal.bin assets are considered. `digest` is present on
+ * modern GitHub responses as "sha256:<hex>"; it may be missing on older ones,
+ * in which case sha256 is null and the caller falls back to a size check.
+ */
+function parseReleaseAssets(release) {
+  const out = new Map();
+  for (const asset of (release && release.assets) || []) {
+    const m = FW_ASSET_RE.exec(asset.name || '');
+    if (!m) continue;
+    out.set(m[1], {
+      name: asset.name,
+      url: `${FW_DIRECT_BASE}/${asset.name}`,
+      size: asset.size,
+      sha256: parseDigest(asset.digest),
+    });
+  }
+  return out;
+}
+
+/** "sha256:abc..." → "abc..." (lowercase hex), else null. */
+function parseDigest(digest) {
+  const m = /^sha256:([0-9a-f]{64})$/i.exec(String(digest || ''));
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * Public CORS proxies, tried in order. Every one of these is an unaffiliated
+ * third party, which is only acceptable because the SHA-256 check makes them
+ * untrusted transport rather than a trusted source.
+ *
+ * Measured 2026-07-28 against u-boot-gk7205v300-universal.bin (250 KB):
+ *   corsproxy.io      403 "This domain has been blocked and can't be proxied"
+ *   api.allorigins.win 500/522 on binaries this size
+ *   api.codetabs.com  522, api.cors.lol 429 (rate limited)
+ *   proxy.corsfix.com / test.cors.workers.dev  403 (need registered origin)
+ *   cors.eu.org       200, correct digest, ACAO * — the only one that worked
+ */
+const FW_PROXIES = [
+  { name: 'cors.eu.org', build: (url) => `https://cors.eu.org/${url}` },
+  {
+    name: 'allorigins',
+    build: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  },
+  {
+    name: 'codetabs',
+    build: (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  },
+];
+
+/**
+ * Ordered download attempts for an asset URL. Direct comes first so the tool
+ * stops depending on proxies the moment GitHub restores CORS (and so it works
+ * unchanged for anyone running behind their own proxy or extension).
+ */
+function fwSourceUrls(url) {
+  return [
+    { name: 'github.com (direct)', url },
+    ...FW_PROXIES.map((p) => ({ name: p.name, url: p.build(url) })),
+  ];
+}
+
+/** Uint8Array → lowercase hex string. */
+function bytesToHex(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Check downloaded bytes against release metadata.
+ * Returns {ok: true} or {ok: false, reason: string}.
+ * `actualSha` is null when SubtleCrypto is unavailable (insecure context).
+ */
+function verifyFirmwareBytes(bytes, meta, actualSha) {
+  if (!bytes || bytes.length === 0) return { ok: false, reason: 'empty response' };
+  if (meta && meta.size && bytes.length !== meta.size) {
+    return { ok: false, reason: `size ${bytes.length} != expected ${meta.size}` };
+  }
+  // An HTML error page or JSON rate-limit body that happens to match on size
+  // still cannot match the digest; this catches the no-digest case.
+  if (bytes[0] === 0x3c) return { ok: false, reason: 'response looks like HTML, not a binary' };
+  if (meta && meta.sha256 && actualSha && actualSha !== meta.sha256) {
+    return { ok: false, reason: `SHA-256 ${actualSha.slice(0, 16)}… != expected ${meta.sha256.slice(0, 16)}…` };
+  }
+  return { ok: true };
+}
+
 // Export for Node.js (no-op in browser)
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     CRC_TABLE, calcCrc, appendCrc, appendCrcLE, verifyCrc,
     buildHeadFrame, buildDataFrame, buildTailFrame, chunkData,
     parseCv6xxBoot, V500_SOCS, CV6XX_SOCS,
+    FW_RELEASE_API, FW_DIRECT_BASE, FW_ASSET_RE, FW_PROXIES,
+    CHIP_FW_ALIAS, fwNameForChip, parseReleaseAssets, parseDigest,
+    fwSourceUrls, bytesToHex, verifyFirmwareBytes,
   };
 }
