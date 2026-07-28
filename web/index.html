@@ -96,7 +96,7 @@ footer a { color: var(--accent); text-decoration: none; }
     <label>Chip Model <span class="chip-count" id="chip-count"></span></label>
     <select id="chip-select"><option value="">Loading...</option></select>
 
-    <label>Firmware</label>
+    <label>U-Boot image</label>
     <div id="fw-auto" class="btn-row" style="display:none;margin-top:0">
       <button class="btn btn-secondary" id="fw-download-btn" onclick="downloadFirmware()" style="flex:1">
         Download from OpenIPC
@@ -582,10 +582,10 @@ function onChipChanged() {
     btn.textContent = `Download U-Boot for ${chip}`;
     btn.disabled = false;
     status.textContent = '';
-    hint.textContent = 'Or select a local file below to use your own build.';
+    hint.textContent = 'Or select a local U-Boot image below to use your own build.';
   } else if (chip) {
     autoDiv.style.display = 'none';
-    hint.textContent = 'No OpenIPC build available — select a local firmware file.';
+    hint.textContent = 'No OpenIPC build available — select a local U-Boot image.';
   } else {
     autoDiv.style.display = 'none';
     hint.textContent = '';
