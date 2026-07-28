@@ -11,6 +11,8 @@ const {
   CRC_TABLE, calcCrc, appendCrc, appendCrcLE, verifyCrc,
   buildHeadFrame, buildDataFrame, buildTailFrame, chunkData,
   parseCv6xxBoot, V500_SOCS, CV6XX_SOCS,
+  FW_DIRECT_BASE, FW_PROXIES, fwNameForChip, parseReleaseAssets,
+  parseDigest, fwSourceUrls, bytesToHex, verifyFirmwareBytes,
 } = require('./protocol.js');
 
 // Helper: hex string → Uint8Array
@@ -374,5 +376,136 @@ describe('SoC Lists', () => {
 
   it('V500 and CV6xx are disjoint', () => {
     for (const soc of V500_SOCS) assert.ok(!CV6XX_SOCS.has(soc));
+  });
+});
+
+// ================================================================
+// U-Boot asset resolution (issue #113)
+// ================================================================
+
+// Trimmed shape of api.github.com .../releases/tags/latest, with the real
+// digest and size of u-boot-gk7205v300-universal.bin.
+const RELEASE_FIXTURE = {
+  tag_name: 'latest',
+  assets: [
+    {
+      name: 'u-boot-gk7205v300-universal.bin',
+      size: 256459,
+      digest: 'sha256:0160bbcb7b8e40a13abbc96d34bc26575534e0ea0d6cc4a5b947ce0bd55ce3dc',
+    },
+    { name: 'u-boot-hi3520dv200-universal.bin', size: 262144, digest: null },
+    // Non-U-Boot assets and the CV6xx boot images must be ignored.
+    { name: 'openipc.hi3516ev300-nor-ultimate.tgz', size: 10315993, digest: 'sha256:' + 'a'.repeat(64) },
+    { name: 'boot-hi3516cv608-nor.bin', size: 241664, digest: 'sha256:' + 'b'.repeat(64) },
+  ],
+};
+
+describe('parseReleaseAssets', () => {
+  it('keeps only u-boot-*-universal.bin assets', () => {
+    const m = parseReleaseAssets(RELEASE_FIXTURE);
+    assert.deepEqual([...m.keys()].sort(), ['gk7205v300', 'hi3520dv200']);
+  });
+
+  it('extracts size and sha256 digest', () => {
+    const a = parseReleaseAssets(RELEASE_FIXTURE).get('gk7205v300');
+    assert.equal(a.size, 256459);
+    assert.equal(a.sha256, '0160bbcb7b8e40a13abbc96d34bc26575534e0ea0d6cc4a5b947ce0bd55ce3dc');
+    assert.equal(a.url, `${FW_DIRECT_BASE}/u-boot-gk7205v300-universal.bin`);
+  });
+
+  it('tolerates a missing digest', () => {
+    assert.equal(parseReleaseAssets(RELEASE_FIXTURE).get('hi3520dv200').sha256, null);
+  });
+
+  it('returns an empty map for a malformed response', () => {
+    assert.equal(parseReleaseAssets(null).size, 0);
+    assert.equal(parseReleaseAssets({}).size, 0);
+  });
+});
+
+describe('parseDigest', () => {
+  it('accepts sha256:<64 hex>', () => {
+    assert.equal(parseDigest('sha256:' + 'A'.repeat(64)), 'a'.repeat(64));
+  });
+
+  it('rejects other algorithms, wrong lengths and junk', () => {
+    assert.equal(parseDigest('md5:' + 'a'.repeat(32)), null);
+    assert.equal(parseDigest('sha256:abc'), null);
+    assert.equal(parseDigest(undefined), null);
+  });
+});
+
+describe('fwNameForChip', () => {
+  it('maps aliases to the published binary name', () => {
+    assert.equal(fwNameForChip('hi3518ev201'), 'hi3518ev200');
+    assert.equal(fwNameForChip('gk7201v300'), 'gk7205v200');
+  });
+
+  it('passes unknown chips through unchanged', () => {
+    assert.equal(fwNameForChip('hi3516ev300'), 'hi3516ev300');
+  });
+
+  it('strips a :variant suffix', () => {
+    assert.equal(fwNameForChip('hi3516ev300:neo'), 'hi3516ev300');
+  });
+});
+
+describe('fwSourceUrls', () => {
+  const url = `${FW_DIRECT_BASE}/u-boot-gk7205v300-universal.bin`;
+
+  it('tries the direct GitHub URL first', () => {
+    assert.equal(fwSourceUrls(url)[0].url, url);
+  });
+
+  it('falls back to every configured proxy', () => {
+    assert.equal(fwSourceUrls(url).length, 1 + FW_PROXIES.length);
+  });
+
+  it('percent-encodes the target for query-style proxies', () => {
+    const allorigins = fwSourceUrls(url).find((s) => s.name === 'allorigins');
+    assert.ok(allorigins.url.includes(encodeURIComponent(url)));
+    assert.ok(!allorigins.url.includes('?url=https://'));
+  });
+});
+
+describe('verifyFirmwareBytes', () => {
+  const meta = { size: 4, sha256: 'c'.repeat(64) };
+  const good = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+
+  it('accepts bytes matching size and digest', () => {
+    assert.deepEqual(verifyFirmwareBytes(good, meta, 'c'.repeat(64)), { ok: true });
+  });
+
+  it('rejects a digest mismatch — a proxy substituting bytes', () => {
+    const r = verifyFirmwareBytes(good, meta, 'd'.repeat(64));
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /SHA-256/);
+  });
+
+  it('rejects a truncated download', () => {
+    const r = verifyFirmwareBytes(good.slice(0, 2), meta, 'c'.repeat(64));
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /size/);
+  });
+
+  it('rejects an empty response', () => {
+    assert.equal(verifyFirmwareBytes(new Uint8Array(0), meta, null).ok, false);
+  });
+
+  it('rejects an HTML error page even with no digest to check', () => {
+    const html = new Uint8Array([0x3c, 0x68, 0x74, 0x6d]); // "<htm"
+    const r = verifyFirmwareBytes(html, { size: 4, sha256: null }, null);
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /HTML/);
+  });
+
+  it('falls back to a size check when SubtleCrypto is unavailable', () => {
+    assert.deepEqual(verifyFirmwareBytes(good, meta, null), { ok: true });
+  });
+});
+
+describe('bytesToHex', () => {
+  it('zero-pads each byte to two digits', () => {
+    assert.equal(bytesToHex(new Uint8Array([0x00, 0x0f, 0xff])), '000fff');
   });
 });
