@@ -1,7 +1,11 @@
 """Firmware auto-download from OpenIPC releases.
 
 Downloads pre-built U-Boot binaries from the OpenIPC firmware repository.
-URL pattern: https://github.com/OpenIPC/firmware/releases/download/latest/u-boot-{chip}-universal.bin
+Two asset families are published, and which one applies depends on the SoC:
+
+- Classic SoCs: ``u-boot-{chip}-universal.bin`` — a bare U-Boot image.
+- CV6xx SoCs: ``boot-{chip}[-{variant}]-nor.bin`` — a composite image
+  (GSL + DDR tables + U-Boot) that the bootrom expects as a single blob.
 
 Caches downloads in a platform-appropriate directory to avoid re-downloading.
 """
@@ -21,17 +25,35 @@ OPENIPC_BASE_URL = (
     "https://github.com/OpenIPC/firmware/releases/download/latest"
 )
 
-# Chips that have pre-built u-boot binaries on OpenIPC
+# Chips that have pre-built u-boot-{chip}-universal.bin binaries on OpenIPC.
+# CV6xx chips are deliberately absent — see CV6XX_BOOT_VARIANTS below.
 AVAILABLE_FIRMWARE: set[str] = {
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
     "hi3516av100", "hi3516av200", "hi3516av300",
     "hi3516cv100", "hi3516cv200", "hi3516cv300", "hi3516cv500",
-    "hi3516cv608", "hi3516cv610",
     "hi3516dv100", "hi3516dv200", "hi3516dv300",
     "hi3516ev100", "hi3516ev200", "hi3516ev300",
     "hi3518av100", "hi3518cv100", "hi3518ev100", "hi3518ev200", "hi3518ev300",
-    "hi3519v101",
+    "hi3519v101", "hi3520dv200", "hi3536cv100", "hi3536dv100",
     "t40a", "t40n", "t40xp",
+}
+
+# CV6xx SoCs publish a composite boot image, not a bare U-Boot, and no
+# u-boot-{chip}-universal.bin exists for any of them — the URL assumed by
+# #112 always 404'd, so auto-download could never work and users had to
+# hand-seed the cache. The real assets are boot-{chip}[-{variant}]-nor.bin.
+#
+# Variants are board-specific: across the five hi3516cv610 images the GSL is
+# identical but each carries a different U-Boot, and the DDR table differs by
+# the numeric prefix (00g/00s share one, 10b another, 20g/20s a third). Nothing
+# in the recovery handshake identifies the board, so a variant cannot be
+# guessed — a chip with more than one published image must be requested
+# explicitly as "chip:variant" (e.g. hi3516cv610:00g).
+CV6XX_BOOT_VARIANTS: dict[str, tuple[str, ...]] = {
+    "hi3516cv608": (),  # single image, no variant suffix
+    "hi3516cv610": ("00g", "00s", "10b", "20g", "20s"),
+    "hi3519dv500": ("dmeb", "dmebpro"),
+    # hi3516cv613 and hi3516dv500 have no published boot image yet.
 }
 
 # Chip aliases: map chip names to the firmware download name
@@ -59,33 +81,75 @@ def get_cache_dir() -> Path:
     return cache_dir
 
 
+def _split_variant(chip: str) -> tuple[str, str | None]:
+    """Split ``chip[:variant]`` into its parts."""
+    base, _, variant = chip.partition(":")
+    return base, variant or None
+
+
 def _strip_variant(chip: str) -> str:
-    """Drop the optional ``:variant`` suffix — U-Boot binaries are per-chip,
-    not per-board, so any variant suffix is irrelevant for firmware lookup."""
-    return chip.split(":", 1)[0]
+    """Drop the optional ``:variant`` suffix. For classic SoCs the U-Boot
+    binary is per-chip, not per-board, so the suffix is irrelevant; CV6xx is
+    the exception and is resolved by :func:`asset_name` before this is used."""
+    return _split_variant(chip)[0]
+
+
+def asset_name(chip: str) -> str | None:
+    """Published release filename for a chip, or None if there isn't one.
+
+    Returns None both for chips OpenIPC doesn't build and for a CV6xx chip
+    named without the variant needed to pick between several board images.
+    """
+    base, variant = _split_variant(chip)
+    name = CHIP_TO_FIRMWARE.get(base, base)
+
+    if name in CV6XX_BOOT_VARIANTS:
+        variants = CV6XX_BOOT_VARIANTS[name]
+        if not variants:
+            # Only one image published; any variant suffix is not meaningful.
+            return f"boot-{name}-nor.bin"
+        if variant in variants:
+            return f"boot-{name}-{variant}-nor.bin"
+        return None
+
+    if name in AVAILABLE_FIRMWARE:
+        return f"u-boot-{name}-universal.bin"
+    return None
 
 
 def firmware_url(chip: str) -> str | None:
     """Get the OpenIPC download URL for a chip, or None if unavailable."""
-    chip = _strip_variant(chip)
-    name = CHIP_TO_FIRMWARE.get(chip, chip)
-    if name in AVAILABLE_FIRMWARE:
-        return f"{OPENIPC_BASE_URL}/u-boot-{name}-universal.bin"
-    return None
+    name = asset_name(chip)
+    return f"{OPENIPC_BASE_URL}/{name}" if name else None
 
 
 def has_firmware(chip: str) -> bool:
-    """Check if OpenIPC has a pre-built firmware for this chip."""
-    return firmware_url(chip) is not None
+    """Check if firmware can be obtained for this chip.
+
+    True when OpenIPC publishes an image *or* one is already cached — the
+    latter keeps hand-seeded blobs working for chips with no published build.
+    """
+    return firmware_url(chip) is not None or get_cached_path(chip) is not None
+
+
+def _legacy_cache_name(chip: str) -> str:
+    """Historic cache filename, which assumed every chip used the universal
+    naming. CV6xx users were told to seed the cache under this name by #112,
+    so keep reading it rather than silently re-downloading over it."""
+    base = _strip_variant(chip)
+    return f"u-boot-{CHIP_TO_FIRMWARE.get(base, base)}-universal.bin"
 
 
 def get_cached_path(chip: str) -> Path | None:
     """Get the path to cached firmware, or None if not cached."""
-    chip = _strip_variant(chip)
-    name = CHIP_TO_FIRMWARE.get(chip, chip)
-    path = get_cache_dir() / f"u-boot-{name}-universal.bin"
-    if path.exists() and path.stat().st_size > 0:
-        return path
+    cache_dir = get_cache_dir()
+    candidates = [asset_name(chip), _legacy_cache_name(chip)]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = cache_dir / candidate
+        if path.exists() and path.stat().st_size > 0:
+            return path
     return None
 
 
@@ -102,6 +166,26 @@ def pad_to_size(data: bytes, target_size: int, fill: int = 0xFF) -> bytes:
             f"Data is {len(data)} bytes, larger than target {target_size}"
         )
     return data.ljust(target_size, bytes([fill]))
+
+
+def _unavailable_message(chip: str) -> str:
+    """Explain why a chip can't be resolved, naming the variants when the
+    chip is a CV6xx whose board image is ambiguous."""
+    base, _ = _split_variant(chip)
+    name = CHIP_TO_FIRMWARE.get(base, base)
+    variants = CV6XX_BOOT_VARIANTS.get(name)
+    if variants:
+        return (
+            f"'{chip}' needs an explicit board variant — OpenIPC publishes "
+            f"{len(variants)} different boot images for {name} and they carry "
+            f"different DDR settings, so the right one cannot be guessed. "
+            f"Use one of: " + ", ".join(f"{name}:{v}" for v in variants)
+            + ". Or use -f/--file to specify a local firmware file."
+        )
+    return (
+        f"No pre-built firmware available for '{chip}'. "
+        f"Use -f/--file to specify a local firmware file."
+    )
 
 
 def download_firmware(
@@ -123,10 +207,13 @@ def download_firmware(
     """
     url = firmware_url(chip)
     if url is None:
-        raise ValueError(
-            f"No pre-built firmware available for '{chip}'. "
-            f"Use -f/--file to specify a local firmware file."
-        )
+        # Check the cache before giving up: a chip with no published build may
+        # still have a hand-seeded blob.
+        cached = get_cached_path(chip)
+        if cached is not None:
+            logger.info("Using cached firmware: %s", cached)
+            return cached
+        raise ValueError(_unavailable_message(chip))
 
     # Check cache
     cached = get_cached_path(chip)
@@ -135,9 +222,9 @@ def download_firmware(
         return cached
 
     # Download
-    chip = _strip_variant(chip)
-    name = CHIP_TO_FIRMWARE.get(chip, chip)
-    dest = get_cache_dir() / f"u-boot-{name}-universal.bin"
+    name = asset_name(chip)
+    assert name is not None  # firmware_url() is None otherwise
+    dest = get_cache_dir() / name
     logger.info("Downloading firmware from %s", url)
 
     try:
