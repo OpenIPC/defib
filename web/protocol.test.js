@@ -13,6 +13,8 @@ const {
   parseCv6xxBoot, V500_SOCS, CV6XX_SOCS,
   FW_DIRECT_BASE, FW_PROXIES, fwNameForChip, parseReleaseAssets,
   parseDigest, fwSourceUrls, bytesToHex, verifyFirmwareBytes,
+  PROXY_WINDOW_SECONDS, proxySignatureMessage, hmacSha256Hex,
+  buildOpenIpcProxyUrl,
 } = require('./protocol.js');
 
 // Helper: hex string → Uint8Array
@@ -507,5 +509,88 @@ describe('verifyFirmwareBytes', () => {
 describe('bytesToHex', () => {
   it('zero-pads each byte to two digits', () => {
     assert.equal(bytesToHex(new Uint8Array([0x00, 0x0f, 0xff])), '000fff');
+  });
+});
+
+// ================================================================
+// OpenIPC cors-proxy worker integration
+// ================================================================
+
+const PROXY_BASE = 'https://cors-proxy.joseph-nef.workers.dev';
+const TARGET = `${FW_DIRECT_BASE}/u-boot-gk7205v300-universal.bin`;
+
+describe('proxySignatureMessage', () => {
+  it('is `floor(t/300):url`, matching the worker', () => {
+    assert.equal(proxySignatureMessage(TARGET, 1_785_242_320), `5950807:${TARGET}`);
+  });
+
+  it('is stable across a 5-minute window and changes at the boundary', () => {
+    const base = 5_950_800 * PROXY_WINDOW_SECONDS;
+    assert.equal(proxySignatureMessage(TARGET, base), proxySignatureMessage(TARGET, base + 299));
+    assert.notEqual(proxySignatureMessage(TARGET, base), proxySignatureMessage(TARGET, base + 300));
+  });
+
+  it('covers the target url, so a swapped target changes the message', () => {
+    assert.notEqual(
+      proxySignatureMessage(TARGET, 1_785_242_320),
+      proxySignatureMessage('https://evil.example/x.bin', 1_785_242_320),
+    );
+  });
+});
+
+describe('hmacSha256Hex', () => {
+  it('matches a known HMAC-SHA256 vector over the key string bytes', async () => {
+    // The worker signs with TextEncoder over the key characters, not decoded
+    // hex — node's createHmac with a utf8 key is the same thing.
+    const { createHmac } = require('node:crypto');
+    const key = 'a'.repeat(64);
+    const msg = `5950807:${TARGET}`;
+    const expected = createHmac('sha256', key).update(msg).digest('hex');
+    assert.equal(await hmacSha256Hex(key, msg), expected);
+  });
+
+  it('returns 64 hex chars', async () => {
+    assert.match(await hmacSha256Hex('k', 'm'), /^[0-9a-f]{64}$/);
+  });
+});
+
+describe('buildOpenIpcProxyUrl', () => {
+  it('percent-encodes the target and attaches t and sig', () => {
+    const u = new URL(buildOpenIpcProxyUrl(PROXY_BASE, TARGET, 1234, 'deadbeef'));
+    assert.equal(u.pathname, '/proxy');
+    assert.equal(u.searchParams.get('url'), TARGET);
+    assert.equal(u.searchParams.get('t'), '1234');
+    assert.equal(u.searchParams.get('sig'), 'deadbeef');
+  });
+
+  it('omits t and sig when unsigned (localhost is HMAC-exempt)', () => {
+    const u = new URL(buildOpenIpcProxyUrl(PROXY_BASE, TARGET, null, null));
+    assert.equal(u.searchParams.get('url'), TARGET);
+    assert.equal(u.searchParams.get('t'), null);
+    assert.equal(u.searchParams.get('sig'), null);
+  });
+
+  it('does not double up slashes on a trailing-slash base', () => {
+    assert.ok(buildOpenIpcProxyUrl(PROXY_BASE + '/', TARGET, null, null).includes('.dev/proxy?'));
+  });
+});
+
+describe('fwSourceUrls with the OpenIPC worker', () => {
+  it('puts the worker second, after the direct attempt', () => {
+    const sources = fwSourceUrls(TARGET, `${PROXY_BASE}/proxy?url=x`);
+    assert.equal(sources[0].name, 'github.com (direct)');
+    assert.equal(sources[1].name, 'OpenIPC cors-proxy');
+  });
+
+  it('keeps the public proxies as a last resort behind it', () => {
+    const sources = fwSourceUrls(TARGET, `${PROXY_BASE}/proxy?url=x`);
+    assert.equal(sources.length, 2 + FW_PROXIES.length);
+    assert.deepEqual(sources.slice(2).map((s) => s.name), FW_PROXIES.map((p) => p.name));
+  });
+
+  it('is omitted entirely when the proxy is not configured', () => {
+    const sources = fwSourceUrls(TARGET, null);
+    assert.ok(!sources.some((s) => s.name === 'OpenIPC cors-proxy'));
+    assert.equal(sources.length, 1 + FW_PROXIES.length);
   });
 });

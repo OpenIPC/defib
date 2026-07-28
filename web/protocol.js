@@ -202,6 +202,43 @@ function parseDigest(digest) {
   return m ? m[1].toLowerCase() : null;
 }
 
+// OpenIPC's own Cloudflare Worker (github.com/OpenIPC/cors-proxy), shared with
+// rnd-player. It fetches upstream without Origin/Referer, so GitHub's asset
+// host serves it as a plain server-to-server request, and it follows the 302
+// to release-assets.githubusercontent.com transparently.
+//
+// Two layers gate it: the request Origin must be in the worker's allowlist
+// (https://openipc.github.io already is — rnd-player shares the origin), and
+// non-localhost origins must present an HMAC-SHA256 signature. Localhost is
+// exempt, so local development needs no key.
+const PROXY_WINDOW_SECONDS = 300;
+
+/** Signed message for the worker: `floor(t/300):url`, matching auth.ts. */
+function proxySignatureMessage(targetUrl, tSeconds) {
+  return `${Math.floor(tSeconds / PROXY_WINDOW_SECONDS)}:${targetUrl}`;
+}
+
+/**
+ * HMAC-SHA256 as hex. The worker signs with the raw bytes of the key *string*
+ * (TextEncoder over the hex characters), not the decoded hex — mirror that
+ * exactly or every signature is rejected.
+ */
+async function hmacSha256Hex(secret, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(message));
+  return bytesToHex(new Uint8Array(sig));
+}
+
+/** Build the worker URL; omit t/sig to send unsigned (localhost only). */
+function buildOpenIpcProxyUrl(base, targetUrl, tSeconds, signature) {
+  const params = [`url=${encodeURIComponent(targetUrl)}`];
+  if (tSeconds != null && signature) params.push(`t=${tSeconds}`, `sig=${signature}`);
+  return `${String(base).replace(/\/+$/, '')}/proxy?${params.join('&')}`;
+}
+
 /**
  * Public CORS proxies, tried in order. Every one of these is an unaffiliated
  * third party, which is only acceptable because the SHA-256 check makes them
@@ -229,11 +266,14 @@ const FW_PROXIES = [
 /**
  * Ordered download attempts for an asset URL. Direct comes first so the tool
  * stops depending on proxies the moment GitHub restores CORS (and so it works
- * unchanged for anyone running behind their own proxy or extension).
+ * unchanged for anyone running behind their own proxy or extension). The
+ * OpenIPC worker is the intended workhorse; the public proxies remain only as
+ * a last resort, since they rate-limit aggressively.
  */
-function fwSourceUrls(url) {
+function fwSourceUrls(url, openIpcProxyUrl) {
   return [
     { name: 'github.com (direct)', url },
+    ...(openIpcProxyUrl ? [{ name: 'OpenIPC cors-proxy', url: openIpcProxyUrl }] : []),
     ...FW_PROXIES.map((p) => ({ name: p.name, url: p.build(url) })),
   ];
 }
@@ -271,5 +311,7 @@ if (typeof module !== 'undefined' && module.exports) {
     FW_RELEASE_API, FW_DIRECT_BASE, FW_ASSET_RE, FW_PROXIES,
     CHIP_FW_ALIAS, fwNameForChip, parseReleaseAssets, parseDigest,
     fwSourceUrls, bytesToHex, verifyFirmwareBytes,
+    PROXY_WINDOW_SECONDS, proxySignatureMessage, hmacSha256Hex,
+    buildOpenIpcProxyUrl,
   };
 }
