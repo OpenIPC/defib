@@ -169,6 +169,7 @@ footer a { color: var(--accent); text-decoration: none; }
   </footer>
 </div>
 
+<script src="config.js"></script>
 <script src="protocol.js"></script>
 <script>
 // ============================================================
@@ -508,6 +509,28 @@ async function sha256Hex(bytes) {
   return bytesToHex(new Uint8Array(digest));
 }
 
+/**
+ * Signed URL for OpenIPC's cors-proxy worker, or null if it isn't configured.
+ * Without a key the request goes unsigned, which the worker accepts only from
+ * localhost — deployed builds get the key injected by the Pages workflow.
+ */
+async function openIpcProxyUrl(targetUrl) {
+  const base = typeof CORS_PROXY_URL === 'string' ? CORS_PROXY_URL : '';
+  if (!base) return null;
+  const key = typeof CORS_PROXY_HMAC_KEY === 'string' ? CORS_PROXY_HMAC_KEY : '';
+  if (!key || !(globalThis.crypto && crypto.subtle)) {
+    return buildOpenIpcProxyUrl(base, targetUrl, null, null);
+  }
+  const t = Math.floor(Date.now() / 1000);
+  try {
+    const sig = await hmacSha256Hex(key, proxySignatureMessage(targetUrl, t));
+    return buildOpenIpcProxyUrl(base, targetUrl, t, sig);
+  } catch (e) {
+    log('Could not sign cors-proxy request: ' + e.message, 'warn');
+    return buildOpenIpcProxyUrl(base, targetUrl, null, null);
+  }
+}
+
 async function downloadFirmware() {
   const chip = document.getElementById('chip-select').value;
   if (!chip || !hasFirmware(chip)) return;
@@ -533,7 +556,7 @@ async function downloadFirmware() {
   // turn; each candidate's bytes are checked against the digest from
   // api.github.com before they are accepted.
   const failures = [];
-  for (const src of fwSourceUrls(url)) {
+  for (const src of fwSourceUrls(url, await openIpcProxyUrl(url))) {
     try {
       btn.textContent = `Downloading via ${src.name}...`;
       const resp = await fetch(src.url);
