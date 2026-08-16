@@ -624,7 +624,12 @@ function onChipChanged() {
       `rel="noopener">Tracking issue</a>.`;
     autoDiv.style.display = 'none';
     hint.textContent = '';
-    firmwareData = null;
+    // Deliberately leave firmwareData alone. Start is already blocked by
+    // needsFrameBlast() below, and clearing it here would strand a locally
+    // selected file: the file input keeps its selection, so the normal path
+    // won't reload it (it only clears when no file is selected) and the
+    // change handler won't re-fire — leaving Start disabled on the way back
+    // to a supported chip.
     updateStartButton();
     return;
   }

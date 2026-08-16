@@ -51,7 +51,9 @@ function resolveProfile(chip, depth = 0) {
 /** Pull the inline `const PROFILES = {...};` blob out of web/index.html. */
 function readWebProfiles() {
   const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
-  const m = html.match(/const PROFILES = (\{[\s\S]*?\});\n/);
+  // Tolerate CRLF and trailing whitespace — a checkout with core.autocrlf=true
+  // would otherwise fail this on a formatting detail rather than a real drift.
+  const m = html.match(/const PROFILES = (\{[\s\S]*?\});[ \t]*\r?$/m);
   assert.ok(m, 'could not locate the PROFILES blob in web/index.html');
   return JSON.parse(m[1]);
 }
