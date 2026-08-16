@@ -71,6 +71,12 @@ select option { background: var(--surface2); }
 .status-msg { padding: 12px 16px; border-radius: var(--radius); margin-top: 12px; font-weight: 600; text-align: center; }
 .status-msg.success { background: rgba(158,206,106,0.15); color: var(--green); }
 .status-msg.failure { background: rgba(247,118,142,0.15); color: var(--red); }
+.notice-warn { margin-top: 10px; padding: 12px 14px; border-radius: var(--radius);
+  background: rgba(224,175,104,0.12); border: 1px solid rgba(224,175,104,0.35);
+  font-size: 0.88em; line-height: 1.5; }
+.notice-warn pre { margin: 8px 0; padding: 8px 10px; border-radius: 6px;
+  background: rgba(0,0,0,0.28); overflow-x: auto; font-size: 0.95em; }
+.notice-warn code { background: rgba(0,0,0,0.28); padding: 1px 4px; border-radius: 3px; }
 .unsupported {
   background: var(--red); color: #fff; padding: 16px; border-radius: var(--radius);
   text-align: center; margin-bottom: 16px;
@@ -95,6 +101,7 @@ footer a { color: var(--accent); text-decoration: none; }
     <h2>Recovery Setup</h2>
     <label>Chip Model <span class="chip-count" id="chip-count"></span></label>
     <select id="chip-select"><option value="">Loading...</option></select>
+    <div id="chip-unsupported" class="notice-warn" style="display:none"></div>
 
     <label>U-Boot image</label>
     <div id="fw-auto" class="btn-row" style="display:none;margin-top:0">
@@ -599,6 +606,29 @@ function onChipChanged() {
   const hint = document.getElementById('fw-hint');
   const btn = document.getElementById('fw-download-btn');
   const status = document.getElementById('fw-status');
+  const unsupported = document.getElementById('chip-unsupported');
+
+  // Frame-blast parts can't be driven from the browser at all — say so up
+  // front instead of letting the user download an image and then watch the
+  // handshake fail for reasons the UI can't explain.
+  if (chip && needsFrameBlast(chip)) {
+    unsupported.style.display = '';
+    unsupported.innerHTML =
+      `<strong>${chip} needs the command-line tool.</strong> Its bootrom uses a ` +
+      `frame-blast handshake (an active <code>0xAA</code>+HEAD blast plus a ` +
+      `PRESTEP0 block) that this browser build does not implement, so the ` +
+      `upload cannot complete here. Install defib and run:` +
+      `<pre>uv tool install defib\ndefib burn -c ${chip} -p /dev/ttyUSB0 -t</pre>` +
+      `Start it before you power-cycle the camera. ` +
+      `<a href="https://github.com/OpenIPC/defib/issues/121" target="_blank" ` +
+      `rel="noopener">Tracking issue</a>.`;
+    autoDiv.style.display = 'none';
+    hint.textContent = '';
+    firmwareData = null;
+    updateStartButton();
+    return;
+  }
+  unsupported.style.display = 'none';
 
   if (chip && hasFirmware(chip)) {
     autoDiv.style.display = '';
@@ -629,8 +659,13 @@ function initChipSelector() {
   ];
   const unique = [...new Set(allChips)].sort();
   sel.innerHTML = '<option value="">— Select chip model —</option>';
-  for (const c of unique) sel.innerHTML += `<option value="${c}">${c}</option>`;
-  document.getElementById('chip-count').textContent = `(${unique.length} supported)`;
+  for (const c of unique) {
+    const suffix = needsFrameBlast(c) ? ' — CLI only' : '';
+    sel.innerHTML += `<option value="${c}">${c}${suffix}</option>`;
+  }
+  const usable = unique.filter(c => !needsFrameBlast(c)).length;
+  document.getElementById('chip-count').textContent =
+    `(${usable} of ${unique.length} supported in browser)`;
   sel.onchange = onChipChanged;
   // Warm the release index so availability reflects what OpenIPC actually
   // publishes today rather than the hardcoded fallback list. Refresh only if
@@ -658,7 +693,8 @@ document.getElementById('file-input').addEventListener('change', async (e) => {
 
 function updateStartButton() {
   const chip = document.getElementById('chip-select').value;
-  document.getElementById('start-btn').disabled = !(chip && firmwareData && selectedPort);
+  document.getElementById('start-btn').disabled =
+    !(chip && firmwareData && selectedPort) || needsFrameBlast(chip);
 }
 
 function setStage(name) {

@@ -138,6 +138,38 @@ function parseCv6xxBoot(data) {
 const V500_SOCS = new Set(["gk7205v500","gk7205v510","gk7205v530","xm7205v500","xm7205v510","xm7205v530"]);
 const CV6XX_SOCS = new Set(["hi3516cv608","hi3516cv610","hi3516cv613","hi3516dv500","hi3519dv500"]);
 
+// Standard-protocol SoCs whose bootrom needs the frame-blast handshake: an
+// active 0xAA+HEAD blast instead of passively waiting for the 0x20 markers,
+// followed by a PRESTEP0 block sent ahead of DDRSTEP0.  The CLI drives this
+// from HiSiliconStandard._send_frame_for_start(); this build implements
+// neither, so standardHandshake()/standardSendFirmware() cannot bring these
+// parts up.  Refuse them in the UI rather than fail silently at the wire.
+//
+// Derived from the chips whose *resolved* profile under
+// src/defib/profiles/data carries a PRESTEP0 — resolution matters, since
+// e.g. hi3516ev300.json is a one-line alias pointing at hi3516ev200.json.
+// profile-parity.test.js recomputes this and fails if it drifts.
+const FRAME_BLAST_SOCS = new Set([
+  "hi3110ev500", "hi3110ev500-ca", "hi3231v520", "hi3231v530", "hi3251v500",
+  "hi3251v510", "hi3516a", "hi3516av200", "hi3516cv300", "hi3516cv500",
+  "hi3516ev200", "hi3516ev300", "hi3518ev200", "hi3519", "hi3519v101",
+  "hi3520dv400", "hi3521a", "hi3521dv100", "hi3531a", "hi3531dv100",
+  "hi3536", "hi3536c", "hi3536dv100", "hi3556av100", "hi3559av100",
+  "hi3559av100es", "hi3559v100", "hi3559v200", "hi3712v100", "hi3716dv100",
+  "hi3716dv100-ca", "hi3716dv110", "hi3716dv110h", "hi3716mv310", "hi3716mv310-ca",
+  "hi3716mv320", "hi3716mv330", "hi3716mv330-ca", "hi3716mv410", "hi3716mv410-ca",
+  "hi3716mv410-ca-n", "hi3716mv420-ca-n", "hi3716mv430", "hi3731v100", "hi3731v101",
+  "hi3731v201", "hi3731v202", "hi3751v310", "hi3751v320", "hi3751v500-ca",
+  "hi3751v510", "hi3751v530", "hi3751v551", "hi3751v553", "hi3751v600",
+  "hi3751v600-ca", "hi3751v620", "hi3751v810", "hi3751v811", "hi3796mv200",
+  "hi3798cv200", "hi3798mv100", "hi3798mv100-ca", "hi3798mv200", "hi3798mv300",
+  "hi3798mv310",
+]);
+
+function needsFrameBlast(chip) {
+  return FRAME_BLAST_SOCS.has(chip);
+}
+
 // ================================================================
 // OpenIPC U-Boot asset resolution
 //
@@ -308,6 +340,7 @@ if (typeof module !== 'undefined' && module.exports) {
     CRC_TABLE, calcCrc, appendCrc, appendCrcLE, verifyCrc,
     buildHeadFrame, buildDataFrame, buildTailFrame, chunkData,
     parseCv6xxBoot, V500_SOCS, CV6XX_SOCS,
+    FRAME_BLAST_SOCS, needsFrameBlast,
     FW_RELEASE_API, FW_DIRECT_BASE, FW_ASSET_RE, FW_PROXIES,
     CHIP_FW_ALIAS, fwNameForChip, parseReleaseAssets, parseDigest,
     fwSourceUrls, bytesToHex, verifyFirmwareBytes,
