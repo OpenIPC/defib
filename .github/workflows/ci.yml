@@ -87,4 +87,4 @@ jobs:
           node-version: "22"
 
       - name: Run JS tests
-        run: node --test web/protocol.test.js
+        run: node --test web/protocol.test.js web/profile-parity.test.js
