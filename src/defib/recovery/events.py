@@ -19,6 +19,10 @@ class Stage(str, Enum):
     AUX_AREA = "aux_area"
     BOOT_IMAGE = "boot_image"
     BOARD_ID = "board_id"
+    # Rockchip USB recovery: the usbplug upload that follows DDR_INIT, and the
+    # block writes it enables.
+    USBPLUG = "usbplug"
+    FLASH_WRITE = "flash_write"
     COMPLETE = "complete"
 
 
