@@ -154,6 +154,44 @@ class TestFoundDevice:
         assert "1-4.2" in str(self._dev())
 
 
+class TestForeignSocImages:
+    """The SoC suffix is the only thing distinguishing an image built for this
+    board from one that would leave it unbootable."""
+
+    def test_foreign_suffix_refused(self, tmp_path):
+        files = {
+            "zboot.img.hi3516ev300": b"\xaa" * 2048,
+            "rootfs.squashfs.hi3516ev300": b"\xbb" * 4096,
+        }
+        with pytest.raises(typer.BadParameter, match="built for 'hi3516ev300'"):
+            _read_usb_payloads(_make_tarball(tmp_path, files), PARTS, "rv1106")
+
+    def test_error_names_the_expected_chip(self, tmp_path):
+        files = {"zboot.img.hi3516ev300": b"\xaa" * 16}
+        with pytest.raises(typer.BadParameter, match="not 'rv1106'"):
+            _read_usb_payloads(_make_tarball(tmp_path, files), PARTS, "rv1106")
+
+    def test_matching_suffix_accepted(self, tmp_path):
+        payloads = _read_usb_payloads(
+            _make_tarball(tmp_path, _complete()), PARTS, "rv1106"
+        )
+        assert len(payloads) == 2
+
+    def test_suffix_match_is_case_insensitive(self, tmp_path):
+        payloads = _read_usb_payloads(
+            _make_tarball(tmp_path, _complete()), PARTS, "RV1106"
+        )
+        assert len(payloads) == 2
+
+    def test_no_chip_given_skips_the_check(self, tmp_path):
+        """Callers that genuinely do not know the SoC keep the old behaviour."""
+        files = {
+            "zboot.img.whatever": b"\xaa" * 16,
+            "rootfs.squashfs.whatever": b"\xbb" * 16,
+        }
+        assert len(_read_usb_payloads(_make_tarball(tmp_path, files), PARTS)) == 2
+
+
 class TestResidueHandling:
     """A device may move less than asked and still report status OK."""
 
@@ -220,3 +258,187 @@ class TestResidueHandling:
         device = self._device(residue=0, status=1)
         with pytest.raises(RockusbUsbError, match="failed"):
             device.command(Opcode.WRITE_LBA, address=0, count=1, data_out=b"\x00" * 512)
+
+
+class TestShortBulkWrites:
+    """pyusb reports how many bytes it managed; a short count on a payload is
+    a partial flash write dressed as a successful one."""
+
+    def _device(self, write_returns):
+        import struct
+
+        from defib.rockusb.device import RockusbDevice
+
+        found = FoundDevice(
+            mode=DeviceMode.LOADER, bus=1, address=1, product_id=0x110C,
+            handle=None, port_numbers=(1,),
+        )
+        device = RockusbDevice(found)
+        written: list[bytes] = []
+
+        class Out:
+            def write(self, data, timeout=None):
+                written.append(bytes(data))
+                return write_returns(bytes(data))
+
+        class In:
+            def read(self, size, timeout=None):
+                tag = struct.unpack_from("<I", written[0], 4)[0]
+                return CSW_SIGNATURE + struct.pack("<IIB", tag, 0, 0)
+
+        device._ep_out = Out()
+        device._ep_in = In()
+        return device
+
+    def test_full_write_accepted(self):
+        device = self._device(lambda d: len(d))
+        device.command(Opcode.WRITE_LBA, address=0, count=1, data_out=b"\x00" * 512)
+
+    def test_short_payload_write_rejected(self):
+        from defib.rockusb.device import RockusbUsbError
+
+        device = self._device(lambda d: len(d) if len(d) == 31 else len(d) - 8)
+        with pytest.raises(RockusbUsbError, match="payload write short"):
+            device.command(Opcode.WRITE_LBA, address=0, count=1, data_out=b"\x00" * 512)
+
+    def test_short_command_write_rejected(self):
+        from defib.rockusb.device import RockusbUsbError
+
+        device = self._device(lambda d: len(d) - 1)
+        with pytest.raises(RockusbUsbError, match="command wrapper write short"):
+            device.command(Opcode.WRITE_LBA, address=0, count=1, data_out=b"\x00" * 512)
+
+
+class TestResetFailureHandling:
+    """A board may vanish acknowledging its own reset — but only that is
+    tolerable. A reset that never went out must not be reported as done."""
+
+    def _device(self, *, send_fails=False, csw_fails=False, status=0):
+        import struct
+
+        from defib.rockusb.device import RockusbDevice
+
+        found = FoundDevice(
+            mode=DeviceMode.LOADER, bus=1, address=1, product_id=0x110C,
+            handle=None, port_numbers=(1,),
+        )
+        device = RockusbDevice(found)
+        written: list[bytes] = []
+
+        class Out:
+            def write(self, data, timeout=None):
+                if send_fails:
+                    raise OSError("pipe error")
+                written.append(bytes(data))
+                return len(data)
+
+        class In:
+            def read(self, size, timeout=None):
+                if csw_fails:
+                    raise OSError("no such device")
+                tag = struct.unpack_from("<I", written[0], 4)[0]
+                return CSW_SIGNATURE + struct.pack("<IIB", tag, 0, status)
+
+        device._ep_out = Out()
+        device._ep_in = In()
+        return device
+
+    async def test_disconnect_while_reading_ack_is_fine(self):
+        from defib.rockusb.recovery import RockchipRecovery
+
+        await RockchipRecovery(self._device(csw_fails=True)).reset()
+
+    async def test_send_failure_propagates(self):
+        from defib.rockusb.device import RockusbUsbError
+        from defib.rockusb.recovery import RockchipRecovery
+
+        with pytest.raises(RockusbUsbError, match="command wrapper write failed"):
+            await RockchipRecovery(self._device(send_fails=True)).reset()
+
+    async def test_explicit_failure_status_propagates(self):
+        from defib.rockusb.device import RockusbUsbError
+        from defib.rockusb.recovery import RockchipRecovery
+
+        with pytest.raises(RockusbUsbError, match="failed"):
+            await RockchipRecovery(self._device(status=1)).reset()
+
+
+class TestShortControlWrite:
+    """A truncated loader upload only shows up much later, as a
+    re-enumeration timeout that looks like a dead board."""
+
+    def _device(self, returns):
+        from defib.rockusb.device import RockusbDevice
+
+        found = FoundDevice(
+            mode=DeviceMode.MASKROM, bus=1, address=1, product_id=0x110C,
+            handle=None, port_numbers=(1,),
+        )
+        device = RockusbDevice(found)
+
+        class Handle:
+            def ctrl_transfer(self, **kwargs):
+                return returns(kwargs["data_or_wLength"])
+
+        device._dev = Handle()
+        return device
+
+    def test_full_write_returns_the_count(self):
+        device = self._device(lambda d: len(d))
+        assert device.control_write(0x471, b"\x00" * 100) == 100
+
+    def test_short_write_rejected(self):
+        from defib.rockusb.device import RockusbUsbError
+
+        device = self._device(lambda d: len(d) - 1)
+        with pytest.raises(RockusbUsbError, match="short"):
+            device.control_write(0x471, b"\x00" * 100)
+
+    def test_transfer_error_still_wrapped(self):
+        from defib.rockusb.device import RockusbUsbError
+
+        def boom(_data):
+            raise OSError("broken pipe")
+
+        with pytest.raises(RockusbUsbError, match="control transfer failed"):
+            self._device(boom).control_write(0x471, b"\x00" * 4)
+
+
+class TestKernelDriverRestore:
+    """A failed claim must not strand the interface away from the kernel
+    driver that owned it."""
+
+    def _device(self, claim_fails: bool):
+        from defib.rockusb.device import RockusbDevice
+
+        found = FoundDevice(
+            mode=DeviceMode.LOADER, bus=1, address=1, product_id=0x110C,
+            handle=None, port_numbers=(1,),
+        )
+        device = RockusbDevice(found)
+        events: list[str] = []
+
+        class Handle:
+            def attach_kernel_driver(self, number):
+                events.append(f"attach{number}")
+
+        device._dev = Handle()
+        device._detached_interface = 3
+        return device, events
+
+    def test_reattach_restores_the_same_interface(self):
+        device, events = self._device(claim_fails=True)
+        device._reattach_kernel_driver()
+        assert events == ["attach3"]
+
+    def test_reattach_is_idempotent(self):
+        device, events = self._device(claim_fails=True)
+        device._reattach_kernel_driver()
+        device._reattach_kernel_driver()
+        assert events == ["attach3"]
+
+    def test_nothing_detached_means_nothing_restored(self):
+        device, events = self._device(claim_fails=False)
+        device._detached_interface = None
+        device._reattach_kernel_driver()
+        assert events == []

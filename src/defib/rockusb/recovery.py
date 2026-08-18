@@ -24,7 +24,6 @@ from defib.recovery.events import ProgressEvent, Stage
 from defib.rockusb.device import (
     DeviceMode,
     RockusbDevice,
-    RockusbUsbError,
     wait_for_device,
 )
 from defib.rockusb.loader import LoaderBlobs
@@ -119,8 +118,10 @@ class RockchipRecovery:
         chunks = build_maskrom_chunks(blob, use_rc4=use_rc4)
         sent = 0
         for chunk in chunks:
-            await asyncio.to_thread(self._device.control_write, code, chunk)
-            sent += len(chunk)
+            # Count what the wire took, not what we handed it. control_write
+            # already rejects a short transfer; crediting the full chunk here
+            # anyway would make the progress bar lie about it.
+            sent += await asyncio.to_thread(self._device.control_write, code, chunk)
             _emit(
                 on_progress,
                 ProgressEvent(stage, sent, len(blob), f"{name} -> {code:#06x}"),
@@ -192,12 +193,16 @@ class RockchipRecovery:
         ``ResetSubcode.MASKROM`` comes back in MaskROM rather than booting,
         which is how you chain several flash operations without needing the
         board's power cut in between.
+
+        A device is entitled to drop off the bus before acknowledging its own
+        reset, so a missing status wrapper is tolerated — but only that.
+        Failing to send the command at all, or getting back an explicit
+        failure, means the board never reset and must not be reported as
+        though it did.
         """
-        try:
-            await asyncio.to_thread(
-                self._device.command, Opcode.RESET_DEVICE, subcode=int(subcode)
-            )
-        except RockusbUsbError as e:
-            # The device is entitled to drop off the bus before it acknowledges
-            # its own reset, so a failed status read here is expected.
-            logger.debug("reset ack not received (device already gone): %s", e)
+        await asyncio.to_thread(
+            self._device.command,
+            Opcode.RESET_DEVICE,
+            subcode=int(subcode),
+            tolerate_disconnect=True,
+        )

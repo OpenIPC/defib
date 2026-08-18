@@ -3834,21 +3834,33 @@ _USB_REQUIRED_PARTITIONS = ("boot", "rootfs")
 _USB_WRITE_LAST = ("idblock",)
 
 
-def _map_usb_images(names: list[str], partitions: dict[str, Any]) -> list[tuple[str, str, Any]]:
+def _map_usb_images(
+    names: list[str], partitions: dict[str, Any], chip: str = "",
+) -> list[tuple[str, str, Any]]:
     """Match tarball members to partitions, in a safe write order.
 
     Returns ``(member, partition, extent)`` triples.
 
+    Args:
+        names: tarball member names, e.g. ``zboot.img.rv1106``.
+        partitions: the chip profile's partition table.
+        chip: when given, the SoC suffix every member must carry. OpenIPC
+            names each image for the SoC it was built for, and that suffix is
+            the only thing separating an RV1106 kernel from one that would
+            leave this board unbootable.
+
     Raises:
-        typer.BadParameter: if a member cannot be placed. The UBI case is
-            called out by name because it is not a mapping gap but a real
-            layout question: ``rootfs.ubi`` bundles kernel *and* rootfs as UBI
-            volumes, so it does not correspond to any single partition in the
-            vendor table.
+        typer.BadParameter: if a member cannot be placed, or was built for a
+            different SoC. The UBI case is called out by name because it is
+            not a mapping gap but a real layout question: ``rootfs.ubi``
+            bundles kernel *and* rootfs as UBI volumes, so it does not
+            correspond to any single partition in the vendor table.
     """
     mapped: list[tuple[str, str, Any]] = []
     for name in names:
-        stem = name.rsplit(".", 1)[0] if "." in name else name
+        stem, _, suffix = name.rpartition(".")
+        if not stem:
+            stem, suffix = name, ""
         partition = _USB_IMAGE_PARTITIONS.get(stem)
         if partition is None:
             if stem.startswith("rootfs.ubi"):
@@ -3859,6 +3871,11 @@ def _map_usb_images(names: list[str], partitions: dict[str, Any]) -> list[tuple[
                     "decide the UBI region for this board first."
                 )
             continue
+        if chip and suffix.lower() != chip.lower():
+            raise typer.BadParameter(
+                f"{name} was built for '{suffix}', not '{chip}' — flashing "
+                "another SoC's image would leave this board unbootable"
+            )
         if partition not in partitions:
             raise typer.BadParameter(
                 f"{name} belongs in partition '{partition}', which this "
@@ -3886,7 +3903,9 @@ def _check_usb_image_fits(name: str, partition: str, extent: Any, size: int) -> 
         )
 
 
-def _read_usb_payloads(tar_path: Any, partitions: dict[str, Any]) -> list[tuple[str, str, Any, bytes]]:
+def _read_usb_payloads(
+    tar_path: Any, partitions: dict[str, Any], chip: str = "",
+) -> list[tuple[str, str, Any, bytes]]:
     """Extract, checksum and bounds-check every image the tarball places.
 
     Returns ``(member, partition, extent, data)`` in write order.
@@ -3897,7 +3916,7 @@ def _read_usb_payloads(tar_path: Any, partitions: dict[str, Any]) -> list[tuple[
     with tarfile.open(tar_path) as tar:
         members = [m for m in tar.getmembers() if m.isfile()]
         names = [m.name for m in members if not m.name.endswith(".md5sum")]
-        targets = _map_usb_images(names, partitions)
+        targets = _map_usb_images(names, partitions, chip)
         if not targets:
             raise typer.BadParameter(
                 f"nothing in {tar_path.name} maps to a partition "
@@ -3958,6 +3977,7 @@ async def _install_usb_async(
     TFTP or U-Boot console in the path at all.
     """
     import json as json_mod
+    import tarfile
     from pathlib import Path
 
     from rich.console import Console
@@ -3973,7 +3993,17 @@ async def _install_usb_async(
     if not tar_path.exists():
         raise typer.BadParameter(f"firmware not found: {firmware_path}")
 
-    payloads = _read_usb_payloads(tar_path, partitions)
+    # In JSON mode every failure has to arrive as a structured event, so
+    # archive and validation errors are funnelled through _usb_fail rather
+    # than surfacing as Typer's own text (or, for a corrupt archive, a
+    # traceback). Human mode keeps Typer's nicer rendering.
+    try:
+        payloads = _read_usb_payloads(tar_path, partitions, chip)
+    except (typer.BadParameter, tarfile.TarError, OSError) as e:
+        if output != "json":
+            raise
+        _usb_fail(output, str(e))
+        return
 
     try:
         blobs = _resolve_usb_loader(chip, ddr, usbplug, loader)

@@ -287,10 +287,28 @@ class RockusbDevice:
         try:
             usb.util.claim_interface(dev, number)
         except usb.core.USBError as e:
+            # Give the kernel driver back before bailing out. Leaving it
+            # detached would strand the interface for whatever owned it,
+            # turning a failed attempt into a lasting one.
+            self._reattach_kernel_driver()
             raise RockusbUsbError(
                 f"cannot claim interface {number} on {self._found}: {e} "
                 "(need a udev rule for 2207:* or root)"
             ) from e
+
+    def _reattach_kernel_driver(self) -> None:
+        """Undo a detach, if we did one. Best-effort by nature."""
+        if self._detached_interface is None:
+            return
+        try:
+            self._dev.attach_kernel_driver(self._detached_interface)
+        except Exception:  # pragma: no cover - platform dependent
+            logger.debug(
+                "could not reattach kernel driver to interface %d",
+                self._detached_interface, exc_info=True,
+            )
+        finally:
+            self._detached_interface = None
 
     def close(self) -> None:
         usb = _require_usb()
@@ -298,25 +316,40 @@ class RockusbDevice:
             if self._interface is not None:
                 usb.util.release_interface(self._dev, self._interface.bInterfaceNumber)
             usb.util.dispose_resources(self._dev)
-            if self._detached_interface is not None:
-                self._dev.attach_kernel_driver(self._detached_interface)
         except Exception:  # pragma: no cover - teardown is best-effort
             logger.debug("cleanup failed for %s", self._found, exc_info=True)
+        self._reattach_kernel_driver()
 
     # -- MaskROM stage ----------------------------------------------------
 
     def control_write(self, code: int, payload: bytes) -> int:
-        """One MaskROM code-upload control transfer."""
+        """One MaskROM code-upload control transfer.
+
+        Returns the number of bytes the host actually pushed.
+
+        Raises:
+            RockusbUsbError: on a transfer error, or a short write. A
+                truncated loader upload surfaces much later as a
+                re-enumeration timeout that looks like a dead board, so it is
+                caught where it happens.
+        """
         try:
-            written = self._dev.ctrl_transfer(
+            written = int(self._dev.ctrl_transfer(
                 bmRequestType=0x40,
                 bRequest=0x0C,
                 wValue=0x0000,
                 wIndex=code,
                 data_or_wLength=payload,
                 timeout=self._timeout_ms,
-            )
-            return int(written)
+            ))
+            if written != len(payload):
+                raise RockusbUsbError(
+                    f"MaskROM control transfer short (code {code:#06x}): "
+                    f"wrote {written} of {len(payload)} bytes"
+                )
+            return written
+        except RockusbUsbError:
+            raise
         except Exception as e:
             raise RockusbUsbError(
                 f"MaskROM control transfer failed (code {code:#06x}, "
@@ -324,6 +357,25 @@ class RockusbDevice:
             ) from e
 
     # -- rockusb bulk stage -----------------------------------------------
+
+    def _write_bulk(self, data: bytes, what: str, opcode: Opcode | int) -> None:
+        """Push ``data`` out the bulk endpoint, insisting all of it lands.
+
+        pyusb returns how many bytes it managed; a short count means the
+        device took less than we handed it, which for a payload write is a
+        partial flash write wearing the costume of a successful one.
+        """
+        try:
+            written = int(self._ep_out.write(data, self._timeout_ms))
+        except Exception as e:
+            raise RockusbUsbError(
+                f"rockusb {what} write failed (opcode {int(opcode):#04x}): {e}"
+            ) from e
+        if written != len(data):
+            raise RockusbUsbError(
+                f"rockusb {what} write short (opcode {int(opcode):#04x}): "
+                f"wrote {written} of {len(data)} bytes"
+            )
 
     def _require_bulk(self) -> None:
         if self._ep_in is None or self._ep_out is None:
@@ -341,6 +393,7 @@ class RockusbDevice:
         count: int = 0,
         data_out: bytes | None = None,
         read_length: int = 0,
+        tolerate_disconnect: bool = False,
     ) -> bytes:
         """Run one CBW / optional data phase / CSW exchange.
 
@@ -368,17 +421,34 @@ class RockusbDevice:
             direction_in=direction_in,
         )
 
+        # The command itself must always get out intact. Only the status
+        # wrapper may legitimately go missing, and only when the caller is
+        # expecting the device to drop off the bus — see `tolerate_disconnect`.
+        self._write_bulk(cbw, "command wrapper", opcode)
         try:
-            self._ep_out.write(cbw, self._timeout_ms)
             payload = b""
             if direction_in:
                 payload = bytes(self._ep_in.read(read_length, self._timeout_ms))
             elif data_out:
-                self._ep_out.write(data_out, self._timeout_ms)
-            csw = bytes(self._ep_in.read(CSW_LENGTH, self._timeout_ms))
+                self._write_bulk(data_out, "payload", opcode)
+        except RockusbUsbError:
+            raise
         except Exception as e:
             raise RockusbUsbError(
-                f"rockusb transfer failed (opcode {int(opcode):#04x}): {e}"
+                f"rockusb data phase failed (opcode {int(opcode):#04x}): {e}"
+            ) from e
+
+        try:
+            csw = bytes(self._ep_in.read(CSW_LENGTH, self._timeout_ms))
+        except Exception as e:
+            if tolerate_disconnect:
+                logger.debug(
+                    "no status wrapper for opcode %#04x — device already gone: %s",
+                    int(opcode), e,
+                )
+                return b""
+            raise RockusbUsbError(
+                f"rockusb status read failed (opcode {int(opcode):#04x}): {e}"
             ) from e
 
         _, residue, status = parse_csw(csw, expected_tag=tag)
