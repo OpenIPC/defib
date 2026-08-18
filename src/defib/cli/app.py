@@ -24,19 +24,28 @@ def burn(
     poe_port_override: str = typer.Option("", "--poe-port", help="Explicit MikroTik ether port (e.g. ether3) — overrides comment-based auto-discovery. Requires --power-cycle."),
     output: str = typer.Option("human", "--output", help="Output mode: human, json, quiet"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
+    ddr: str = typer.Option("", "--ddr", help="USB-recovery chips: DDR-init blob (rkbin rv1106_ddr_*.bin)"),
+    usbplug: str = typer.Option("", "--usbplug", help="USB-recovery chips: usbplug blob (rkbin rv1106_usbplug_*.bin)"),
+    loader: str = typer.Option("", "--loader", help="USB-recovery chips: RKBOOT container (MiniLoaderAll.bin), instead of --ddr/--usbplug"),
+    wait: float = typer.Option(30.0, "--wait", help="USB-recovery chips: seconds to wait for the board to enumerate"),
 ) -> None:
-    """Recover a device by uploading firmware via UART serial.
+    """Wake a dead device so its flash can be written.
 
-    If no firmware file is specified with -f, automatically downloads
-    the appropriate U-Boot from OpenIPC releases.
+    For most chips this uploads U-Boot into RAM over UART; if no file is
+    given with -f the right one is downloaded from OpenIPC.
+
+    Chips whose boot ROM only answers on USB (Rockchip) instead take
+    --ddr/--usbplug (or --loader) and ignore -p: an erased flash drops them
+    into MaskROM on its own at power-up, so --power-cycle is all it takes.
     """
     import asyncio
-    asyncio.run(_burn_async(chip, file, port, send_break, terminal, power_cycle, poe_port_override, output, debug))
+    asyncio.run(_burn_async(chip, file, port, send_break, terminal, power_cycle, poe_port_override, output, debug, ddr, usbplug, loader, wait))
 
 
 async def _burn_async(
     chip: str, file: str, port: str, send_break: bool, terminal: bool,
     power_cycle: bool, poe_port_override: str, output: str, debug: bool,
+    ddr: str = "", usbplug: str = "", loader: str = "", wait: float = 30.0,
 ) -> None:
     import json as json_mod
     import logging
@@ -44,6 +53,7 @@ async def _burn_async(
     from rich.console import Console
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
+    from defib.profiles.loader import recovery_mode
     from defib.recovery.events import LogEvent, ProgressEvent
     from defib.recovery.session import RecoverySession
 
@@ -53,6 +63,10 @@ async def _burn_async(
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.INFO)
+
+    if recovery_mode(chip) == "usb":
+        await _burn_usb_async(chip, ddr, usbplug, loader, power_cycle, output, wait)
+        return
 
     # Resolve firmware: local file or auto-download from OpenIPC
     firmware_path = file
@@ -2094,17 +2108,26 @@ def install(
     ),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
+    ddr: str = typer.Option("", "--ddr", help="USB-recovery chips: DDR-init blob (rkbin rv1106_ddr_*.bin)"),
+    usbplug: str = typer.Option("", "--usbplug", help="USB-recovery chips: usbplug blob (rkbin rv1106_usbplug_*.bin)"),
+    loader: str = typer.Option("", "--loader", help="USB-recovery chips: RKBOOT container (MiniLoaderAll.bin), instead of --ddr/--usbplug"),
+    wait: float = typer.Option(30.0, "--wait", help="USB-recovery chips: seconds to wait for the board to enumerate"),
+    verify: bool = typer.Option(False, "--verify", help="USB-recovery chips: read each image back and compare"),
 ) -> None:
-    """Install a full OpenIPC firmware (U-Boot + kernel + rootfs) via UART + TFTP.
+    """Install a full OpenIPC firmware (U-Boot + kernel + rootfs).
 
-    Extracts the firmware tarball, burns U-Boot to RAM via boot ROM,
-    then uses TFTP to transfer kernel and rootfs to U-Boot which
-    flashes them to NOR or NAND.
+    For UART chips: extracts the tarball, burns U-Boot to RAM via the boot
+    ROM, then TFTPs kernel and rootfs to U-Boot, which flashes them.
+
+    For chips whose boot ROM only answers on USB (Rockchip), -p and the TFTP
+    options do not apply — pass --ddr/--usbplug (or --loader) and the images
+    are written straight to flash over USB.
     """
     import asyncio
     asyncio.run(_install_async(
         chip, firmware, port, power_cycle, poe_port_override, nic, host_ip, device_ip,
         tftp_port, nor_size, nand, wipe_env, tftp_via, output, debug,
+        ddr, usbplug, loader, wait, verify,
     ))
 
 
@@ -2181,6 +2204,11 @@ async def _install_async(
     tftp_via: str,
     output: str,
     debug: bool,
+    ddr: str = "",
+    usbplug: str = "",
+    loader: str = "",
+    wait: float = 30.0,
+    verify: bool = False,
 ) -> None:
     import hashlib
     import json as json_mod
@@ -2201,6 +2229,7 @@ async def _install_async(
     )
     from defib.network.ip_manager import list_interfaces, temporary_ip
     from defib.network.tftp_server import start_tftp_server
+    from defib.profiles.loader import recovery_mode
     from defib.recovery.events import LogEvent, ProgressEvent
     from defib.recovery.session import RecoverySession
     from defib.transport.serial_platform import create_transport, normalize_port_name
@@ -2211,6 +2240,13 @@ async def _install_async(
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.INFO)
+
+    if recovery_mode(chip) == "usb":
+        await _install_usb_async(
+            chip, firmware_path, ddr, usbplug, loader,
+            power_cycle, output, wait, verify,
+        )
+        return
 
     if nand:
         layout = _NAND_LAYOUT
@@ -3609,6 +3645,273 @@ async def _restore_async(
         console.print("\n[green bold]Restore complete![/green bold] Device is rebooting.")
     elif output == "json":
         print(json_mod.dumps({"event": "done", "success": True, "partitions": len(partitions)}))
+
+
+def _usb_progress_printer(output: str) -> Any:
+    """Progress callback that emits JSON lines, or nothing in other modes."""
+    import json as json_mod
+
+    from defib.recovery.events import ProgressEvent
+
+    def on_progress(event: ProgressEvent) -> None:
+        if output == "json":
+            print(json_mod.dumps({
+                "event": "progress", "stage": event.stage.value,
+                "sent": event.bytes_sent, "total": event.bytes_total,
+                "percent": round(event.percent, 1),
+            }), flush=True)
+
+    return on_progress
+
+
+def _resolve_usb_loader(chip: str, ddr: str, usbplug: str, loader: str) -> Any:
+    """Build the MaskROM loader blobs for a USB-recovery chip.
+
+    ``--loader`` takes an RKBOOT container; ``--ddr``/``--usbplug`` take the
+    two bare images. Both forms exist because the blobs Rockchip publishes for
+    RV1106 carry no container header — which is exactly what ``rkdeveloptool
+    db`` refuses to load.
+
+    Neither is bundled: they are vendor binaries, so the profile records only
+    the filenames it expects and the user supplies them.
+    """
+    from pathlib import Path
+
+    from defib.profiles.loader import load_profile
+    from defib.rockusb.loader import parse_loader, raw_blobs
+
+    if loader:
+        return parse_loader(Path(loader).read_bytes())
+    if ddr and usbplug:
+        return raw_blobs(Path(ddr).read_bytes(), Path(usbplug).read_bytes())
+
+    profile = load_profile(chip)
+    expected = " and ".join(
+        n for n in (profile.loader_ddr, profile.loader_usbplug) if n
+    )
+    raise typer.BadParameter(
+        f"{chip} recovers over USB and needs its vendor loader blobs: pass "
+        f"--ddr and --usbplug (expected {expected}), or --loader for an "
+        "RKBOOT container."
+    )
+
+
+async def _open_usb_target(
+    blobs: Any, power_cycle: bool, output: str, wait: float,
+) -> Any:
+    """Power-cycle if asked, catch the board, and get its usbplug running.
+
+    Returns a ``RockchipRecovery`` ready to touch flash.
+    """
+    from rich.console import Console
+
+    from defib.rockusb.device import DeviceMode, RockusbDevice, wait_for_device
+    from defib.rockusb.recovery import RockchipRecovery
+
+    console = Console()
+
+    if power_cycle:
+        from defib.power.factory import power_controller_from_env
+
+        controller = power_controller_from_env()
+        if output == "human":
+            console.print(f"  Power-cycling via {controller.name()}...")
+        try:
+            await controller.power_cycle("")
+        finally:
+            await controller.close()
+
+    found = await wait_for_device(timeout=wait)
+    if output == "human":
+        console.print(f"  Found {found}")
+
+    device = RockusbDevice(found)
+    device.open()
+    recovery = RockchipRecovery(device)
+
+    if found.mode is DeviceMode.MASKROM:
+        if output == "human":
+            console.print("  Uploading DDR init and usbplug...")
+        await recovery.download_boot(blobs, on_progress=_usb_progress_printer(output))
+
+    return recovery
+
+
+def _usb_fail(output: str, message: str) -> None:
+    """Report a USB-recovery failure and exit non-zero."""
+    import json as json_mod
+
+    from rich.console import Console
+    from rich.markup import escape
+
+    if output == "json":
+        print(json_mod.dumps({"event": "error", "message": message}))
+    else:
+        # Escaped: messages carry file paths and the "defib[rockchip]" install
+        # hint, either of which Rich would read as markup.
+        Console().print(f"[red]{escape(message)}[/red]")
+    raise typer.Exit(1)
+
+
+async def _burn_usb_async(
+    chip: str, ddr: str, usbplug: str, loader: str,
+    power_cycle: bool, output: str, wait: float,
+) -> None:
+    """``burn`` for chips whose boot ROM only answers on USB.
+
+    The UART path uploads U-Boot into RAM; the USB equivalent is getting the
+    usbplug running, after which flash is writable. It stops there — writing
+    images is ``install``'s job.
+    """
+    import json as json_mod
+
+    from rich.console import Console
+
+    from defib.rockusb.protocol import RockusbError
+
+    console = Console()
+    blobs = _resolve_usb_loader(chip, ddr, usbplug, loader)
+
+    try:
+        recovery = await _open_usb_target(blobs, power_cycle, output, wait)
+        flash_id = await recovery.read_flash_id()
+    except RockusbError as e:
+        _usb_fail(output, str(e))
+        return
+
+    if output == "json":
+        print(json_mod.dumps({
+            "event": "done", "success": True, "flash_id": flash_id.hex(),
+        }))
+    elif output != "quiet":
+        console.print(f"  Flash ID: {flash_id.hex()}")
+        console.print(
+            "\n[green bold]Device is awake.[/green bold] Flash it with: "
+            f"defib install -c {chip} --firmware <image>"
+        )
+
+
+# Which partition each OpenIPC image belongs in, for USB-recovery chips.
+# Keyed on the filename stem the tarball uses before the ``.<soc>`` suffix.
+_USB_IMAGE_PARTITIONS = {
+    "zboot.img": "boot",
+    "rootfs.squashfs": "rootfs",
+    "uboot.img": "uboot",
+    "idblock.img": "idblock",
+}
+
+
+def _map_usb_images(names: list[str], partitions: dict[str, int]) -> list[tuple[str, str, int]]:
+    """Match tarball members to partitions.
+
+    Returns ``(member, partition, lba)`` triples.
+
+    Raises:
+        typer.BadParameter: if a member cannot be placed. The UBI case is
+            called out by name because it is not a mapping gap but a real
+            layout question: ``rootfs.ubi`` bundles kernel *and* rootfs as UBI
+            volumes, so it does not correspond to any single partition in the
+            vendor table.
+    """
+    mapped: list[tuple[str, str, int]] = []
+    for name in names:
+        stem = name.rsplit(".", 1)[0] if "." in name else name
+        partition = _USB_IMAGE_PARTITIONS.get(stem)
+        if partition is None:
+            if stem.startswith("rootfs.ubi"):
+                raise typer.BadParameter(
+                    f"{name} is a UBI image holding both kernel and rootfs "
+                    "volumes, so it has no single partition to go in. Use the "
+                    "nor-style tarball (zboot.img + rootfs.squashfs), or "
+                    "decide the UBI region for this board first."
+                )
+            continue
+        if partition not in partitions:
+            raise typer.BadParameter(
+                f"{name} belongs in partition '{partition}', which this "
+                f"chip's profile does not declare. Known: "
+                f"{', '.join(sorted(partitions)) or '(none)'}"
+            )
+        mapped.append((name, partition, partitions[partition]))
+    return mapped
+
+
+async def _install_usb_async(
+    chip: str, firmware_path: str, ddr: str, usbplug: str, loader: str,
+    power_cycle: bool, output: str, wait: float, verify: bool,
+) -> None:
+    """``install`` for chips whose boot ROM only answers on USB.
+
+    The usbplug runs Rockchip's FTL, so flash is a flat array of 512-byte
+    sectors here — bad blocks and ECC are handled device-side and there is no
+    TFTP or U-Boot console in the path at all.
+    """
+    import json as json_mod
+    import tarfile
+    from pathlib import Path
+
+    from rich.console import Console
+
+    from defib.profiles.loader import load_profile
+    from defib.rockusb.protocol import SECTOR_SIZE, ResetSubcode, RockusbError
+
+    console = Console()
+    blobs = _resolve_usb_loader(chip, ddr, usbplug, loader)
+    partitions = load_profile(chip).partitions
+
+    tar_path = Path(firmware_path)
+    if not tar_path.exists():
+        raise typer.BadParameter(f"firmware not found: {firmware_path}")
+
+    with tarfile.open(tar_path) as tar:
+        members = [m for m in tar.getmembers() if m.isfile()]
+        names = [m.name for m in members if not m.name.endswith(".md5sum")]
+        targets = _map_usb_images(names, partitions)
+        if not targets:
+            raise typer.BadParameter(
+                f"nothing in {tar_path.name} maps to a partition "
+                f"(saw: {', '.join(names) or 'no files'})"
+            )
+        payloads = []
+        for name, partition, lba in targets:
+            handle = tar.extractfile(name)
+            if handle is None:
+                raise typer.BadParameter(f"cannot read {name} from {tar_path.name}")
+            payloads.append((name, partition, lba, handle.read()))
+
+    try:
+        recovery = await _open_usb_target(blobs, power_cycle, output, wait)
+        flash_id = await recovery.read_flash_id()
+        if output == "human":
+            console.print(f"  Flash ID: {flash_id.hex()}")
+
+        for name, partition, lba, data in payloads:
+            if output == "human":
+                console.print(
+                    f"  Writing {name} -> {partition} "
+                    f"(LBA {lba}, {len(data)} bytes)..."
+                )
+            await recovery.write_image(
+                lba, data, on_progress=_usb_progress_printer(output)
+            )
+            if verify:
+                sectors = (len(data) + SECTOR_SIZE - 1) // SECTOR_SIZE
+                if (await recovery.read_image(lba, sectors))[: len(data)] != data:
+                    _usb_fail(output, f"verify failed for {name} at LBA {lba}")
+                if output == "human":
+                    console.print("    Verified")
+
+        await recovery.reset(ResetSubcode.NORMAL)
+    except RockusbError as e:
+        _usb_fail(output, str(e))
+        return
+
+    if output == "json":
+        print(json_mod.dumps({
+            "event": "done", "success": True, "images": len(payloads),
+        }))
+    else:
+        console.print("\n[green bold]Install complete![/green bold] Device is rebooting.")
 
 
 def main() -> None:
