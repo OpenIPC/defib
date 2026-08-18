@@ -61,11 +61,18 @@ class RockchipRecovery:
         blobs: LoaderBlobs,
         on_progress: Callable[[ProgressEvent], None] | None = None,
         reenumerate_timeout: float = 15.0,
+        usb_path: str | None = None,
     ) -> RockusbDevice:
         """Upload DDR init then usbplug, and wait for the device to come back.
 
         Returns the *new* opened device — the old handle is stale once the
         usbplug re-enumerates, so callers must use the returned one.
+
+        Pass ``usb_path`` to require that the device coming back is the same
+        one that went away. Every Rockchip board shares a VID:PID and gets a
+        fresh USB address on re-enumeration, so without it a second board
+        appearing mid-upload could be adopted by this session and flashed by
+        mistake.
         """
         if self._device.mode is not DeviceMode.MASKROM:
             logger.info("device already past MaskROM; skipping loader upload")
@@ -89,7 +96,7 @@ class RockchipRecovery:
         await asyncio.sleep(USBPLUG_SETTLE)
 
         found = await wait_for_device(
-            timeout=reenumerate_timeout, mode=DeviceMode.LOADER
+            timeout=reenumerate_timeout, mode=DeviceMode.LOADER, usb_path=usb_path
         )
         device = RockusbDevice(found)
         device.open()

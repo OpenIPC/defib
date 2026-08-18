@@ -72,11 +72,25 @@ class FoundDevice:
     address: int
     product_id: int
     handle: Any  # usb.core.Device
+    port_numbers: tuple[int, ...] = ()
+
+    @property
+    def usb_path(self) -> str:
+        """Physical topology path, e.g. ``1-4.2``.
+
+        This is the only stable identity a Rockchip board has across the
+        MaskROM-to-loader transition: the USB address is reassigned when the
+        usbplug re-enumerates, and every board shares one VID:PID. The port
+        path is where it is plugged in, so it survives.
+        """
+        if not self.port_numbers:
+            return f"{self.bus}-?"
+        return f"{self.bus}-{'.'.join(str(p) for p in self.port_numbers)}"
 
     def __str__(self) -> str:
         return (
             f"{self.mode.value} device {ROCKCHIP_VID:04x}:{self.product_id:04x} "
-            f"at bus {self.bus} addr {self.address}"
+            f"at {self.usb_path} (bus {self.bus} addr {self.address})"
         )
 
 
@@ -91,49 +105,76 @@ def _classify(dev: Any) -> DeviceMode:
     return DeviceMode.MASKROM if not (dev.bcdUSB & 0x0001) else DeviceMode.LOADER
 
 
-def find_device(product_id: int | None = None) -> FoundDevice | None:
-    """Return the first Rockchip device on the bus, or None."""
+def find_devices(usb_path: str | None = None) -> list[FoundDevice]:
+    """Every Rockchip device on the bus, optionally filtered to one port path."""
     usb = _require_usb()
 
-    kwargs: dict[str, Any] = {"idVendor": ROCKCHIP_VID, "find_all": True}
-    if product_id is not None:
-        kwargs["idProduct"] = product_id
-
-    for dev in usb.core.find(**kwargs):
-        return FoundDevice(
+    out: list[FoundDevice] = []
+    for dev in usb.core.find(idVendor=ROCKCHIP_VID, find_all=True):
+        found = FoundDevice(
             mode=_classify(dev),
             bus=dev.bus,
             address=dev.address,
             product_id=dev.idProduct,
             handle=dev,
+            port_numbers=tuple(getattr(dev, "port_numbers", None) or ()),
         )
-    return None
+        if usb_path is None or found.usb_path == usb_path:
+            out.append(found)
+    return out
+
+
+def find_device(usb_path: str | None = None) -> FoundDevice | None:
+    """A single Rockchip device, or None.
+
+    Raises:
+        RockusbUsbError: if more than one is present and no ``usb_path``
+            narrows it down. Picking one arbitrarily would mean flashing
+            whichever board happened to enumerate first, which on a rack is
+            how you write firmware to the wrong device.
+    """
+    devices = find_devices(usb_path)
+    if not devices:
+        return None
+    if len(devices) > 1:
+        paths = ", ".join(sorted(d.usb_path for d in devices))
+        raise RockusbUsbError(
+            f"{len(devices)} Rockchip devices present ({paths}) — "
+            "narrow it down with --usb-path"
+        )
+    return devices[0]
 
 
 async def wait_for_device(
     timeout: float = 30.0,
     mode: DeviceMode | None = None,
     poll_interval: float = 0.25,
+    usb_path: str | None = None,
 ) -> FoundDevice:
     """Poll until a matching device appears.
 
     Used both for the initial "power-cycle an erased board and catch it in
     MaskROM" step and for the re-enumeration that follows the usbplug upload.
+    Pass ``usb_path`` for the latter: the board keeps its port path across
+    re-enumeration, so pinning it stops the session hopping to a different
+    board that happened to appear meanwhile.
 
     Args:
         timeout: seconds to keep looking.
         mode: require this stage; None accepts either.
         poll_interval: seconds between scans.
+        usb_path: restrict to this physical port path (e.g. ``1-4.2``).
 
     Raises:
-        RockusbUsbError: if nothing matching shows up in time.
+        RockusbUsbError: if nothing matching shows up in time, or if several
+            candidates are present and ``usb_path`` does not disambiguate.
     """
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
     seen: str | None = None
 
     while loop.time() < deadline:
-        found = await asyncio.to_thread(find_device)
+        found = await asyncio.to_thread(find_device, usb_path)
         if found is not None:
             if mode is None or found.mode is mode:
                 return found
@@ -141,12 +182,14 @@ async def wait_for_device(
         await asyncio.sleep(poll_interval)
 
     want = f" in {mode.value} mode" if mode else ""
+    where = f" at {usb_path}" if usb_path else ""
     if seen:
         raise RockusbUsbError(
-            f"no Rockchip device{want} after {timeout:.0f}s — saw {seen} instead"
+            f"no Rockchip device{want}{where} after {timeout:.0f}s — "
+            f"saw {seen} instead"
         )
     raise RockusbUsbError(
-        f"no Rockchip device{want} after {timeout:.0f}s. "
+        f"no Rockchip device{want}{where} after {timeout:.0f}s. "
         "Power-cycle the board; an erased flash enters MaskROM on its own."
     )
 
@@ -165,7 +208,7 @@ class RockusbDevice:
         self._interface: Any = None
         self._ep_in: Any = None
         self._ep_out: Any = None
-        self._detached = False
+        self._detached_interface: int | None = None
 
     @property
     def mode(self) -> DeviceMode:
@@ -186,15 +229,6 @@ class RockusbDevice:
         """
         usb = _require_usb()
         dev = self._dev
-
-        try:
-            if dev.is_kernel_driver_active(0):
-                dev.detach_kernel_driver(0)
-                self._detached = True
-        except (NotImplementedError, usb.core.USBError):
-            # Not all backends/platforms implement this; only Linux binds a
-            # kernel driver here in the first place.
-            pass
 
         try:
             dev.set_configuration()
@@ -236,11 +270,25 @@ class RockusbDevice:
                 f"{self._found}: no bulk IN/OUT endpoint pair found"
             )
 
+        # Detach from the interface actually being claimed, not interface 0 —
+        # the bulk pair is not guaranteed to live on the first one, and
+        # detaching the wrong interface leaves the right one bound and the
+        # claim below failing.
+        number = self._interface.bInterfaceNumber
         try:
-            usb.util.claim_interface(dev, self._interface.bInterfaceNumber)
+            if dev.is_kernel_driver_active(number):
+                dev.detach_kernel_driver(number)
+                self._detached_interface = number
+        except (NotImplementedError, usb.core.USBError):
+            # Not all backends/platforms implement this; only Linux binds a
+            # kernel driver here in the first place.
+            pass
+
+        try:
+            usb.util.claim_interface(dev, number)
         except usb.core.USBError as e:
             raise RockusbUsbError(
-                f"cannot claim interface on {self._found}: {e} "
+                f"cannot claim interface {number} on {self._found}: {e} "
                 "(need a udev rule for 2207:* or root)"
             ) from e
 
@@ -250,8 +298,8 @@ class RockusbDevice:
             if self._interface is not None:
                 usb.util.release_interface(self._dev, self._interface.bInterfaceNumber)
             usb.util.dispose_resources(self._dev)
-            if self._detached:
-                self._dev.attach_kernel_driver(0)
+            if self._detached_interface is not None:
+                self._dev.attach_kernel_driver(self._detached_interface)
         except Exception:  # pragma: no cover - teardown is best-effort
             logger.debug("cleanup failed for %s", self._found, exc_info=True)
 
@@ -299,7 +347,11 @@ class RockusbDevice:
         Returns any data read during an IN transfer, otherwise ``b""``.
 
         Raises:
-            RockusbUsbError: on a transfer error or a non-zero status.
+            RockusbUsbError: on a transfer error, a non-zero status, or a
+                short transfer. A device is entitled to move less than it was
+                asked to and still report OK, reporting the shortfall in the
+                status wrapper's residue; treating that as success is how a
+                partial write gets announced as a finished install.
         """
         self._require_bulk()
         tag = secrets.randbits(32)
@@ -334,5 +386,16 @@ class RockusbDevice:
             raise RockusbUsbError(
                 f"rockusb command {int(opcode):#04x} failed "
                 f"(status {status}, residue {residue})"
+            )
+        if residue:
+            raise RockusbUsbError(
+                f"rockusb command {int(opcode):#04x} moved "
+                f"{transfer_length - residue} of {transfer_length} bytes "
+                f"(residue {residue})"
+            )
+        if direction_in and len(payload) != read_length:
+            raise RockusbUsbError(
+                f"rockusb command {int(opcode):#04x} returned "
+                f"{len(payload)} of {read_length} bytes"
             )
         return payload

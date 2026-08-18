@@ -61,7 +61,14 @@ def raw_blobs(ddr: bytes, usbplug: bytes, *, use_rc4: bool = False) -> LoaderBlo
 
     For RV1106 this is the normal path, since rkbin ships its DDR and usbplug
     images headerless.
+
+    Raises:
+        LoaderFormatError: if either image is empty — uploading nothing would
+            look like a board that never came back.
     """
+    empty = [n for n, b in (("ddr", ddr), ("usbplug", usbplug)) if not b]
+    if empty:
+        raise LoaderFormatError(f"{' and '.join(empty)} image is empty")
     return LoaderBlobs(
         ddr=[LoaderEntry(name="ddr", data=ddr, delay_ms=0)],
         usbplug=[LoaderEntry(name="usbplug", data=usbplug, delay_ms=0)],
@@ -144,6 +151,21 @@ def parse_loader(data: bytes) -> LoaderBlobs:
     # Skip the loader table triple; jump to the two trailing flag bytes.
     flags_at = table_at + 6 + 6 + 6
     rc4_flag = data[flags_at + 1]
+
+    # Both stages are mandatory. A container missing either would parse fine
+    # and then upload nothing, leaving the caller waiting out a re-enumeration
+    # that was never going to happen — a timeout that blames the board for a
+    # bad file.
+    missing = [
+        name
+        for name, count in (("DDR init (471)", n471), ("usbplug (472)", n472))
+        if count == 0
+    ]
+    if missing:
+        raise LoaderFormatError(
+            f"loader declares no {' or '.join(missing)} entries — "
+            "it cannot bring a board up"
+        )
 
     return LoaderBlobs(
         ddr=_parse_entries(data, off471, size471, n471),

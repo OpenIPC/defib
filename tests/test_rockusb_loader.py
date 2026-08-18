@@ -126,6 +126,35 @@ class TestRejections:
             parse_loader(bytes(data))
 
 
+class TestEmptyStages:
+    """Both stages are mandatory.
+
+    A container missing either parses cleanly and then uploads nothing,
+    leaving the caller to wait out a re-enumeration that was never coming —
+    a timeout that blames the board for a bad file.
+    """
+
+    def _with_counts(self, n471: int, n472: int) -> bytes:
+        data = bytearray(_build_loader())
+        data[TABLE_AT] = n471
+        data[TABLE_AT + 6] = n472
+        return bytes(data)
+
+    def test_no_ddr_entries_rejected(self):
+        with pytest.raises(LoaderFormatError, match="DDR init"):
+            parse_loader(self._with_counts(0, 1))
+
+    def test_no_usbplug_entries_rejected(self):
+        with pytest.raises(LoaderFormatError, match="usbplug"):
+            parse_loader(self._with_counts(1, 0))
+
+    def test_neither_stage_names_both(self):
+        with pytest.raises(LoaderFormatError) as excinfo:
+            parse_loader(self._with_counts(0, 0))
+        assert "DDR init" in str(excinfo.value)
+        assert "usbplug" in str(excinfo.value)
+
+
 class TestRawBlobs:
     def test_wraps_bare_images(self):
         blobs = raw_blobs(b"\x01" * 16, b"\x02" * 32)
@@ -137,3 +166,11 @@ class TestRawBlobs:
 
     def test_rc4_can_be_forced_on(self):
         assert raw_blobs(b"a", b"b", use_rc4=True).use_rc4 is True
+
+    def test_empty_ddr_rejected(self):
+        with pytest.raises(LoaderFormatError, match="ddr"):
+            raw_blobs(b"", b"b")
+
+    def test_empty_usbplug_rejected(self):
+        with pytest.raises(LoaderFormatError, match="usbplug"):
+            raw_blobs(b"a", b"")

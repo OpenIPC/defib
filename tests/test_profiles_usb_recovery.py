@@ -12,9 +12,9 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from defib.cli.app import _map_usb_images
+from defib.cli.app import _check_usb_image_fits, _map_usb_images
 from defib.profiles.loader import load_profile, recovery_mode
-from defib.profiles.schema import SoCProfile
+from defib.profiles.schema import FlashPartition, SoCProfile
 
 PROFILES_DIR = Path(__file__).parent.parent / "src" / "defib" / "profiles" / "data"
 
@@ -79,21 +79,34 @@ class TestRv1106Profile:
         """Luckfox SPI NAND: 256K(env) 256K@256K(idblock) 512K(uboot) 4M(boot)
         30M(oem) 10M(userdata) 80M(rootfs), converted to 512-byte sectors."""
         partitions = load_profile("rv1106", PROFILES_DIR).partitions
-        expected_bytes = {
-            "env": 0,
-            "idblock": 256 * 1024,
-            "uboot": 512 * 1024,
-            "boot": 1024 * 1024,
-            "oem": 5 * 1024 * 1024,
-            "userdata": 35 * 1024 * 1024,
-            "rootfs": 45 * 1024 * 1024,
+        K, M = 1024, 1024 * 1024
+        expected = {
+            "env": (0, 256 * K),
+            "idblock": (256 * K, 256 * K),
+            "uboot": (512 * K, 512 * K),
+            "boot": (1 * M, 4 * M),
+            "oem": (5 * M, 30 * M),
+            "userdata": (35 * M, 10 * M),
+            "rootfs": (45 * M, 80 * M),
         }
-        assert partitions == {k: v // 512 for k, v in expected_bytes.items()}
+        actual = {
+            name: (p.lba * 512, p.size_bytes) for name, p in partitions.items()
+        }
+        assert actual == expected
+
+    def test_partitions_tile_without_gaps_or_overlap(self):
+        """A gap or an overlap here would show up as one image silently
+        landing inside another."""
+        partitions = load_profile("rv1106", PROFILES_DIR).partitions
+        extents = sorted(partitions.values(), key=lambda p: p.lba)
+        for lower, upper in zip(extents, extents[1:]):
+            assert lower.end_lba == upper.lba
 
     def test_idblock_stays_at_its_fixed_offset(self):
         """The boot ROM looks for the IDB at 0x40000; moving it bricks the
         board in a way no button recovers."""
-        assert load_profile("rv1106", PROFILES_DIR).partitions["idblock"] * 512 == 0x40000
+        partitions = load_profile("rv1106", PROFILES_DIR).partitions
+        assert partitions["idblock"].lba * 512 == 0x40000
 
     def test_profile_json_is_minimal(self):
         """A USB profile carrying UART bytecode would mean someone copied the
@@ -103,16 +116,37 @@ class TestRv1106Profile:
 
 
 class TestMapUsbImages:
-    PARTS = {"boot": 2048, "rootfs": 92160, "uboot": 1024, "idblock": 512}
+    PARTS = {
+        "idblock": FlashPartition(lba=512, sectors=512),
+        "uboot": FlashPartition(lba=1024, sectors=1024),
+        "boot": FlashPartition(lba=2048, sectors=8192),
+        "rootfs": FlashPartition(lba=92160, sectors=163840),
+    }
 
     def test_maps_nor_style_tarball(self):
         out = _map_usb_images(
             ["zboot.img.rv1106", "rootfs.squashfs.rv1106"], self.PARTS
         )
-        assert out == [
+        assert [(name, part, ext.lba) for name, part, ext in out] == [
             ("zboot.img.rv1106", "boot", 2048),
             ("rootfs.squashfs.rv1106", "rootfs", 92160),
         ]
+
+    def test_idblock_is_written_last(self):
+        """The boot ROM enters MaskROM precisely because it finds no valid
+        IDB. Committing one before the rest of flash is populated trades that
+        recovery path away if a later write fails."""
+        out = _map_usb_images(
+            ["idblock.img.rv1106", "zboot.img.rv1106", "rootfs.squashfs.rv1106"],
+            self.PARTS,
+        )
+        assert [part for _, part, _ in out][-1] == "idblock"
+
+    def test_order_is_otherwise_preserved(self):
+        out = _map_usb_images(
+            ["rootfs.squashfs.rv1106", "zboot.img.rv1106"], self.PARTS
+        )
+        assert [part for _, part, _ in out] == ["rootfs", "boot"]
 
     def test_ubi_image_refused_with_the_reason(self):
         """Not a mapping gap — a UBI bundles kernel and rootfs volumes, so no
@@ -126,7 +160,10 @@ class TestMapUsbImages:
         import typer
 
         with pytest.raises(typer.BadParameter, match="does not declare"):
-            _map_usb_images(["zboot.img.rv1106"], {"rootfs": 1})
+            _map_usb_images(
+                ["zboot.img.rv1106"],
+                {"rootfs": FlashPartition(lba=1, sectors=1)},
+            )
 
     def test_unrecognised_files_are_ignored(self):
         assert _map_usb_images(["README", "notes.txt"], self.PARTS) == []
@@ -134,3 +171,36 @@ class TestMapUsbImages:
     def test_checksums_are_not_mistaken_for_images(self):
         out = _map_usb_images(["zboot.img.rv1106.md5sum"], self.PARTS)
         assert out == []
+
+
+class TestImageFits:
+    BOOT = FlashPartition(lba=2048, sectors=8192)  # 4 MB
+
+    def test_image_within_bounds_passes(self):
+        _check_usb_image_fits("zboot.img", "boot", self.BOOT, self.BOOT.size_bytes)
+
+    def test_oversized_image_refused(self):
+        """The usbplug writes what it is told from a start sector, so an
+        oversized image runs straight on into the next partition."""
+        import typer
+
+        with pytest.raises(typer.BadParameter, match="would overwrite"):
+            _check_usb_image_fits(
+                "zboot.img", "boot", self.BOOT, self.BOOT.size_bytes + 1
+            )
+
+    def test_error_names_both_sizes(self):
+        import typer
+
+        with pytest.raises(typer.BadParameter) as excinfo:
+            _check_usb_image_fits("zboot.img", "boot", self.BOOT, 9_000_000)
+        assert "9000000" in str(excinfo.value)
+        assert str(self.BOOT.size_bytes) in str(excinfo.value)
+
+
+class TestFlashPartition:
+    def test_end_lba(self):
+        assert FlashPartition(lba=100, sectors=50).end_lba == 150
+
+    def test_size_bytes(self):
+        assert FlashPartition(lba=0, sectors=8192).size_bytes == 4 * 1024 * 1024

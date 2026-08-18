@@ -7,6 +7,26 @@ from typing import Literal
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 
+class FlashPartition(BaseModel):
+    """Where a partition lives, in 512-byte sectors.
+
+    The size matters as much as the offset: without it an oversized image
+    would be written straight through into whatever follows.
+    """
+
+    lba: int = Field(description="Starting sector")
+    sectors: int = Field(description="Length in sectors")
+
+    @property
+    def end_lba(self) -> int:
+        """First sector past this partition."""
+        return self.lba + self.sectors
+
+    @property
+    def size_bytes(self) -> int:
+        return self.sectors * 512
+
+
 class SoCProfile(BaseModel):
     """A SoC configuration profile.
 
@@ -87,12 +107,12 @@ class SoCProfile(BaseModel):
             "over USB and exposes flash (rkbin's rv1106_usbplug_*.bin)."
         ),
     )
-    partitions: dict[str, int] = Field(
+    partitions: dict[str, FlashPartition] = Field(
         default_factory=dict, alias="PARTITIONS",
         description=(
-            "USB recovery only. Partition name to starting LBA (512-byte "
-            "sectors), used to place firmware images without the caller "
-            "computing offsets."
+            "USB recovery only. Partition name to its extent, used to place "
+            "firmware images without the caller computing offsets and to "
+            "reject images that would not fit."
         ),
     )
 
