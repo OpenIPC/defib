@@ -107,6 +107,19 @@ def load_profile(chip_name: str, profiles_dir: Path | None = None) -> SoCProfile
     raise ValueError(f"Alias chain too deep for chip: {chip_name}")
 
 
+def recovery_mode(chip_name: str, profiles_dir: Path | None = None) -> str:
+    """How ``chip_name`` is reached when it is dead: ``"uart"`` or ``"usb"``.
+
+    Defaults to ``"uart"`` for anything without a profile, which covers the
+    V500 and CV6xx families whose chip lists live in their protocol modules
+    rather than in JSON.
+    """
+    try:
+        return load_profile(chip_name, profiles_dir).recovery
+    except (FileNotFoundError, ValueError):
+        return "uart"
+
+
 def list_variants(chip_name: str, profiles_dir: Path | None = None) -> list[str]:
     """Return the list of board variants declared for ``chip_name``.
 

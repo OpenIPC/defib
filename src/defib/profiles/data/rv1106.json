@@ -1,0 +1,15 @@
+{
+  "name": "rv1106",
+  "RECOVERY": "usb",
+  "LOADER_DDR": "rv1106_ddr_924MHz_v1.15.bin",
+  "LOADER_USBPLUG": "rv1106_usbplug_v1.09.bin",
+  "PARTITIONS": {
+    "env": 0,
+    "idblock": 512,
+    "uboot": 1024,
+    "boot": 2048,
+    "oem": 10240,
+    "userdata": 71680,
+    "rootfs": 92160
+  }
+}

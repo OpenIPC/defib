@@ -95,7 +95,10 @@ def get_ram_staging_addr(chip: str) -> int:
     try:
         from defib.profiles.loader import load_profile
         profile = load_profile(chip_lower)
-        uboot_addr = int(profile.addresses[2], 16)
+        # The property raises for USB-recovery chips, which have no load
+        # addresses at all — the except below then falls through to the
+        # prefix lookup, which is the right answer for them.
+        uboot_addr = profile.uboot_address
         # Derive RAM base from U-Boot address (aligned to 0x40000000 boundary)
         ram_base = uboot_addr & 0xF0000000
         return ram_base + RAM_STAGING_OFFSET
