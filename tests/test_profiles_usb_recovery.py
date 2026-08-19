@@ -76,8 +76,16 @@ class TestRv1106Profile:
         assert profile.loader_usbplug == "rv1106_usbplug_v1.09.bin"
 
     def test_partition_lbas_match_the_vendor_byte_layout(self):
-        """Luckfox SPI NAND: 256K(env) 256K@256K(idblock) 512K(uboot) 4M(boot)
-        30M(oem) 10M(userdata) 80M(rootfs), converted to 512-byte sectors."""
+        """Read off a real Luckfox Pico Max, not the docs.
+
+        Its U-Boot env and /proc/mtd both give::
+
+            spi-nand0:256K(env),256K@256K(idblock),512K(uboot),4M(boot),
+                      30M(oem),10M(userdata),210M(rootfs)
+
+        Note rootfs is 210M. Luckfox's published layout says 80M, which is
+        what this profile shipped with until hardware contradicted it.
+        """
         partitions = load_profile("rv1106", PROFILES_DIR).partitions
         K, M = 1024, 1024 * 1024
         expected = {
@@ -87,7 +95,7 @@ class TestRv1106Profile:
             "boot": (1 * M, 4 * M),
             "oem": (5 * M, 30 * M),
             "userdata": (35 * M, 10 * M),
-            "rootfs": (45 * M, 80 * M),
+            "rootfs": (45 * M, 210 * M),
         }
         actual = {
             name: (p.lba * 512, p.size_bytes) for name, p in partitions.items()

@@ -1,6 +1,7 @@
 {
   "name": "rv1106",
   "RECOVERY": "usb",
+  "USB_RECOVERY_IDS": [4364],
   "LOADER_DDR": "rv1106_ddr_924MHz_v1.15.bin",
   "LOADER_USBPLUG": "rv1106_usbplug_v1.09.bin",
   "PARTITIONS": {
@@ -10,6 +11,6 @@
     "boot":     {"lba": 2048,  "sectors": 8192},
     "oem":      {"lba": 10240, "sectors": 61440},
     "userdata": {"lba": 71680, "sectors": 20480},
-    "rootfs":   {"lba": 92160, "sectors": 163840}
+    "rootfs":   {"lba": 92160, "sectors": 430080}
   }
 }

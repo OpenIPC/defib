@@ -3706,6 +3706,7 @@ def _resolve_usb_loader(chip: str, ddr: str, usbplug: str, loader: str) -> Any:
 async def _open_usb_target(
     blobs: Any, power_cycle: bool, output: str, wait: float,
     poe_port_override: str = "", usb_path: str = "",
+    recovery_ids: Any = None,
 ) -> Any:
     """Power-cycle if asked, catch the board, and get its usbplug running.
 
@@ -3729,7 +3730,9 @@ async def _open_usb_target(
         finally:
             await controller.close()
 
-    found = await wait_for_device(timeout=wait, usb_path=usb_path or None)
+    found = await wait_for_device(
+        timeout=wait, usb_path=usb_path or None, recovery_ids=recovery_ids
+    )
     if output == "human":
         console.print(f"  Found {found}")
 
@@ -3746,6 +3749,7 @@ async def _open_usb_target(
             blobs,
             on_progress=_usb_progress_printer(output),
             usb_path=found.usb_path,
+            recovery_ids=recovery_ids,
         )
 
     return recovery
@@ -3782,10 +3786,12 @@ async def _burn_usb_async(
 
     from rich.console import Console
 
+    from defib.profiles.loader import load_profile
     from defib.rockusb.loader import LoaderFormatError
     from defib.rockusb.protocol import RockusbError
 
     console = Console()
+    recovery_ids = load_profile(chip).usb_recovery_ids
 
     # Loader resolution sits inside the handler: an unreadable file or a
     # malformed container would otherwise escape as a traceback, and in JSON
@@ -3793,7 +3799,8 @@ async def _burn_usb_async(
     try:
         blobs = _resolve_usb_loader(chip, ddr, usbplug, loader)
         recovery = await _open_usb_target(
-            blobs, power_cycle, output, wait, poe_port_override, usb_path
+            blobs, power_cycle, output, wait, poe_port_override, usb_path,
+            recovery_ids,
         )
         flash_id = await recovery.read_flash_id()
     except (RockusbError, LoaderFormatError, OSError) as e:
@@ -3987,7 +3994,8 @@ async def _install_usb_async(
     from defib.rockusb.protocol import SECTOR_SIZE, ResetSubcode, RockusbError
 
     console = Console()
-    partitions = load_profile(chip).partitions
+    profile = load_profile(chip)
+    partitions = profile.partitions
 
     tar_path = Path(firmware_path)
     if not tar_path.exists():
@@ -4008,7 +4016,8 @@ async def _install_usb_async(
     try:
         blobs = _resolve_usb_loader(chip, ddr, usbplug, loader)
         recovery = await _open_usb_target(
-            blobs, power_cycle, output, wait, poe_port_override, usb_path
+            blobs, power_cycle, output, wait, poe_port_override, usb_path,
+            profile.usb_recovery_ids,
         )
         flash_id = await recovery.read_flash_id()
         if output == "human":

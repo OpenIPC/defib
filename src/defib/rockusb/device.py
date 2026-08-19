@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -26,6 +27,7 @@ from defib.rockusb.protocol import (
     RockusbError,
     build_cbw,
     parse_csw,
+    residue_is_meaningful,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,19 +100,50 @@ def _classify(dev: Any) -> DeviceMode:
     """MaskROM or loader?
 
     Both stages enumerate under the same VID:PID — on RV1106, ``2207:110c`` —
-    so the product id cannot be used. The boot ROM leaves the low bit of
-    ``bcdUSB`` clear where the usbplug sets it, which is the same discriminator
-    xrock relies on.
+    so the product id cannot separate them.
+
+    xrock uses the low bit of ``bcdUSB`` for this. Measured on an RV1106 that
+    does not hold: the boot ROM and the running usbplug both report 0x0200,
+    so that test calls the usbplug MaskROM and the caller waits out a
+    re-enumeration that already happened.
+
+    What does differ is the string descriptors. The boot ROM ships a bare
+    descriptor with no strings at all; the usbplug names itself::
+
+        MaskROM   iManufacturer=0  iProduct=0
+        usbplug   iManufacturer=1 "RockChip"  iProduct=2 "USB-MSC"
+
+    Only the index is read here, which lives in the device descriptor — no
+    string fetch, so this stays cheap and cannot fail on a device that
+    refuses string reads.
     """
-    return DeviceMode.MASKROM if not (dev.bcdUSB & 0x0001) else DeviceMode.LOADER
+    named = bool(dev.iProduct) or bool(dev.iManufacturer)
+    return DeviceMode.LOADER if named else DeviceMode.MASKROM
 
 
-def find_devices(usb_path: str | None = None) -> list[FoundDevice]:
-    """Every Rockchip device on the bus, optionally filtered to one port path."""
+def find_devices(
+    usb_path: str | None = None,
+    recovery_ids: Sequence[int] | None = None,
+) -> list[FoundDevice]:
+    """Every Rockchip device in a recovery mode, optionally pinned to a port.
+
+    ``recovery_ids`` restricts the search to product ids that mean "waiting to
+    be flashed". Without it the vendor id alone is far too broad: a Luckfox
+    booted into Linux presents 2207:0019, an RNDIS+ADB gadget that shares the
+    vendor id and — because its bcdUSB is 0x0200 — even looks like MaskROM to
+    the bcdUSB test. Uploading a loader into a healthy running board is not a
+    mistake worth leaving reachable.
+    """
     usb = _require_usb()
 
     out: list[FoundDevice] = []
     for dev in usb.core.find(idVendor=ROCKCHIP_VID, find_all=True):
+        if recovery_ids and dev.idProduct not in recovery_ids:
+            logger.debug(
+                "ignoring %04x:%04x — not a recovery product id",
+                ROCKCHIP_VID, dev.idProduct,
+            )
+            continue
         found = FoundDevice(
             mode=_classify(dev),
             bus=dev.bus,
@@ -124,8 +157,11 @@ def find_devices(usb_path: str | None = None) -> list[FoundDevice]:
     return out
 
 
-def find_device(usb_path: str | None = None) -> FoundDevice | None:
-    """A single Rockchip device, or None.
+def find_device(
+    usb_path: str | None = None,
+    recovery_ids: Sequence[int] | None = None,
+) -> FoundDevice | None:
+    """A single Rockchip device in a recovery mode, or None.
 
     Raises:
         RockusbUsbError: if more than one is present and no ``usb_path``
@@ -133,7 +169,7 @@ def find_device(usb_path: str | None = None) -> FoundDevice | None:
             whichever board happened to enumerate first, which on a rack is
             how you write firmware to the wrong device.
     """
-    devices = find_devices(usb_path)
+    devices = find_devices(usb_path, recovery_ids)
     if not devices:
         return None
     if len(devices) > 1:
@@ -150,6 +186,7 @@ async def wait_for_device(
     mode: DeviceMode | None = None,
     poll_interval: float = 0.25,
     usb_path: str | None = None,
+    recovery_ids: Sequence[int] | None = None,
 ) -> FoundDevice:
     """Poll until a matching device appears.
 
@@ -174,7 +211,7 @@ async def wait_for_device(
     seen: str | None = None
 
     while loop.time() < deadline:
-        found = await asyncio.to_thread(find_device, usb_path)
+        found = await asyncio.to_thread(find_device, usb_path, recovery_ids)
         if found is not None:
             if mode is None or found.mode is mode:
                 return found
@@ -230,14 +267,21 @@ class RockusbDevice:
         usb = _require_usb()
         dev = self._dev
 
+        # Only configure a device that is not configured already. Issuing
+        # SET_CONFIGURATION to a running usbplug resets the endpoint data
+        # toggles underneath it, after which the next read comes back
+        # [Errno 75] Overflow — the device answers out of step with what the
+        # host asked for. Costly to diagnose, trivial to avoid.
         try:
-            dev.set_configuration()
-        except usb.core.USBError as e:
-            # Already configured is fine; anything else is not.
-            if e.errno not in (16, None):  # EBUSY
-                raise RockusbUsbError(f"cannot configure {self._found}: {e}") from e
-
-        cfg = dev.get_active_configuration()
+            cfg = dev.get_active_configuration()
+        except usb.core.USBError:
+            try:
+                dev.set_configuration()
+            except usb.core.USBError as e:
+                raise RockusbUsbError(
+                    f"cannot configure {self._found}: {e}"
+                ) from e
+            cfg = dev.get_active_configuration()
         for intf in cfg:
             ep_out = usb.util.find_descriptor(
                 intf,
@@ -286,6 +330,7 @@ class RockusbDevice:
 
         try:
             usb.util.claim_interface(dev, number)
+            self._drain_stale_input()
         except usb.core.USBError as e:
             # Give the kernel driver back before bailing out. Leaving it
             # detached would strand the interface for whatever owned it,
@@ -358,6 +403,44 @@ class RockusbDevice:
 
     # -- rockusb bulk stage -----------------------------------------------
 
+    def _drain_stale_input(self) -> None:
+        """Discard anything the device still has queued from a previous run.
+
+        A recovery tool is routinely pointed at a device some earlier attempt
+        abandoned mid-transaction, leaving an unread status wrapper in the
+        pipe. The next command then reads that stale wrapper as its data
+        phase — a 13-byte CSW landing in a 5-byte buffer surfaces as
+        ``[Errno 75] Overflow`` and every command after it desynchronises.
+
+        The serial transports already open by reading until the line goes
+        quiet; this is the same idea one layer down.
+        """
+        if self._ep_in is None:
+            return
+        mps = getattr(self._ep_in, "wMaxPacketSize", 512) or 512
+        for _ in range(8):
+            try:
+                stale = self._ep_in.read(mps, 50)
+            except Exception:
+                return  # nothing waiting: a timeout here is the good outcome
+            if not stale:
+                return
+            logger.debug("discarded %d stale bytes from a previous session", len(stale))
+
+    def _read_bulk(self, length: int) -> bytes:
+        """Read ``length`` bytes from the bulk IN endpoint.
+
+        The request is rounded up to the endpoint's max packet size and the
+        result trimmed. A bulk IN transfer whose buffer is not a multiple of
+        that size fails with ``[Errno 75] Overflow`` the moment the device
+        answers with a full packet — which the usbplug does for short replies
+        like READ_FLASH_ID's five bytes.
+        """
+        mps = getattr(self._ep_in, "wMaxPacketSize", 512) or 512
+        rounded = ((length + mps - 1) // mps) * mps
+        data = bytes(self._ep_in.read(rounded, self._timeout_ms))
+        return data[:length]
+
     def _write_bulk(self, data: bytes, what: str, opcode: Opcode | int) -> None:
         """Push ``data`` out the bulk endpoint, insisting all of it lands.
 
@@ -428,7 +511,7 @@ class RockusbDevice:
         try:
             payload = b""
             if direction_in:
-                payload = bytes(self._ep_in.read(read_length, self._timeout_ms))
+                payload = self._read_bulk(read_length)
             elif data_out:
                 self._write_bulk(data_out, "payload", opcode)
         except RockusbUsbError:
@@ -457,7 +540,7 @@ class RockusbDevice:
                 f"rockusb command {int(opcode):#04x} failed "
                 f"(status {status}, residue {residue})"
             )
-        if residue:
+        if residue and residue_is_meaningful(opcode):
             raise RockusbUsbError(
                 f"rockusb command {int(opcode):#04x} moved "
                 f"{transfer_length - residue} of {transfer_length} bytes "

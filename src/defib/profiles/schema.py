@@ -92,6 +92,16 @@ class SoCProfile(BaseModel):
             "`spl_data` property."
         ),
     )
+    usb_recovery_ids: list[int] = Field(
+        default_factory=list, alias="USB_RECOVERY_IDS",
+        description=(
+            "USB recovery only. Product ids the SoC presents while it is "
+            "actually in a recovery mode. Needed because a running board can "
+            "expose an unrelated gadget under the same vendor id — a Luckfox "
+            "booted into Linux shows 2207:0019 (RNDIS+ADB), which must never "
+            "be mistaken for something waiting to be flashed."
+        ),
+    )
     loader_ddr: str | None = Field(
         default=None, alias="LOADER_DDR",
         description=(

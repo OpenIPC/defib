@@ -49,6 +49,54 @@ class Opcode(IntEnum):
     RESET_DEVICE = 0xFF
 
 
+#: Declared CDB length, which is *not* the 16 bytes the field occupies on the
+#: wire. Commands carrying an address declare 10; the rest declare 6. Sending
+#: 16 makes the usbplug ignore the wrapper outright — the command never lands
+#: and the host waits out its timeout with no error to explain it.
+CDB_LENGTH_SHORT = 6
+CDB_LENGTH_ADDRESSED = 10
+
+_ADDRESSED_OPCODES = frozenset({
+    Opcode.READ_LBA,
+    Opcode.WRITE_LBA,
+    Opcode.ERASE_LBA,
+})
+
+
+def cdb_length(opcode: Opcode | int) -> int:
+    """How long this opcode's command block claims to be."""
+    return (
+        CDB_LENGTH_ADDRESSED
+        if opcode in _ADDRESSED_OPCODES
+        else CDB_LENGTH_SHORT
+    )
+
+
+def residue_is_meaningful(opcode: Opcode | int) -> bool:
+    """Whether this opcode's status wrapper reports a usable residue.
+
+    Mass Storage says residue is a little-endian count of bytes *not*
+    transferred, and on the LBA path an RV1106 usbplug honours that — a
+    full-sector read comes back with residue 0.
+
+    Everything else reports nonsense. Measured::
+
+        TEST_UNIT_READY  transfer 0   residue 0x06000000
+        READ_FLASH_ID    transfer 5   residue 0x05000000
+        READ_CAPABILITY  transfer 8   residue 0x08000000
+        READ_FLASH_INFO  transfer 11  residue 0x0B000000
+        READ_LBA         transfer 512 residue 0
+
+    Those are the transfer lengths written big-endian, i.e. "none of it
+    arrived" — while the data plainly did arrive and is correct. xrock never
+    looks at residue at all, which is presumably why nobody noticed.
+
+    So the check is kept exactly where it earns its keep: the block path, the
+    one place a short transfer means a partially written flash.
+    """
+    return opcode in _ADDRESSED_OPCODES
+
+
 class ResetSubcode(IntEnum):
     """Sub-selector for :attr:`Opcode.RESET_DEVICE`."""
 
@@ -114,7 +162,7 @@ def build_cbw(
             [
                 DIRECTION_IN if direction_in else DIRECTION_OUT,
                 0x00,  # LUN
-                len(cdb),
+                cdb_length(opcode),
             ]
         )
         + cdb

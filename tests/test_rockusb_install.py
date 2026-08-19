@@ -192,6 +192,241 @@ class TestForeignSocImages:
         assert len(_read_usb_payloads(_make_tarball(tmp_path, files), PARTS)) == 2
 
 
+class TestRecoveryIdFilter:
+    """A running Luckfox presents 2207:0019 — an RNDIS+ADB gadget sharing the
+    vendor id, whose bcdUSB of 0x0200 makes it look like MaskROM to the
+    bcdUSB test. Found on real hardware: without a product-id filter, defib
+    would have uploaded a loader into a healthy booted board.
+    """
+
+    class _FakeUsbDevice:
+        def __init__(self, pid, bcd=0x0200, strings=False):
+            self.idProduct = pid
+            self.bcdUSB = bcd
+            # MaskROM ships no string descriptors; anything past it names
+            # itself. Measured on an RV1106: bcdUSB is 0x0200 for both, so
+            # these indices are the only thing separating the two stages.
+            self.iManufacturer = 1 if strings else 0
+            self.iProduct = 2 if strings else 0
+            self.bus = 7
+            self.address = 3
+            self.port_numbers = (1,)
+
+    def _patch(self, monkeypatch, devices):
+        import defib.rockusb.device as mod
+
+        class FakeCore:
+            @staticmethod
+            def find(**kwargs):
+                return list(devices)
+
+        monkeypatch.setattr(mod, "_require_usb", lambda: type("U", (), {"core": FakeCore}))
+
+    def test_runtime_adb_gadget_ignored(self, monkeypatch):
+        from defib.rockusb.device import find_devices
+
+        self._patch(monkeypatch, [self._FakeUsbDevice(0x0019)])
+        assert find_devices(recovery_ids=[0x110C]) == []
+
+    def test_recovery_device_still_found(self, monkeypatch):
+        from defib.rockusb.device import find_devices
+
+        self._patch(monkeypatch, [self._FakeUsbDevice(0x110C)])
+        found = find_devices(recovery_ids=[0x110C])
+        assert len(found) == 1
+        assert found[0].product_id == 0x110C
+
+    def test_recovery_device_picked_out_of_a_mixed_bus(self, monkeypatch):
+        from defib.rockusb.device import find_devices
+
+        self._patch(
+            monkeypatch,
+            [self._FakeUsbDevice(0x0019), self._FakeUsbDevice(0x110C)],
+        )
+        found = find_devices(recovery_ids=[0x110C])
+        assert [d.product_id for d in found] == [0x110C]
+
+    def test_no_ids_means_no_filter(self, monkeypatch):
+        """Back-compat: callers that pass nothing keep the old broad search."""
+        from defib.rockusb.device import find_devices
+
+        self._patch(monkeypatch, [self._FakeUsbDevice(0x0019)])
+        assert len(find_devices()) == 1
+
+    def test_rv1106_profile_declares_the_recovery_id(self):
+        from defib.profiles.loader import load_profile
+
+        assert load_profile("rv1106").usb_recovery_ids == [0x110C]
+
+
+class TestModeClassification:
+    """Measured on an RV1106: both stages report bcdUSB 0x0200, so xrock's
+    low-bit test calls a running usbplug MaskROM. Only the string descriptors
+    tell them apart.
+    """
+
+    def _dev(self, *, strings):
+        return TestRecoveryIdFilter._FakeUsbDevice(0x110C, strings=strings)
+
+    def test_bare_descriptor_is_maskrom(self):
+        from defib.rockusb.device import DeviceMode, _classify
+
+        assert _classify(self._dev(strings=False)) is DeviceMode.MASKROM
+
+    def test_named_device_is_loader(self):
+        from defib.rockusb.device import DeviceMode, _classify
+
+        assert _classify(self._dev(strings=True)) is DeviceMode.LOADER
+
+    def test_bcdusb_is_not_consulted(self):
+        """Both real stages report 0x0200; keying on it regresses the bug."""
+        from defib.rockusb.device import DeviceMode, _classify
+
+        maskrom = TestRecoveryIdFilter._FakeUsbDevice(0x110C, bcd=0x0200, strings=False)
+        loader = TestRecoveryIdFilter._FakeUsbDevice(0x110C, bcd=0x0200, strings=True)
+        assert _classify(maskrom) is DeviceMode.MASKROM
+        assert _classify(loader) is DeviceMode.LOADER
+
+    def test_manufacturer_alone_is_enough(self):
+        from defib.rockusb.device import DeviceMode, _classify
+
+        dev = TestRecoveryIdFilter._FakeUsbDevice(0x110C, strings=False)
+        dev.iManufacturer = 1
+        assert _classify(dev) is DeviceMode.LOADER
+
+
+class TestResidueScope:
+    """Measured on an RV1106 usbplug: residue is only honoured on the LBA
+    path. Everything else reports its transfer length written big-endian —
+    i.e. "none of it arrived" — while the data plainly did arrive.
+    """
+
+    def test_lba_opcodes_are_checked(self):
+        from defib.rockusb.protocol import Opcode, residue_is_meaningful
+
+        for op in (Opcode.READ_LBA, Opcode.WRITE_LBA, Opcode.ERASE_LBA):
+            assert residue_is_meaningful(op)
+
+    def test_other_opcodes_are_not(self):
+        from defib.rockusb.protocol import Opcode, residue_is_meaningful
+
+        for op in (
+            Opcode.TEST_UNIT_READY, Opcode.READ_FLASH_ID,
+            Opcode.READ_CAPABILITY, Opcode.READ_CHIP_INFO,
+            Opcode.READ_FLASH_INFO, Opcode.RESET_DEVICE,
+        ):
+            assert not residue_is_meaningful(op)
+
+    def test_observed_garbage_residues_would_be_ignored(self):
+        """The literal values seen on the bench, each the transfer length
+        byte-swapped. Enforcing residue here would break every probe."""
+        from defib.rockusb.protocol import Opcode, residue_is_meaningful
+
+        observed = {
+            Opcode.TEST_UNIT_READY: 0x06000000,
+            Opcode.READ_FLASH_ID: 0x05000000,
+            Opcode.READ_CAPABILITY: 0x08000000,
+            Opcode.READ_FLASH_INFO: 0x0B000000,
+        }
+        for op, residue in observed.items():
+            assert residue != 0 and not residue_is_meaningful(op)
+
+
+class TestStaleInputDrain:
+    """A recovery tool is routinely pointed at a device an earlier attempt
+    abandoned mid-transaction. The unread status wrapper it left behind gets
+    read as the next command's data phase — 13 bytes into a 5-byte buffer is
+    [Errno 75] Overflow, and everything after it desynchronises.
+    """
+
+    class _Ep:
+        wMaxPacketSize = 512
+
+        def __init__(self, queued):
+            self.queued = list(queued)
+            self.reads = 0
+
+        def read(self, size, timeout=None):
+            self.reads += 1
+            if not self.queued:
+                raise TimeoutError("nothing waiting")
+            return self.queued.pop(0)
+
+    def _device(self, queued):
+        from defib.rockusb.device import RockusbDevice
+
+        found = FoundDevice(
+            mode=DeviceMode.LOADER, bus=1, address=1, product_id=0x110C,
+            handle=None, port_numbers=(1,),
+        )
+        d = RockusbDevice(found)
+        d._ep_in = self._Ep(queued)
+        return d
+
+    def test_stale_bytes_are_discarded(self):
+        d = self._device([b"USBS" + b"\x00" * 9])
+        d._drain_stale_input()
+        assert d._ep_in.queued == []
+
+    def test_drain_stops_at_the_first_timeout(self):
+        d = self._device([])
+        d._drain_stale_input()
+        assert d._ep_in.reads == 1
+
+    def test_drain_is_bounded(self):
+        """A device stuck streaming must not hang the open."""
+        d = self._device([b"x" * 512] * 100)
+        d._drain_stale_input()
+        assert d._ep_in.reads <= 8
+
+    def test_no_endpoint_is_harmless(self):
+        """MaskROM is reached before endpoints are known."""
+        d = self._device([])
+        d._ep_in = None
+        d._drain_stale_input()
+
+
+class TestBulkReadRounding:
+    """Bulk IN buffers must be a multiple of the endpoint's max packet size."""
+
+    class _Ep:
+        wMaxPacketSize = 512
+
+        def __init__(self):
+            self.requested = None
+
+        def read(self, size, timeout=None):
+            self.requested = size
+            return b"\x5a" * size
+
+    def _device(self):
+        from defib.rockusb.device import RockusbDevice
+
+        found = FoundDevice(
+            mode=DeviceMode.LOADER, bus=1, address=1, product_id=0x110C,
+            handle=None, port_numbers=(1,),
+        )
+        d = RockusbDevice(found)
+        d._ep_in = self._Ep()
+        return d
+
+    def test_short_read_is_rounded_up(self):
+        d = self._device()
+        out = d._read_bulk(5)
+        assert d._ep_in.requested == 512
+        assert len(out) == 5
+
+    def test_exact_multiple_is_unchanged(self):
+        d = self._device()
+        d._read_bulk(1024)
+        assert d._ep_in.requested == 1024
+
+    def test_partial_sector_rounds_to_next_packet(self):
+        d = self._device()
+        d._read_bulk(513)
+        assert d._ep_in.requested == 1024
+
+
 class TestResidueHandling:
     """A device may move less than asked and still report status OK."""
 

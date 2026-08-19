@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from typing import Callable
 
 from defib.recovery.events import ProgressEvent, Stage
@@ -61,6 +62,7 @@ class RockchipRecovery:
         on_progress: Callable[[ProgressEvent], None] | None = None,
         reenumerate_timeout: float = 15.0,
         usb_path: str | None = None,
+        recovery_ids: Sequence[int] | None = None,
     ) -> RockusbDevice:
         """Upload DDR init then usbplug, and wait for the device to come back.
 
@@ -95,7 +97,8 @@ class RockchipRecovery:
         await asyncio.sleep(USBPLUG_SETTLE)
 
         found = await wait_for_device(
-            timeout=reenumerate_timeout, mode=DeviceMode.LOADER, usb_path=usb_path
+            timeout=reenumerate_timeout, mode=DeviceMode.LOADER,
+            usb_path=usb_path, recovery_ids=recovery_ids,
         )
         device = RockusbDevice(found)
         device.open()

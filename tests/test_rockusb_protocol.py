@@ -55,10 +55,33 @@ class TestBuildCbw:
         assert build_cbw(1, Opcode.READ_LBA, count=1, direction_in=True)[12] == DIRECTION_IN
         assert build_cbw(1, Opcode.WRITE_LBA, count=1)[12] == DIRECTION_OUT
 
-    def test_lun_and_cdb_length(self):
-        cbw = build_cbw(1, Opcode.TEST_UNIT_READY)
-        assert cbw[13] == 0  # LUN
-        assert cbw[14] == 16  # CDB length
+    def test_lun(self):
+        assert build_cbw(1, Opcode.TEST_UNIT_READY)[13] == 0
+
+    @pytest.mark.parametrize(
+        "opcode,expected",
+        [
+            (Opcode.TEST_UNIT_READY, 6),
+            (Opcode.READ_FLASH_ID, 6),
+            (Opcode.READ_CAPABILITY, 6),
+            (Opcode.READ_CHIP_INFO, 6),
+            (Opcode.READ_FLASH_INFO, 6),
+            (Opcode.RESET_DEVICE, 6),
+            (Opcode.READ_LBA, 10),
+            (Opcode.WRITE_LBA, 10),
+            (Opcode.ERASE_LBA, 10),
+        ],
+    )
+    def test_declared_cdb_length(self, opcode, expected):
+        """Commands carrying an address declare 10, the rest 6 — never the 16
+        bytes the field actually occupies. Measured against a real usbplug:
+        declaring 16 makes it ignore the wrapper and the host just times out.
+        """
+        assert build_cbw(1, opcode, count=1)[14] == expected
+
+    def test_cdb_block_is_still_16_bytes_on_the_wire(self):
+        """The declared length shrinks; the wrapper does not."""
+        assert len(build_cbw(1, Opcode.TEST_UNIT_READY)) == CBW_LENGTH
 
     def test_opcode_and_subcode_placement(self):
         cbw = build_cbw(1, Opcode.RESET_DEVICE, subcode=int(ResetSubcode.MASKROM))
