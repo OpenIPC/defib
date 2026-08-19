@@ -1,126 +1,15 @@
-"""Tests for USB-recovery tarball handling and device selection.
+"""Tests for Rockchip USB device selection and transport behaviour.
 
-These cover the guards that stop a flash going wrong in a way the operator
-would not notice: a truncated tarball, a corrupted image, an oversized one, a
-partial transfer the device reported as OK, or the wrong board entirely.
+Most of what is pinned here was learnt from a Luckfox Pico Max on the bench:
+which device on the bus is actually a recovery target, which stage it is in,
+and the several ways an inherited or half-finished transaction makes a
+healthy board look dead.
 """
 
-import hashlib
-import io
-import tarfile
-
 import pytest
-import typer
 
-from defib.cli.app import _read_usb_payloads
-from defib.profiles.schema import FlashPartition
 from defib.rockusb.device import DeviceMode, FoundDevice
 from defib.rockusb.protocol import CSW_SIGNATURE, Opcode
-
-PARTS = {
-    "idblock": FlashPartition(lba=512, sectors=512),
-    "uboot": FlashPartition(lba=1024, sectors=1024),
-    "boot": FlashPartition(lba=2048, sectors=8192),
-    "rootfs": FlashPartition(lba=92160, sectors=163840),
-}
-
-
-def _make_tarball(tmp_path, files: dict[str, bytes], *, checksums=True, corrupt=()):
-    """Build an OpenIPC-shaped tarball, optionally with bad checksums."""
-    path = tmp_path / "fw.tgz"
-    with tarfile.open(path, "w:gz") as tar:
-        for name, data in files.items():
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
-            if not checksums:
-                continue
-            digest = hashlib.md5(data).hexdigest()
-            if name in corrupt:
-                digest = "0" * 32
-            line = f"{digest}  {name}\n".encode()
-            sig = tarfile.TarInfo(f"{name}.md5sum")
-            sig.size = len(line)
-            tar.addfile(sig, io.BytesIO(line))
-    return path
-
-
-def _complete(**overrides) -> dict[str, bytes]:
-    files = {
-        "zboot.img.rv1106": b"\xaa" * 2048,
-        "rootfs.squashfs.rv1106": b"\xbb" * 4096,
-    }
-    files.update(overrides)
-    return files
-
-
-class TestReadUsbPayloads:
-    def test_reads_a_complete_tarball(self, tmp_path):
-        payloads = _read_usb_payloads(_make_tarball(tmp_path, _complete()), PARTS)
-        assert [(n, p) for n, p, _, _ in payloads] == [
-            ("zboot.img.rv1106", "boot"),
-            ("rootfs.squashfs.rv1106", "rootfs"),
-        ]
-
-    def test_returns_image_bytes(self, tmp_path):
-        payloads = _read_usb_payloads(_make_tarball(tmp_path, _complete()), PARTS)
-        assert dict((n, d) for n, _, _, d in payloads)["zboot.img.rv1106"] == b"\xaa" * 2048
-
-    def test_missing_rootfs_refused(self, tmp_path):
-        """Half a firmware written and called a success leaves an unbootable
-        board — the UART installer rejects this too."""
-        tar = _make_tarball(tmp_path, {"zboot.img.rv1106": b"\xaa" * 16})
-        with pytest.raises(typer.BadParameter, match="no image for rootfs"):
-            _read_usb_payloads(tar, PARTS)
-
-    def test_missing_kernel_refused(self, tmp_path):
-        tar = _make_tarball(tmp_path, {"rootfs.squashfs.rv1106": b"\xbb" * 16})
-        with pytest.raises(typer.BadParameter, match="no image for boot"):
-            _read_usb_payloads(tar, PARTS)
-
-    def test_empty_tarball_refused(self, tmp_path):
-        tar = _make_tarball(tmp_path, {"README": b"nothing here"})
-        with pytest.raises(typer.BadParameter, match="maps to a partition"):
-            _read_usb_payloads(tar, PARTS)
-
-    def test_idblock_ordered_last(self, tmp_path):
-        files = _complete()
-        files["idblock.img.rv1106"] = b"\xcc" * 512
-        payloads = _read_usb_payloads(_make_tarball(tmp_path, files), PARTS)
-        assert [p for _, p, _, _ in payloads][-1] == "idblock"
-
-
-class TestChecksums:
-    def test_corrupted_image_refused(self, tmp_path):
-        """--verify compares flash against what was sent, so it cannot catch a
-        bad download; only the shipped md5sum can."""
-        tar = _make_tarball(tmp_path, _complete(), corrupt=("zboot.img.rv1106",))
-        with pytest.raises(typer.BadParameter, match="MD5 mismatch"):
-            _read_usb_payloads(tar, PARTS)
-
-    def test_error_names_both_digests(self, tmp_path):
-        tar = _make_tarball(tmp_path, _complete(), corrupt=("zboot.img.rv1106",))
-        with pytest.raises(typer.BadParameter) as excinfo:
-            _read_usb_payloads(tar, PARTS)
-        message = str(excinfo.value)
-        assert "0" * 32 in message
-        assert hashlib.md5(b"\xaa" * 2048).hexdigest() in message
-
-    def test_tarball_without_checksums_still_works(self, tmp_path):
-        """Absent checksums are not an error — only mismatching ones are."""
-        tar = _make_tarball(tmp_path, _complete(), checksums=False)
-        assert len(_read_usb_payloads(tar, PARTS)) == 2
-
-
-class TestBounds:
-    def test_oversized_image_refused(self, tmp_path):
-        files = _complete(**{"zboot.img.rv1106": b"\xaa" * (PARTS["boot"].size_bytes + 1)})
-        with pytest.raises(typer.BadParameter, match="would overwrite"):
-            _read_usb_payloads(_make_tarball(tmp_path, files), PARTS)
-
-    def test_exactly_full_partition_accepted(self, tmp_path):
-        files = _complete(**{"zboot.img.rv1106": b"\xaa" * PARTS["boot"].size_bytes})
-        assert len(_read_usb_payloads(_make_tarball(tmp_path, files), PARTS)) == 2
 
 
 class TestFoundDevice:
@@ -152,44 +41,6 @@ class TestFoundDevice:
 
     def test_str_mentions_the_path(self):
         assert "1-4.2" in str(self._dev())
-
-
-class TestForeignSocImages:
-    """The SoC suffix is the only thing distinguishing an image built for this
-    board from one that would leave it unbootable."""
-
-    def test_foreign_suffix_refused(self, tmp_path):
-        files = {
-            "zboot.img.hi3516ev300": b"\xaa" * 2048,
-            "rootfs.squashfs.hi3516ev300": b"\xbb" * 4096,
-        }
-        with pytest.raises(typer.BadParameter, match="built for 'hi3516ev300'"):
-            _read_usb_payloads(_make_tarball(tmp_path, files), PARTS, "rv1106")
-
-    def test_error_names_the_expected_chip(self, tmp_path):
-        files = {"zboot.img.hi3516ev300": b"\xaa" * 16}
-        with pytest.raises(typer.BadParameter, match="not 'rv1106'"):
-            _read_usb_payloads(_make_tarball(tmp_path, files), PARTS, "rv1106")
-
-    def test_matching_suffix_accepted(self, tmp_path):
-        payloads = _read_usb_payloads(
-            _make_tarball(tmp_path, _complete()), PARTS, "rv1106"
-        )
-        assert len(payloads) == 2
-
-    def test_suffix_match_is_case_insensitive(self, tmp_path):
-        payloads = _read_usb_payloads(
-            _make_tarball(tmp_path, _complete()), PARTS, "RV1106"
-        )
-        assert len(payloads) == 2
-
-    def test_no_chip_given_skips_the_check(self, tmp_path):
-        """Callers that genuinely do not know the SoC keep the old behaviour."""
-        files = {
-            "zboot.img.whatever": b"\xaa" * 16,
-            "rootfs.squashfs.whatever": b"\xbb" * 16,
-        }
-        assert len(_read_usb_payloads(_make_tarball(tmp_path, files), PARTS)) == 2
 
 
 class TestRecoveryIdFilter:

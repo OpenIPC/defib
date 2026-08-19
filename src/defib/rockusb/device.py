@@ -330,6 +330,7 @@ class RockusbDevice:
 
         try:
             usb.util.claim_interface(dev, number)
+            self._clear_stalls()
             self._drain_stale_input()
         except usb.core.USBError as e:
             # Give the kernel driver back before bailing out. Leaving it
@@ -402,6 +403,29 @@ class RockusbDevice:
             ) from e
 
     # -- rockusb bulk stage -----------------------------------------------
+
+    def _clear_stalls(self) -> None:
+        """Clear a halt condition left on either endpoint.
+
+        The other half of inheriting a device from an abandoned attempt: a
+        transfer that failed part-way can leave an endpoint halted, and every
+        subsequent transfer on it then times out — including the very first
+        command wrapper, which makes the device look dead rather than merely
+        out of step.
+
+        Best-effort. A device that has genuinely gone away will fail here and
+        that is fine; the caller finds out on the next real transfer.
+        """
+        for ep in (self._ep_out, self._ep_in):
+            if ep is None:
+                continue
+            try:
+                ep.clear_halt()
+            except Exception:
+                logger.debug(
+                    "could not clear halt on endpoint %#04x",
+                    ep.bEndpointAddress, exc_info=True,
+                )
 
     def _drain_stale_input(self) -> None:
         """Discard anything the device still has queued from a previous run.

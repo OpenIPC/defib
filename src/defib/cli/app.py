@@ -2113,27 +2113,17 @@ def install(
     ),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
-    ddr: str = typer.Option("", "--ddr", help="USB-recovery chips: DDR-init blob (rkbin rv1106_ddr_*.bin)"),
-    usbplug: str = typer.Option("", "--usbplug", help="USB-recovery chips: usbplug blob (rkbin rv1106_usbplug_*.bin)"),
-    loader: str = typer.Option("", "--loader", help="USB-recovery chips: RKBOOT container (MiniLoaderAll.bin), instead of --ddr/--usbplug"),
-    wait: float = typer.Option(30.0, "--wait", help="USB-recovery chips: seconds to wait for the board to enumerate"),
-    verify: bool = typer.Option(False, "--verify", help="USB-recovery chips: read each image back and compare"),
-    usb_path: str = typer.Option("", "--usb-path", help="USB-recovery chips: pin to one physical port path (e.g. 1-4.2); required when several Rockchip boards are attached"),
 ) -> None:
-    """Install a full OpenIPC firmware (U-Boot + kernel + rootfs).
+    """Install a full OpenIPC firmware (U-Boot + kernel + rootfs) via UART + TFTP.
 
-    For UART chips: extracts the tarball, burns U-Boot to RAM via the boot
-    ROM, then TFTPs kernel and rootfs to U-Boot, which flashes them.
-
-    For chips whose boot ROM only answers on USB (Rockchip), -p and the TFTP
-    options do not apply — pass --ddr/--usbplug (or --loader) and the images
-    are written straight to flash over USB.
+    Extracts the firmware tarball, burns U-Boot to RAM via boot ROM,
+    then uses TFTP to transfer kernel and rootfs to U-Boot which
+    flashes them to NOR or NAND.
     """
     import asyncio
     asyncio.run(_install_async(
         chip, firmware, port, power_cycle, poe_port_override, nic, host_ip, device_ip,
         tftp_port, nor_size, nand, wipe_env, tftp_via, output, debug,
-        ddr, usbplug, loader, wait, verify, usb_path,
     ))
 
 
@@ -2210,12 +2200,6 @@ async def _install_async(
     tftp_via: str,
     output: str,
     debug: bool,
-    ddr: str = "",
-    usbplug: str = "",
-    loader: str = "",
-    wait: float = 30.0,
-    verify: bool = False,
-    usb_path: str = "",
 ) -> None:
     import hashlib
     import json as json_mod
@@ -2249,11 +2233,15 @@ async def _install_async(
         logging.basicConfig(level=logging.INFO)
 
     if recovery_mode(chip) == "usb":
-        await _install_usb_async(
-            chip, firmware_path, ddr, usbplug, loader,
-            power_cycle, output, wait, verify, poe_port_override, usb_path,
+        # Writing flash over USB is not landed yet: this chip's images have
+        # nowhere correct to go until the UBI-vs-raw rootfs question is
+        # settled, and the write path has never run against hardware. Wake
+        # the board with `burn` and flash it by other means meanwhile.
+        console.print(
+            f"[red]{chip} recovers over USB, and `install` does not support "
+            "that yet — use `defib burn` to bring the board up.[/red]"
         )
-        return
+        raise typer.Exit(1)
 
     if nand:
         layout = _NAND_LAYOUT
@@ -3817,240 +3805,6 @@ async def _burn_usb_async(
             "\n[green bold]Device is awake.[/green bold] Flash it with: "
             f"defib install -c {chip} --firmware <image>"
         )
-
-
-# Which partition each OpenIPC image belongs in, for USB-recovery chips.
-# Keyed on the filename stem the tarball uses before the ``.<soc>`` suffix.
-_USB_IMAGE_PARTITIONS = {
-    "zboot.img": "boot",
-    "rootfs.squashfs": "rootfs",
-    "uboot.img": "uboot",
-    "idblock.img": "idblock",
-}
-
-# A firmware install is only complete with both of these. Writing a rootfs
-# without the kernel beside it leaves an unbootable board that this command
-# would otherwise call a success.
-_USB_REQUIRED_PARTITIONS = ("boot", "rootfs")
-
-# Written last, whatever order the tarball lists things in. The boot ROM falls
-# into MaskROM precisely because it finds no valid IDB, so committing the
-# idblock before everything else is on flash trades the recovery path away: a
-# failure after that point leaves a board that boots into a broken image
-# instead of one that can be re-flashed over USB.
-_USB_WRITE_LAST = ("idblock",)
-
-
-def _map_usb_images(
-    names: list[str], partitions: dict[str, Any], chip: str = "",
-) -> list[tuple[str, str, Any]]:
-    """Match tarball members to partitions, in a safe write order.
-
-    Returns ``(member, partition, extent)`` triples.
-
-    Args:
-        names: tarball member names, e.g. ``zboot.img.rv1106``.
-        partitions: the chip profile's partition table.
-        chip: when given, the SoC suffix every member must carry. OpenIPC
-            names each image for the SoC it was built for, and that suffix is
-            the only thing separating an RV1106 kernel from one that would
-            leave this board unbootable.
-
-    Raises:
-        typer.BadParameter: if a member cannot be placed, or was built for a
-            different SoC. The UBI case is called out by name because it is
-            not a mapping gap but a real layout question: ``rootfs.ubi``
-            bundles kernel *and* rootfs as UBI volumes, so it does not
-            correspond to any single partition in the vendor table.
-    """
-    mapped: list[tuple[str, str, Any]] = []
-    for name in names:
-        stem, _, suffix = name.rpartition(".")
-        if not stem:
-            stem, suffix = name, ""
-        partition = _USB_IMAGE_PARTITIONS.get(stem)
-        if partition is None:
-            if stem.startswith("rootfs.ubi"):
-                raise typer.BadParameter(
-                    f"{name} is a UBI image holding both kernel and rootfs "
-                    "volumes, so it has no single partition to go in. Use the "
-                    "nor-style tarball (zboot.img + rootfs.squashfs), or "
-                    "decide the UBI region for this board first."
-                )
-            continue
-        if chip and suffix.lower() != chip.lower():
-            raise typer.BadParameter(
-                f"{name} was built for '{suffix}', not '{chip}' — flashing "
-                "another SoC's image would leave this board unbootable"
-            )
-        if partition not in partitions:
-            raise typer.BadParameter(
-                f"{name} belongs in partition '{partition}', which this "
-                f"chip's profile does not declare. Known: "
-                f"{', '.join(sorted(partitions)) or '(none)'}"
-            )
-        mapped.append((name, partition, partitions[partition]))
-
-    mapped.sort(key=lambda item: item[1] in _USB_WRITE_LAST)
-    return mapped
-
-
-def _check_usb_image_fits(name: str, partition: str, extent: Any, size: int) -> None:
-    """Reject an image too big for the partition it is bound for.
-
-    Raises:
-        typer.BadParameter: if it would spill past the end. The usbplug takes
-            a start sector and a count and writes what it is told, so an
-            oversized image quietly runs on into whatever follows.
-    """
-    if size > extent.size_bytes:
-        raise typer.BadParameter(
-            f"{name} is {size} bytes but partition '{partition}' holds "
-            f"{extent.size_bytes} — it would overwrite whatever follows"
-        )
-
-
-def _read_usb_payloads(
-    tar_path: Any, partitions: dict[str, Any], chip: str = "",
-) -> list[tuple[str, str, Any, bytes]]:
-    """Extract, checksum and bounds-check every image the tarball places.
-
-    Returns ``(member, partition, extent, data)`` in write order.
-    """
-    import hashlib
-    import tarfile
-
-    with tarfile.open(tar_path) as tar:
-        members = [m for m in tar.getmembers() if m.isfile()]
-        names = [m.name for m in members if not m.name.endswith(".md5sum")]
-        targets = _map_usb_images(names, partitions, chip)
-        if not targets:
-            raise typer.BadParameter(
-                f"nothing in {tar_path.name} maps to a partition "
-                f"(saw: {', '.join(names) or 'no files'})"
-            )
-
-        placed = {partition for _, partition, _ in targets}
-        missing = [p for p in _USB_REQUIRED_PARTITIONS if p not in placed]
-        if missing:
-            raise typer.BadParameter(
-                f"{tar_path.name} has no image for {', '.join(missing)} — "
-                "a firmware install needs both a kernel and a rootfs, and "
-                "writing one without the other leaves an unbootable board"
-            )
-
-        def _member(name: str) -> bytes:
-            handle = tar.extractfile(name)
-            if handle is None:
-                raise typer.BadParameter(f"cannot read {name} from {tar_path.name}")
-            return handle.read()
-
-        # The tarball ships a .md5sum beside each image. --verify only proves
-        # flash matches what we sent, so without this a corrupted download
-        # would be written and confirmed against its own corruption.
-        expected: dict[str, str] = {}
-        for member in members:
-            if not member.name.endswith(".md5sum"):
-                continue
-            line = _member(member.name).decode(errors="replace").strip()
-            if line:
-                expected[member.name.removesuffix(".md5sum")] = line.split()[0]
-
-        payloads: list[tuple[str, str, Any, bytes]] = []
-        for name, partition, extent in targets:
-            data = _member(name)
-            digest = expected.get(name)
-            if digest is not None:
-                actual = hashlib.md5(data).hexdigest()
-                if actual != digest:
-                    raise typer.BadParameter(
-                        f"MD5 mismatch for {name}: expected {digest}, got {actual}"
-                    )
-            _check_usb_image_fits(name, partition, extent, len(data))
-            payloads.append((name, partition, extent, data))
-
-    return payloads
-
-
-async def _install_usb_async(
-    chip: str, firmware_path: str, ddr: str, usbplug: str, loader: str,
-    power_cycle: bool, output: str, wait: float, verify: bool,
-    poe_port_override: str = "", usb_path: str = "",
-) -> None:
-    """``install`` for chips whose boot ROM only answers on USB.
-
-    The usbplug runs Rockchip's FTL, so flash is a flat array of 512-byte
-    sectors here — bad blocks and ECC are handled device-side and there is no
-    TFTP or U-Boot console in the path at all.
-    """
-    import json as json_mod
-    import tarfile
-    from pathlib import Path
-
-    from rich.console import Console
-
-    from defib.profiles.loader import load_profile
-    from defib.rockusb.loader import LoaderFormatError
-    from defib.rockusb.protocol import SECTOR_SIZE, ResetSubcode, RockusbError
-
-    console = Console()
-    profile = load_profile(chip)
-    partitions = profile.partitions
-
-    tar_path = Path(firmware_path)
-    if not tar_path.exists():
-        raise typer.BadParameter(f"firmware not found: {firmware_path}")
-
-    # In JSON mode every failure has to arrive as a structured event, so
-    # archive and validation errors are funnelled through _usb_fail rather
-    # than surfacing as Typer's own text (or, for a corrupt archive, a
-    # traceback). Human mode keeps Typer's nicer rendering.
-    try:
-        payloads = _read_usb_payloads(tar_path, partitions, chip)
-    except (typer.BadParameter, tarfile.TarError, OSError) as e:
-        if output != "json":
-            raise
-        _usb_fail(output, str(e))
-        return
-
-    try:
-        blobs = _resolve_usb_loader(chip, ddr, usbplug, loader)
-        recovery = await _open_usb_target(
-            blobs, power_cycle, output, wait, poe_port_override, usb_path,
-            profile.usb_recovery_ids,
-        )
-        flash_id = await recovery.read_flash_id()
-        if output == "human":
-            console.print(f"  Flash ID: {flash_id.hex()}")
-
-        for name, partition, extent, data in payloads:
-            if output == "human":
-                console.print(
-                    f"  Writing {name} -> {partition} "
-                    f"(LBA {extent.lba}, {len(data)} bytes)..."
-                )
-            await recovery.write_image(
-                extent.lba, data, on_progress=_usb_progress_printer(output)
-            )
-            if verify:
-                sectors = (len(data) + SECTOR_SIZE - 1) // SECTOR_SIZE
-                read_back = await recovery.read_image(extent.lba, sectors)
-                if read_back[: len(data)] != data:
-                    _usb_fail(output, f"verify failed for {name} at LBA {extent.lba}")
-                if output == "human":
-                    console.print("    Verified")
-
-        await recovery.reset(ResetSubcode.NORMAL)
-    except (RockusbError, LoaderFormatError, OSError) as e:
-        _usb_fail(output, str(e))
-        return
-
-    if output == "json":
-        print(json_mod.dumps({
-            "event": "done", "success": True, "images": len(payloads),
-        }))
-    else:
-        console.print("\n[green bold]Install complete![/green bold] Device is rebooting.")
 
 
 def main() -> None:
