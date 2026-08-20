@@ -30,9 +30,12 @@ from defib.rockusb.device import (
 from defib.rockusb.loader import LoaderBlobs
 from defib.rockusb.maskrom import CODE_471, CODE_472, build_maskrom_chunks
 from defib.rockusb.protocol import (
+    FLASH_INFO_LENGTH,
     SECTOR_SIZE,
+    FlashInfo,
     Opcode,
     ResetSubcode,
+    parse_flash_info,
     split_lba_transfers,
 )
 
@@ -187,6 +190,45 @@ class RockchipRecovery:
                 read_length=count * SECTOR_SIZE,
             )
         return bytes(out)
+
+    async def read_flash_info(self) -> FlashInfo:
+        """Capacity and geometry as the FTL sees it."""
+        return parse_flash_info(
+            await asyncio.to_thread(
+                self._device.command,
+                Opcode.READ_FLASH_INFO,
+                read_length=FLASH_INFO_LENGTH,
+            )
+        )
+
+    async def dump_image(
+        self,
+        start_lba: int,
+        sectors: int,
+        sink: Callable[[bytes], None],
+        on_progress: Callable[[ProgressEvent], None] | None = None,
+    ) -> int:
+        """Read ``sectors`` sectors, handing each chunk straight to ``sink``.
+
+        Streams rather than returning bytes: a full RV1106 dump is 255 MiB,
+        and holding that in memory to write it out again helps nobody.
+
+        Returns the number of bytes read.
+        """
+        done = 0
+        total = sectors * SECTOR_SIZE
+        for lba, count in split_lba_transfers(start_lba, sectors):
+            chunk = await asyncio.to_thread(
+                self._device.command,
+                Opcode.READ_LBA,
+                address=lba,
+                count=count,
+                read_length=count * SECTOR_SIZE,
+            )
+            sink(chunk)
+            done += len(chunk)
+            _emit(on_progress, ProgressEvent(Stage.FLASH_READ, done, total, f"lba {lba}"))
+        return done
 
     async def read_flash_id(self) -> bytes:
         """Flash ID bytes — a cheap "is the usbplug really alive" probe."""

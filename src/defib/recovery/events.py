@@ -23,6 +23,7 @@ class Stage(str, Enum):
     # block writes it enables.
     USBPLUG = "usbplug"
     FLASH_WRITE = "flash_write"
+    FLASH_READ = "flash_read"
     COMPLETE = "complete"
 
 
