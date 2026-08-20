@@ -24,19 +24,30 @@ def burn(
     poe_port_override: str = typer.Option("", "--poe-port", help="Explicit MikroTik ether port (e.g. ether3) — overrides comment-based auto-discovery. Requires --power-cycle."),
     output: str = typer.Option("human", "--output", help="Output mode: human, json, quiet"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
+    ddr: str = typer.Option("", "--ddr", help="USB-recovery chips: DDR-init blob (rkbin rv1106_ddr_*.bin)"),
+    usbplug: str = typer.Option("", "--usbplug", help="USB-recovery chips: usbplug blob (rkbin rv1106_usbplug_*.bin)"),
+    loader: str = typer.Option("", "--loader", help="USB-recovery chips: RKBOOT container (MiniLoaderAll.bin), instead of --ddr/--usbplug"),
+    wait: float = typer.Option(30.0, "--wait", help="USB-recovery chips: seconds to wait for the board to enumerate"),
+    usb_path: str = typer.Option("", "--usb-path", help="USB-recovery chips: pin to one physical port path (e.g. 1-4.2); required when several Rockchip boards are attached"),
 ) -> None:
-    """Recover a device by uploading firmware via UART serial.
+    """Wake a dead device so its flash can be written.
 
-    If no firmware file is specified with -f, automatically downloads
-    the appropriate U-Boot from OpenIPC releases.
+    For most chips this uploads U-Boot into RAM over UART; if no file is
+    given with -f the right one is downloaded from OpenIPC.
+
+    Chips whose boot ROM only answers on USB (Rockchip) instead take
+    --ddr/--usbplug (or --loader) and ignore -p: an erased flash drops them
+    into MaskROM on its own at power-up, so --power-cycle is all it takes.
     """
     import asyncio
-    asyncio.run(_burn_async(chip, file, port, send_break, terminal, power_cycle, poe_port_override, output, debug))
+    asyncio.run(_burn_async(chip, file, port, send_break, terminal, power_cycle, poe_port_override, output, debug, ddr, usbplug, loader, wait, usb_path))
 
 
 async def _burn_async(
     chip: str, file: str, port: str, send_break: bool, terminal: bool,
     power_cycle: bool, poe_port_override: str, output: str, debug: bool,
+    ddr: str = "", usbplug: str = "", loader: str = "", wait: float = 30.0,
+    usb_path: str = "",
 ) -> None:
     import json as json_mod
     import logging
@@ -53,6 +64,13 @@ async def _burn_async(
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.INFO)
+
+    if _recovery_mode_or_exit(chip, output) == "usb":
+        await _burn_usb_async(
+            chip, ddr, usbplug, loader, power_cycle, output, wait,
+            poe_port_override, usb_path,
+        )
+        return
 
     # Resolve firmware: local file or auto-download from OpenIPC
     firmware_path = file
@@ -2212,6 +2230,19 @@ async def _install_async(
     else:
         logging.basicConfig(level=logging.INFO)
 
+    if _recovery_mode_or_exit(chip, output) == "usb":
+        # Writing flash over USB is not landed yet: this chip's images have
+        # nowhere correct to go until the UBI-vs-raw rootfs question is
+        # settled, and the write path has never run against hardware. Wake
+        # the board with `burn` and flash it by other means meanwhile.
+        # Routed through _usb_fail so --output json still gets an event.
+        _usb_fail(
+            output,
+            f"{chip} recovers over USB, and `install` does not support that "
+            "yet — use `defib burn` to bring the board up.",
+        )
+        return
+
     if nand:
         layout = _NAND_LAYOUT
         flash_cmd = "nand"
@@ -3609,6 +3640,195 @@ async def _restore_async(
         console.print("\n[green bold]Restore complete![/green bold] Device is rebooting.")
     elif output == "json":
         print(json_mod.dumps({"event": "done", "success": True, "partitions": len(partitions)}))
+
+
+def _recovery_mode_or_exit(chip: str, output: str) -> str:
+    """Resolve how ``chip`` is recovered, reporting profile problems cleanly.
+
+    ``recovery_mode`` deliberately lets a bad variant or malformed profile
+    propagate rather than defaulting to UART, so this turns that into a
+    message rather than a traceback.
+    """
+    from defib.profiles.loader import recovery_mode
+
+    try:
+        return recovery_mode(chip)
+    except ValueError as e:
+        _usb_fail(output, str(e))
+        raise AssertionError("unreachable") from e  # pragma: no cover
+
+
+def _usb_progress_printer(output: str) -> Any:
+    """Progress callback that emits JSON lines, or nothing in other modes."""
+    import json as json_mod
+
+    from defib.recovery.events import ProgressEvent
+
+    def on_progress(event: ProgressEvent) -> None:
+        if output == "json":
+            print(json_mod.dumps({
+                "event": "progress", "stage": event.stage.value,
+                "sent": event.bytes_sent, "total": event.bytes_total,
+                "percent": round(event.percent, 1),
+            }), flush=True)
+
+    return on_progress
+
+
+def _resolve_usb_loader(chip: str, ddr: str, usbplug: str, loader: str) -> Any:
+    """Build the MaskROM loader blobs for a USB-recovery chip.
+
+    ``--loader`` takes an RKBOOT container; ``--ddr``/``--usbplug`` take the
+    two bare images. Both forms exist because the blobs Rockchip publishes for
+    RV1106 carry no container header — which is exactly what ``rkdeveloptool
+    db`` refuses to load.
+
+    Neither is bundled: they are vendor binaries, so the profile records only
+    the filenames it expects and the user supplies them.
+    """
+    from pathlib import Path
+
+    from defib.profiles.loader import load_profile
+    from defib.rockusb.loader import parse_loader, raw_blobs
+
+    if loader:
+        return parse_loader(Path(loader).read_bytes())
+    if ddr and usbplug:
+        return raw_blobs(Path(ddr).read_bytes(), Path(usbplug).read_bytes())
+
+    profile = load_profile(chip)
+    expected = " and ".join(
+        n for n in (profile.loader_ddr, profile.loader_usbplug) if n
+    )
+    raise typer.BadParameter(
+        f"{chip} recovers over USB and needs its vendor loader blobs: pass "
+        f"--ddr and --usbplug (expected {expected}), or --loader for an "
+        "RKBOOT container."
+    )
+
+
+async def _open_usb_target(
+    blobs: Any, power_cycle: bool, output: str, wait: float,
+    poe_port_override: str = "", usb_path: str = "",
+    recovery_ids: Any = None,
+) -> Any:
+    """Power-cycle if asked, catch the board, and get its usbplug running.
+
+    Returns a ``RockchipRecovery`` ready to touch flash.
+    """
+    from rich.console import Console
+
+    from defib.rockusb.device import DeviceMode, RockusbDevice, wait_for_device
+    from defib.rockusb.recovery import RockchipRecovery
+
+    console = Console()
+
+    if power_cycle:
+        from defib.power.factory import power_controller_from_env
+
+        controller = power_controller_from_env()
+        if output == "human":
+            console.print(f"  Power-cycling via {controller.name()}...")
+        try:
+            await controller.power_cycle(poe_port_override)
+        finally:
+            await controller.close()
+
+    found = await wait_for_device(
+        timeout=wait, usb_path=usb_path or None, recovery_ids=recovery_ids
+    )
+    if output == "human":
+        console.print(f"  Found {found}")
+
+    device = RockusbDevice(found)
+    device.open()
+    recovery = RockchipRecovery(device)
+
+    if found.mode is DeviceMode.MASKROM:
+        if output == "human":
+            console.print("  Uploading DDR init and usbplug...")
+        # Pin re-enumeration to the port this board is plugged into, so a
+        # second board appearing mid-upload cannot be adopted instead.
+        await recovery.download_boot(
+            blobs,
+            on_progress=_usb_progress_printer(output),
+            usb_path=found.usb_path,
+            recovery_ids=recovery_ids,
+        )
+
+    return recovery
+
+
+def _usb_fail(output: str, message: str) -> None:
+    """Report a USB-recovery failure and exit non-zero."""
+    import json as json_mod
+
+    from rich.console import Console
+    from rich.markup import escape
+
+    if output == "json":
+        print(json_mod.dumps({"event": "error", "message": message}))
+    else:
+        # Escaped: messages carry file paths and the "defib[rockchip]" install
+        # hint, either of which Rich would read as markup.
+        Console().print(f"[red]{escape(message)}[/red]")
+    raise typer.Exit(1)
+
+
+async def _burn_usb_async(
+    chip: str, ddr: str, usbplug: str, loader: str,
+    power_cycle: bool, output: str, wait: float,
+    poe_port_override: str = "", usb_path: str = "",
+) -> None:
+    """``burn`` for chips whose boot ROM only answers on USB.
+
+    The UART path uploads U-Boot into RAM; the USB equivalent is getting the
+    usbplug running, after which flash is writable. It stops there — writing
+    images is ``install``'s job.
+    """
+    import json as json_mod
+
+    from rich.console import Console
+
+    from defib.profiles.loader import load_profile
+    from defib.rockusb.loader import LoaderFormatError
+    from defib.rockusb.protocol import RockusbError
+
+    console = Console()
+    recovery_ids = load_profile(chip).usb_recovery_ids
+
+    # Loader resolution sits inside the handler: an unreadable file, a
+    # malformed container or missing arguments would otherwise escape as
+    # Typer text or a traceback, and in JSON mode that means no error event
+    # at all.
+    recovery = None
+    try:
+        blobs = _resolve_usb_loader(chip, ddr, usbplug, loader)
+        recovery = await _open_usb_target(
+            blobs, power_cycle, output, wait, poe_port_override, usb_path,
+            recovery_ids,
+        )
+        flash_id = await recovery.read_flash_id()
+    except (RockusbError, LoaderFormatError, OSError, typer.BadParameter) as e:
+        _usb_fail(output, str(e))
+        return
+    finally:
+        # Release the interface either way. A claimed handle outliving the
+        # command leaves the next attempt unable to open the board, which is
+        # indistinguishable from a device that has stopped responding.
+        if recovery is not None:
+            recovery.close()
+
+    if output == "json":
+        print(json_mod.dumps({
+            "event": "done", "success": True, "flash_id": flash_id.hex(),
+        }))
+    elif output != "quiet":
+        console.print(f"  Flash ID: {flash_id.hex()}")
+        console.print(
+            "\n[green bold]Device is awake[/green bold] and in loader mode, "
+            "ready for a flashing tool."
+        )
 
 
 def main() -> None:

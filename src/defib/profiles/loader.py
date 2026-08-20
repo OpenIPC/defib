@@ -107,6 +107,25 @@ def load_profile(chip_name: str, profiles_dir: Path | None = None) -> SoCProfile
     raise ValueError(f"Alias chain too deep for chip: {chip_name}")
 
 
+def recovery_mode(chip_name: str, profiles_dir: Path | None = None) -> str:
+    """How ``chip_name`` is reached when it is dead: ``"uart"`` or ``"usb"``.
+
+    Defaults to ``"uart"`` only when the chip has no profile at all, which
+    covers the V500 and CV6xx families whose chip lists live in their
+    protocol modules rather than in JSON.
+
+    Anything else — an unknown variant, an alias loop, malformed JSON, a
+    profile that fails validation — propagates. Treating those as UART would
+    quietly route a USB-recovery chip into the serial workflow and report the
+    wrong problem: ``rv1106:typo`` should say the variant is unknown, not
+    fail later trying to open a serial port.
+    """
+    try:
+        return load_profile(chip_name, profiles_dir).recovery
+    except FileNotFoundError:
+        return "uart"
+
+
 def list_variants(chip_name: str, profiles_dir: Path | None = None) -> list[str]:
     """Return the list of board variants declared for ``chip_name``.
 
