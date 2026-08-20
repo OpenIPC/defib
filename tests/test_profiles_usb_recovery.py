@@ -128,3 +128,30 @@ class TestFlashPartition:
 
     def test_size_bytes(self):
         assert FlashPartition(lba=0, sectors=8192).size_bytes == 4 * 1024 * 1024
+
+
+class TestRecoveryModeErrorHandling:
+    """recovery_mode() must default to UART only for a chip with no profile.
+
+    Swallowing every ValueError would route a mistyped USB chip into the
+    serial workflow and then report the wrong problem entirely — a failure to
+    open a serial port, rather than "that variant does not exist".
+    """
+
+    def test_missing_profile_defaults_to_uart(self):
+        assert recovery_mode("no-such-chip-at-all", PROFILES_DIR) == "uart"
+
+    def test_unknown_variant_propagates(self):
+        with pytest.raises(ValueError, match="Unknown variant"):
+            recovery_mode("rv1106:typo", PROFILES_DIR)
+
+    def test_unknown_variant_on_uart_chip_also_propagates(self):
+        with pytest.raises(ValueError, match="Unknown variant"):
+            recovery_mode("hi3516cv300:nope", PROFILES_DIR)
+
+    def test_declared_variant_still_resolves(self):
+        from defib.profiles.loader import list_variants
+
+        for chip in ("hi3516cv300", "rv1106"):
+            for variant in list_variants(chip, PROFILES_DIR):
+                assert recovery_mode(f"{chip}:{variant}", PROFILES_DIR) in ("uart", "usb")

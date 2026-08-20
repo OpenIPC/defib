@@ -55,7 +55,6 @@ async def _burn_async(
     from rich.console import Console
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
-    from defib.profiles.loader import recovery_mode
     from defib.recovery.events import LogEvent, ProgressEvent
     from defib.recovery.session import RecoverySession
 
@@ -66,7 +65,7 @@ async def _burn_async(
     else:
         logging.basicConfig(level=logging.INFO)
 
-    if recovery_mode(chip) == "usb":
+    if _recovery_mode_or_exit(chip, output) == "usb":
         await _burn_usb_async(
             chip, ddr, usbplug, loader, power_cycle, output, wait,
             poe_port_override, usb_path,
@@ -2220,7 +2219,6 @@ async def _install_async(
     )
     from defib.network.ip_manager import list_interfaces, temporary_ip
     from defib.network.tftp_server import start_tftp_server
-    from defib.profiles.loader import recovery_mode
     from defib.recovery.events import LogEvent, ProgressEvent
     from defib.recovery.session import RecoverySession
     from defib.transport.serial_platform import create_transport, normalize_port_name
@@ -2232,16 +2230,18 @@ async def _install_async(
     else:
         logging.basicConfig(level=logging.INFO)
 
-    if recovery_mode(chip) == "usb":
+    if _recovery_mode_or_exit(chip, output) == "usb":
         # Writing flash over USB is not landed yet: this chip's images have
         # nowhere correct to go until the UBI-vs-raw rootfs question is
         # settled, and the write path has never run against hardware. Wake
         # the board with `burn` and flash it by other means meanwhile.
-        console.print(
-            f"[red]{chip} recovers over USB, and `install` does not support "
-            "that yet — use `defib burn` to bring the board up.[/red]"
+        # Routed through _usb_fail so --output json still gets an event.
+        _usb_fail(
+            output,
+            f"{chip} recovers over USB, and `install` does not support that "
+            "yet — use `defib burn` to bring the board up.",
         )
-        raise typer.Exit(1)
+        return
 
     if nand:
         layout = _NAND_LAYOUT
@@ -3642,6 +3642,22 @@ async def _restore_async(
         print(json_mod.dumps({"event": "done", "success": True, "partitions": len(partitions)}))
 
 
+def _recovery_mode_or_exit(chip: str, output: str) -> str:
+    """Resolve how ``chip`` is recovered, reporting profile problems cleanly.
+
+    ``recovery_mode`` deliberately lets a bad variant or malformed profile
+    propagate rather than defaulting to UART, so this turns that into a
+    message rather than a traceback.
+    """
+    from defib.profiles.loader import recovery_mode
+
+    try:
+        return recovery_mode(chip)
+    except ValueError as e:
+        _usb_fail(output, str(e))
+        raise AssertionError("unreachable") from e  # pragma: no cover
+
+
 def _usb_progress_printer(output: str) -> Any:
     """Progress callback that emits JSON lines, or nothing in other modes."""
     import json as json_mod
@@ -3781,9 +3797,11 @@ async def _burn_usb_async(
     console = Console()
     recovery_ids = load_profile(chip).usb_recovery_ids
 
-    # Loader resolution sits inside the handler: an unreadable file or a
-    # malformed container would otherwise escape as a traceback, and in JSON
-    # mode that means no error event at all.
+    # Loader resolution sits inside the handler: an unreadable file, a
+    # malformed container or missing arguments would otherwise escape as
+    # Typer text or a traceback, and in JSON mode that means no error event
+    # at all.
+    recovery = None
     try:
         blobs = _resolve_usb_loader(chip, ddr, usbplug, loader)
         recovery = await _open_usb_target(
@@ -3791,9 +3809,15 @@ async def _burn_usb_async(
             recovery_ids,
         )
         flash_id = await recovery.read_flash_id()
-    except (RockusbError, LoaderFormatError, OSError) as e:
+    except (RockusbError, LoaderFormatError, OSError, typer.BadParameter) as e:
         _usb_fail(output, str(e))
         return
+    finally:
+        # Release the interface either way. A claimed handle outliving the
+        # command leaves the next attempt unable to open the board, which is
+        # indistinguishable from a device that has stopped responding.
+        if recovery is not None:
+            recovery.close()
 
     if output == "json":
         print(json_mod.dumps({
@@ -3802,8 +3826,8 @@ async def _burn_usb_async(
     elif output != "quiet":
         console.print(f"  Flash ID: {flash_id.hex()}")
         console.print(
-            "\n[green bold]Device is awake.[/green bold] Flash it with: "
-            f"defib install -c {chip} --firmware <image>"
+            "\n[green bold]Device is awake[/green bold] and in loader mode, "
+            "ready for a flashing tool."
         )
 
 

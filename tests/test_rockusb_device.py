@@ -528,3 +528,32 @@ class TestKernelDriverRestore:
         device._detached_interface = None
         device._reattach_kernel_driver()
         assert events == []
+
+
+class TestUploadProgress:
+    """Progress is measured in framed bytes at both ends.
+
+    Framing appends a CRC and sometimes a terminator packet, so counting real
+    bytes sent against the raw blob length reports over 100% — a 3-byte blob
+    would announce 5 of 3.
+    """
+
+    def test_framed_total_covers_the_crc(self):
+        from defib.rockusb.maskrom import build_maskrom_chunks
+
+        blob = b"\x01\x02\x03"
+        total = sum(len(c) for c in build_maskrom_chunks(blob))
+        assert total == len(blob) + 2
+        assert total > len(blob)
+
+    def test_progress_never_exceeds_total(self):
+        from defib.rockusb.maskrom import build_maskrom_chunks
+
+        for size in (1, 3, 4094, 4095, 4096, 10000):
+            chunks = build_maskrom_chunks(b"\xa5" * size)
+            total = sum(len(c) for c in chunks)
+            sent = 0
+            for c in chunks:
+                sent += len(c)
+                assert sent <= total
+            assert sent == total

@@ -119,6 +119,10 @@ class RockchipRecovery:
         on_progress: Callable[[ProgressEvent], None] | None,
     ) -> None:
         chunks = build_maskrom_chunks(blob, use_rc4=use_rc4)
+        # Total is the framed size, not the blob's: framing appends a CRC and
+        # sometimes a terminator packet, so measuring real bytes sent against
+        # the raw length reports more than 100%.
+        total = sum(len(c) for c in chunks)
         sent = 0
         for chunk in chunks:
             # Count what the wire took, not what we handed it. control_write
@@ -127,7 +131,7 @@ class RockchipRecovery:
             sent += await asyncio.to_thread(self._device.control_write, code, chunk)
             _emit(
                 on_progress,
-                ProgressEvent(stage, sent, len(blob), f"{name} -> {code:#06x}"),
+                ProgressEvent(stage, sent, total, f"{name} -> {code:#06x}"),
             )
         logger.debug(
             "uploaded %s (%d bytes in %d chunks) to %#06x", name, len(blob), len(chunks), code
@@ -189,6 +193,15 @@ class RockchipRecovery:
         return await asyncio.to_thread(
             self._device.command, Opcode.READ_FLASH_ID, read_length=5
         )
+
+    def close(self) -> None:
+        """Release the underlying device.
+
+        Whoever drove the recovery owns the handle; leaving it claimed makes
+        the next attempt fail to open the board, which looks exactly like
+        hardware that has stopped answering.
+        """
+        self._device.close()
 
     async def reset(self, subcode: ResetSubcode = ResetSubcode.NORMAL) -> None:
         """Reset the device.
