@@ -21,10 +21,10 @@ uv tool install git+https://github.com/OpenIPC/defib
 pipx install git+https://github.com/OpenIPC/defib
 ```
 
-To run it once without installing anything:
+To run it once without installing anything (swap in your own chip and port):
 
 ```bash
-uvx --from git+https://github.com/OpenIPC/defib defib burn -c <chip> -p /dev/ttyUSB0 -t
+uvx --from git+https://github.com/OpenIPC/defib defib burn -c hi3516ev300 -p /dev/ttyUSB0 -t
 ```
 
 ## Quick Start
