@@ -618,7 +618,7 @@ function onChipChanged() {
       `frame-blast handshake (an active <code>0xAA</code>+HEAD blast plus a ` +
       `PRESTEP0 block) that this browser build does not implement, so the ` +
       `upload cannot complete here. Install defib and run:` +
-      `<pre>uv tool install defib\ndefib burn -c ${chip} -p /dev/ttyUSB0 -t</pre>` +
+      `<pre>uvx --from git+https://github.com/OpenIPC/defib \\\n  defib burn -c ${chip} -p /dev/ttyUSB0 -t</pre>` +
       `Start it before you power-cycle the camera. ` +
       `<a href="https://github.com/OpenIPC/defib/issues/121" target="_blank" ` +
       `rel="noopener">Tracking issue</a>.`;
