@@ -387,6 +387,30 @@ class TestDetectSplSize:
         profile = load_profile("hi3520dv200", PROFILES_DIR)
         assert profile.spl_sram_limit == 0x3B00
 
+    def test_hi3518ev200_profile_wires_sram_limit(self):
+        # OpenIPC/firmware#2299: u-boot-hi3518ev200-universal.bin (135452 B)
+        # carries its LZMA payload at file offset 0x4BB0, so detection returns
+        # 0x4800 (18 chunks) — 3328 B past the chip's SRAM ceiling. The upload
+        # ACKed chunks 1-14 (up to 0x04013D00) and the bootrom faulted on chunk
+        # 15, which crosses 0x04014000; the reporter saw "Failed to send SPL" at
+        # 78% (14/18). ev200's SRAM window from spl_address 0x04010500 ends at
+        # 0x04014000, i.e. 0x3B00 — the same ceiling already confirmed on the
+        # sibling hi3520dv200 (PR #78), and exactly what HiTool's own FILELEN
+        # for this chip uploads.
+        profile = load_profile("hi3518ev200", PROFILES_DIR)
+        assert profile.spl_sram_limit == 0x3B00
+        assert profile.spl_address + profile.spl_sram_limit == 0x04014000
+
+    def test_hi3518ev200_openipc_layout_is_capped(self):
+        # The real file's boundary (LZMA at 0x4BB0 -> 0x4800) capped to 0x3B00.
+        firmware = bytes(0x4BB0) + b"\x5d\x00\x00\x00\x01" + b"\x00" * 100
+        assert HiSiliconStandard._detect_spl_size(
+            firmware, profile_max=0x3B00, sram_limit=None,
+        ) == 0x4800
+        assert HiSiliconStandard._detect_spl_size(
+            firmware, profile_max=0x3B00, sram_limit=0x3B00,
+        ) == 0x3B00
+
     def test_profile_without_sram_limit_returns_none(self):
         # Chips without the optional SRAMLIMIT field continue to return None.
         profile = load_profile("hi3516ev300", PROFILES_DIR)
