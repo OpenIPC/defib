@@ -411,6 +411,17 @@ class TestDetectSplSize:
             firmware, profile_max=0x3B00, sram_limit=0x3B00,
         ) == 0x3B00
 
+    def test_hi3516cv200_profile_wires_sram_limit(self):
+        # Same silicon window as its hi3518ev200 sibling: identical ADDRESS and
+        # FILELEN (only PRESTEP0 differs), so spl_address 0x04010500 + 0x3B00
+        # lands on the same 0x04014000 ceiling. u-boot-hi3516cv200-universal.bin
+        # carries its LZMA payload at 0x4BB0 too, so detection returns the same
+        # 0x4800 and would overrun by the same 3328 B. See OpenIPC/firmware#2299
+        # for the ev200 hardware trace this is derived from.
+        profile = load_profile("hi3516cv200", PROFILES_DIR)
+        assert profile.spl_sram_limit == 0x3B00
+        assert profile.spl_address + profile.spl_sram_limit == 0x04014000
+
     def test_profile_without_sram_limit_returns_none(self):
         # Chips without the optional SRAMLIMIT field continue to return None.
         profile = load_profile("hi3516ev300", PROFILES_DIR)
