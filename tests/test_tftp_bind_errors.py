@@ -13,7 +13,11 @@ import pytest
 
 from defib.network.tftp_server import (
     TFTPBindError,
+    _add_address_cmd,
     _bind_error_help,
+    _find_port_holder_cmd,
+    _list_addresses_cmd,
+    _privileged_port_advice,
     start_tftp_server,
 )
 
@@ -22,20 +26,59 @@ def test_address_in_use_names_the_port_and_how_to_find_the_holder():
     msg = _bind_error_help("192.168.1.10", 69, OSError(errno.EADDRINUSE, "x"))
     assert "192.168.1.10:69" in msg
     assert "already in use" in msg
-    assert "sport = :69" in msg          # the command that finds the holder
     assert "--tftp-via pod" in msg       # the way around it
+    # and a command that actually exists on the host we are running on
+    assert _find_port_holder_cmd(69) in msg
 
 
 def test_address_not_available_points_at_the_missing_ip():
     msg = _bind_error_help("192.168.1.10", 69, OSError(errno.EADDRNOTAVAIL, "x"))
     assert "no interface has that address" in msg
-    assert "ip addr add 192.168.1.10/24" in msg
+    assert _add_address_cmd("192.168.1.10") in msg
+    assert _list_addresses_cmd() in msg
 
 
-def test_permission_denied_explains_the_privileged_port():
+def test_permission_denied_explains_the_refusal():
     msg = _bind_error_help("0.0.0.0", 69, OSError(errno.EACCES, "x"))
     assert "permission denied" in msg
-    assert "1024" in msg
+    assert _privileged_port_advice() in msg
+
+
+@pytest.mark.parametrize("plat", ["linux", "darwin", "win32"])
+def test_advice_is_native_to_the_platform(monkeypatch, plat):
+    """defib ships on Linux, macOS and Windows -- CI runs all three.
+
+    Advising `ss`/`ip addr`/CAP_NET_BIND_SERVICE on a Mac or a Windows box
+    sends the operator looking for tools that are not there, mid-recovery.
+    """
+    monkeypatch.setattr("defib.network.tftp_server.sys.platform", plat)
+    holder = _find_port_holder_cmd(69)
+    addr = _add_address_cmd("192.168.1.10")
+    listing = _list_addresses_cmd()
+    priv = _privileged_port_advice()
+
+    if plat == "linux":
+        assert "ss -ulpn" in holder and "ip addr add" in addr
+        assert listing == "ip -brief address"
+        assert "CAP_NET_BIND_SERVICE" in priv
+    elif plat == "darwin":
+        assert "lsof" in holder and "ifconfig" in addr
+        assert listing == "ifconfig -a"
+        # macOS reserves low ports but has no capabilities
+        assert "sudo" in priv and "CAP_NET_BIND_SERVICE" not in priv
+    else:
+        assert "netstat" in holder and "netsh" in addr
+        assert listing == "ipconfig"
+        # Windows has no reserved-port rule -- do not tell people to be root
+        assert "sudo" not in priv and "root" not in priv
+        assert "firewall" in priv.lower()
+
+    # no Linux-only tooling leaks into the non-Linux messages
+    if plat != "linux":
+        for m in (holder, addr, listing, priv):
+            assert "ss -ulpn" not in m
+            assert "ip addr add" not in m
+            assert "CAP_NET_BIND_SERVICE" not in m
 
 
 def test_unrecognised_errno_still_names_the_address():

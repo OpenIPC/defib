@@ -16,6 +16,7 @@ import asyncio
 import errno
 import logging
 import struct
+import sys
 from dataclasses import dataclass
 from typing import Callable
 
@@ -270,6 +271,58 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
             return False
 
 
+def _find_port_holder_cmd(port: int) -> str:
+    """The command that names whatever is holding a UDP port, per platform."""
+    if sys.platform == "win32":
+        return f"netstat -ano -p UDP | findstr :{port}"
+    if sys.platform == "darwin":
+        return f"sudo lsof -nP -iUDP:{port}"
+    return f"sudo ss -ulpn 'sport = :{port}'"
+
+
+def _add_address_cmd(bind_addr: str) -> str:
+    """The command that puts an address on an interface, per platform."""
+    if sys.platform == "win32":
+        return (
+            f'netsh interface ip add address "<adapter>" {bind_addr} '
+            f"255.255.255.0"
+        )
+    if sys.platform == "darwin":
+        return f"sudo ifconfig <nic> alias {bind_addr} 255.255.255.0"
+    return f"sudo ip addr add {bind_addr}/24 dev <nic>"
+
+
+def _list_addresses_cmd() -> str:
+    """The command that shows what addresses are actually configured."""
+    if sys.platform == "win32":
+        return "ipconfig"
+    if sys.platform == "darwin":
+        return "ifconfig -a"
+    return "ip -brief address"
+
+
+def _privileged_port_advice() -> str:
+    """How to get a low port, per platform.
+
+    Windows has no reserved-port rule, so a refusal there is a firewall or
+    an ACL rather than a missing privilege, and telling the operator to
+    "run as root" would send them the wrong way.
+    """
+    if sys.platform == "win32":
+        return (
+            "On Windows this is usually a firewall rule or an address "
+            "reservation rather than a privilege -- check Windows Defender "
+            "Firewall for a UDP block, and `netsh interface ipv4 show "
+            "excludedportrange protocol=udp`."
+        )
+    if sys.platform == "darwin":
+        return "Ports below 1024 need root -- run defib with sudo."
+    return (
+        "Ports below 1024 need root -- run defib with sudo, or grant the "
+        "binary CAP_NET_BIND_SERVICE."
+    )
+
+
 def _bind_error_help(bind_addr: str, port: int, exc: OSError) -> str:
     """Turn a bind failure into something the operator can act on."""
     where = f"{bind_addr}:{port}"
@@ -278,21 +331,20 @@ def _bind_error_help(bind_addr: str, port: int, exc: OSError) -> str:
             f"TFTP server cannot bind {where}: address already in use. "
             f"Something else already holds UDP port {port} -- commonly a "
             f"system tftpd or dnsmasq, or an earlier defib run that has not "
-            f"exited. Find it with `sudo ss -ulpn 'sport = :{port}'` and stop "
+            f"exited. Find it with `{_find_port_holder_cmd(port)}` and stop "
             f"it, or use --tftp-via pod if you have a rack pod."
         )
     if exc.errno == errno.EADDRNOTAVAIL:
         return (
             f"TFTP server cannot bind {where}: no interface has that address. "
             f"The host needs {bind_addr} configured on the NIC the camera is "
-            f"plugged into, e.g. `sudo ip addr add {bind_addr}/24 dev <nic>` "
-            f"-- check `ip -brief address` to see what is actually set."
+            f"plugged into, e.g. `{_add_address_cmd(bind_addr)}` -- check "
+            f"`{_list_addresses_cmd()}` to see what is actually set."
         )
     if exc.errno in (errno.EACCES, errno.EPERM):
         return (
-            f"TFTP server cannot bind {where}: permission denied. Ports below "
-            f"1024 need root -- run defib with sudo, or grant the binary "
-            f"CAP_NET_BIND_SERVICE."
+            f"TFTP server cannot bind {where}: permission denied. "
+            f"{_privileged_port_advice()}"
         )
     return f"TFTP server cannot bind {where}: {exc}"
 
