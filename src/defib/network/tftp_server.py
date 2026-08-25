@@ -13,12 +13,24 @@ Typical U-Boot TFTP flow:
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import struct
 from dataclasses import dataclass
 from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+
+class TFTPBindError(Exception):
+    """The TFTP server could not take the address it was asked to serve on.
+
+    Raised instead of the bare OSError so the caller can tell the operator
+    what to do about it: the kernel's own text ("Address already in use")
+    names neither the address nor the fix, and this failure lands in the
+    middle of a flash recovery where guessing is expensive.
+    """
+
 
 # TFTP opcodes
 OPCODE_RRQ = 1
@@ -258,6 +270,33 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
             return False
 
 
+def _bind_error_help(bind_addr: str, port: int, exc: OSError) -> str:
+    """Turn a bind failure into something the operator can act on."""
+    where = f"{bind_addr}:{port}"
+    if exc.errno == errno.EADDRINUSE:
+        return (
+            f"TFTP server cannot bind {where}: address already in use. "
+            f"Something else already holds UDP port {port} -- commonly a "
+            f"system tftpd or dnsmasq, or an earlier defib run that has not "
+            f"exited. Find it with `sudo ss -ulpn 'sport = :{port}'` and stop "
+            f"it, or use --tftp-via pod if you have a rack pod."
+        )
+    if exc.errno == errno.EADDRNOTAVAIL:
+        return (
+            f"TFTP server cannot bind {where}: no interface has that address. "
+            f"The host needs {bind_addr} configured on the NIC the camera is "
+            f"plugged into, e.g. `sudo ip addr add {bind_addr}/24 dev <nic>` "
+            f"-- check `ip -brief address` to see what is actually set."
+        )
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return (
+            f"TFTP server cannot bind {where}: permission denied. Ports below "
+            f"1024 need root -- run defib with sudo, or grant the binary "
+            f"CAP_NET_BIND_SERVICE."
+        )
+    return f"TFTP server cannot bind {where}: {exc}"
+
+
 async def start_tftp_server(
     file_data: bytes | None = None,
     bind_addr: str = "0.0.0.0",
@@ -288,10 +327,13 @@ async def start_tftp_server(
         files=files, done_count=done_count,
     )
 
-    transport, _ = await loop.create_datagram_endpoint(
-        lambda: protocol,
-        local_addr=(bind_addr, port),
-    )
+    try:
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: protocol,
+            local_addr=(bind_addr, port),
+        )
+    except OSError as exc:
+        raise TFTPBindError(_bind_error_help(bind_addr, port, exc)) from exc
 
     total = len(file_data) if file_data else sum(len(v) for v in (files or {}).values())
     if files:
