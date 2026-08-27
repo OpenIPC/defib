@@ -400,24 +400,16 @@ async def _burn_async(
             if output == "human":
                 console.print("[dim]--- Terminal mode (Ctrl-C to exit) ---[/dim]")
 
-            stop = False
-
-            def on_sigint(*_: object) -> None:
-                nonlocal stop
-                stop = True
-
-            signal.signal(signal.SIGINT, on_sigint)
-
+            from defib.cli.terminal import run_raw_terminal
             try:
-                while not stop:
-                    try:
-                        data = await transport.read(256, timeout=0.1)
-                        _sys.stdout.buffer.write(data)
-                        _sys.stdout.buffer.flush()
-                    except Exception:
-                        pass
+                await run_raw_terminal(
+                    transport,
+                    _sys.stdin.buffer,
+                    _sys.stdout.buffer,
+                )
+            except KeyboardInterrupt:
+                pass
             finally:
-                signal.signal(signal.SIGINT, signal.SIG_DFL)
                 if output == "human":
                     console.print("\n[dim]--- Terminal closed ---[/dim]")
 
