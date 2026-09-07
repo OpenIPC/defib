@@ -557,3 +557,34 @@ class TestUploadProgress:
                 sent += len(c)
                 assert sent <= total
             assert sent == total
+
+
+class TestBuildCbwEraseTransfer:
+    """ERASE_LBA/ERASE_NORMAL carry a sector count in the CDB but move no
+    data, so their CBW must declare a zero-length transfer. Defaulting it to
+    count*SECTOR_SIZE makes an RV1106 usbplug wait for a data phase that never
+    comes — observed as "moved -1024 of 0 bytes (residue 1024)" — after which
+    the erase never lands.
+    """
+
+    @staticmethod
+    def _transfer_length(cbw: bytes) -> int:
+        import struct
+
+        # dCBWDataTransferLength: the little-endian u32 after the 4-byte
+        # signature and the 4-byte tag.
+        return struct.unpack_from("<I", cbw, 8)[0]
+
+    def test_erase_opcodes_move_no_data(self):
+        from defib.rockusb.protocol import Opcode, build_cbw
+
+        for op in (Opcode.ERASE_LBA, Opcode.ERASE_NORMAL):
+            cbw = build_cbw(tag=1, opcode=op, address=0, count=2)
+            assert self._transfer_length(cbw) == 0, op
+
+    def test_block_read_write_still_declare_the_data_phase(self):
+        from defib.rockusb.protocol import SECTOR_SIZE, Opcode, build_cbw
+
+        for op in (Opcode.WRITE_LBA, Opcode.READ_LBA):
+            cbw = build_cbw(tag=1, opcode=op, address=0, count=2)
+            assert self._transfer_length(cbw) == 2 * SECTOR_SIZE, op

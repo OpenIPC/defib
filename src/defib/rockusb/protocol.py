@@ -139,10 +139,19 @@ def build_cbw(
         address: starting LBA, for the block opcodes.
         count: sector count, for the block opcodes.
         transfer_length: bytes in the data phase. Defaults to
-            ``count * SECTOR_SIZE`` when a count is given.
+            ``count * SECTOR_SIZE`` when a count is given — except for the
+            erase opcodes, which carry a count but move no data.
         direction_in: True when the data phase flows device to host.
     """
-    if transfer_length == 0 and count:
+    if transfer_length == 0 and count and opcode not in (
+        Opcode.ERASE_LBA,
+        Opcode.ERASE_NORMAL,
+    ):
+        # Erase carries its sector count in the CDB but moves no data, so its
+        # CBW must declare a zero-length transfer. Defaulting it to
+        # count*SECTOR_SIZE makes the usbplug wait for a data phase that never
+        # comes — observed on an RV1106 as "moved -1024 of 0 bytes (residue
+        # 1024)", after which the erase never lands.
         transfer_length = count * SECTOR_SIZE
 
     cdb = struct.pack(
