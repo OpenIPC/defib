@@ -3746,7 +3746,12 @@ async def _open_usb_target(
     """
     from rich.console import Console
 
-    from defib.rockusb.device import DeviceMode, RockusbDevice, wait_for_device
+    from defib.rockusb.device import (
+        DeviceMode,
+        RockusbDevice,
+        RockusbUsbError,
+        wait_for_device,
+    )
     from defib.rockusb.recovery import RockchipRecovery
 
     console = Console()
@@ -3771,6 +3776,25 @@ async def _open_usb_target(
     device = RockusbDevice(found)
     device.open()
     recovery = RockchipRecovery(device)
+
+    # A usbplug left running by a previous invocation is not safe to reuse: it
+    # reliably wedges on the next command from a fresh process. Every tool in
+    # this space re-uploads the loader each run for that reason. So if we find
+    # one already in loader mode, send it back to MaskROM and start clean.
+    if found.mode is DeviceMode.LOADER:
+        if output == "human":
+            console.print("  Found a stale loader; returning it to MaskROM...")
+        try:
+            await recovery.return_to_maskrom(
+                usb_path=found.usb_path, recovery_ids=recovery_ids
+            )
+        except RockusbUsbError as e:
+            recovery.close()
+            raise RockusbUsbError(
+                f"{e}. A previous run left the loader wedged and it will not "
+                "reset — power-cycle the board (BOOT + replug) and retry."
+            ) from e
+        found = recovery.device_info
 
     if found.mode is DeviceMode.MASKROM:
         if output == "human":

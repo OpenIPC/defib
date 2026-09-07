@@ -24,6 +24,7 @@ from typing import Callable
 from defib.recovery.events import ProgressEvent, Stage
 from defib.rockusb.device import (
     DeviceMode,
+    FoundDevice,
     RockusbDevice,
     wait_for_device,
 )
@@ -235,6 +236,43 @@ class RockchipRecovery:
         return await asyncio.to_thread(
             self._device.command, Opcode.READ_FLASH_ID, read_length=5
         )
+
+    @property
+    def device_info(self) -> FoundDevice:
+        """The currently-held device's :class:`FoundDevice`."""
+        return self._device._found
+
+    async def return_to_maskrom(
+        self,
+        usb_path: str | None = None,
+        recovery_ids: Sequence[int] | None = None,
+        timeout: float = 15.0,
+    ) -> RockusbDevice:
+        """Send a running usbplug back to MaskROM and re-acquire it there.
+
+        Reusing a usbplug a previous process left behind wedges the next
+        command, so a fresh run resets to MaskROM and re-uploads. Returns the
+        new MaskROM-mode device handle; the old one is closed.
+
+        Raises:
+            RockusbUsbError: if the loader will not accept the reset (already
+                wedged) or MaskROM never reappears.
+        """
+        if self._device.mode is DeviceMode.MASKROM:
+            return self._device
+
+        await self.reset(ResetSubcode.MASKROM)
+        self._device.close()
+        await asyncio.sleep(USBPLUG_SETTLE)
+
+        found = await wait_for_device(
+            timeout=timeout, mode=DeviceMode.MASKROM,
+            usb_path=usb_path, recovery_ids=recovery_ids,
+        )
+        device = RockusbDevice(found)
+        device.open()
+        self._device = device
+        return device
 
     def close(self) -> None:
         """Release the underlying device.

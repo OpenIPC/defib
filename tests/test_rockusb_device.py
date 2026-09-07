@@ -588,3 +588,99 @@ class TestBuildCbwEraseTransfer:
         for op in (Opcode.WRITE_LBA, Opcode.READ_LBA):
             cbw = build_cbw(tag=1, opcode=op, address=0, count=2)
             assert self._transfer_length(cbw) == 2 * SECTOR_SIZE, op
+
+
+class TestReturnToMaskrom:
+    """A usbplug a previous process left running wedges the next command, so a
+    fresh run resets it to MaskROM and re-uploads. This is the reset step.
+    """
+
+    class _Dev:
+        def __init__(self, mode, after=None):
+            from defib.rockusb.device import FoundDevice
+            self._mode = mode
+            self._found = FoundDevice(
+                mode=mode, bus=1, address=1, product_id=0x110C,
+                handle=None, port_numbers=(1,),
+            )
+            self.closed = False
+
+        @property
+        def mode(self):
+            return self._mode
+
+        def close(self):
+            self.closed = True
+
+    async def test_noop_when_already_maskrom(self, monkeypatch):
+        from defib.rockusb.device import DeviceMode
+        from defib.rockusb.recovery import RockchipRecovery
+
+        dev = self._Dev(DeviceMode.MASKROM)
+        r = RockchipRecovery(dev)
+        out = await r.return_to_maskrom()
+        assert out is dev
+        assert not dev.closed
+
+    async def test_device_info_exposes_the_handle(self):
+        from defib.rockusb.device import DeviceMode
+        from defib.rockusb.recovery import RockchipRecovery
+
+        dev = self._Dev(DeviceMode.LOADER)
+        r = RockchipRecovery(dev)
+        assert r.device_info.mode is DeviceMode.LOADER
+
+    async def test_reset_and_reacquire(self, monkeypatch):
+        """A healthy loader resets, the old handle is closed, and a fresh
+        MaskROM handle comes back."""
+        import defib.rockusb.recovery as mod
+        from defib.rockusb.device import DeviceMode, FoundDevice
+        from defib.rockusb.recovery import RockchipRecovery
+
+        loader = self._Dev(DeviceMode.LOADER)
+        r = RockchipRecovery(loader)
+
+        reset_calls = []
+
+        async def fake_reset(subcode):
+            reset_calls.append(subcode)
+
+        monkeypatch.setattr(r, "reset", fake_reset)
+        monkeypatch.setattr(mod.asyncio, "sleep", _no_sleep)
+
+        maskrom_found = FoundDevice(
+            mode=DeviceMode.MASKROM, bus=1, address=2, product_id=0x110C,
+            handle=object(), port_numbers=(1,),
+        )
+
+        async def fake_wait(**kwargs):
+            assert kwargs["mode"] is DeviceMode.MASKROM
+            return maskrom_found
+
+        opened = []
+        monkeypatch.setattr(mod, "wait_for_device", fake_wait)
+        monkeypatch.setattr(
+            mod, "RockusbDevice",
+            lambda found: _FakeReopened(found, opened),
+        )
+
+        from defib.rockusb.protocol import ResetSubcode
+
+        await r.return_to_maskrom()
+        assert reset_calls == [ResetSubcode.MASKROM]
+        assert loader.closed
+        assert opened == ["opened"]
+
+
+async def _no_sleep(_seconds):
+    return None
+
+
+class _FakeReopened:
+    def __init__(self, found, log):
+        self._found = found
+        self._log = log
+        self.mode = found.mode
+
+    def open(self):
+        self._log.append("opened")
