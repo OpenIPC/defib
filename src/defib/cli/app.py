@@ -3954,11 +3954,22 @@ async def _dump_flash_usb_async(
                 f"from lba {start} -> {target}"
             )
 
-        with target.open("wb") as fh:
-            written = await recovery.dump_image(
-                start, sectors, fh.write,
-                on_progress=_usb_progress_printer(output),
-            )
+        # Stream to a temp file beside the destination and atomically replace
+        # it only once the whole transfer lands: a failure part-way must not
+        # truncate an existing backup or strand a partial image at the path.
+        tmp = target.with_name(target.name + ".partial")
+        ok = False
+        try:
+            with tmp.open("wb") as fh:
+                written = await recovery.dump_image(
+                    start, sectors, fh.write,
+                    on_progress=_usb_progress_printer(output),
+                )
+            tmp.replace(target)
+            ok = True
+        finally:
+            if not ok:
+                tmp.unlink(missing_ok=True)
     except (RockusbError, LoaderFormatError, OSError, typer.BadParameter) as e:
         _usb_fail(output, str(e))
         return

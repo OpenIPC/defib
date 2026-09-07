@@ -76,3 +76,71 @@ class TestGeometry:
         info = parse_flash_info(REAL)
         for name, part in load_profile("rv1106").partitions.items():
             assert part.end_lba <= info.sectors, name
+
+
+class TestDumpAtomicity:
+    """A failed USB dump must not truncate an existing backup or leave a
+    partial file behind: dump-flash streams to a temp file and replaces the
+    destination only once the whole transfer lands.
+    """
+
+    def _drive(self, monkeypatch, tmp_path, dump_impl):
+        import asyncio
+
+        import defib.cli.app as app
+
+        class _Rec:
+            async def read_flash_info(self):
+                return FlashInfo(
+                    sectors=4, block_sectors=1, page_sectors=1, ecc_bits=0,
+                    access_time=0, manufacturer=0, flash_mask=0,
+                )
+
+            async def dump_image(self, start, sectors, write, on_progress=None):
+                return await dump_impl(write)
+
+            def close(self):
+                pass
+
+        async def _open(*args, **kwargs):
+            return _Rec()
+
+        monkeypatch.setattr(app, "_resolve_usb_loader", lambda *a, **k: object())
+        monkeypatch.setattr(app, "_open_usb_target", _open)
+
+        import typer
+
+        target = tmp_path / "backup.bin"
+        try:
+            asyncio.run(
+                app._dump_flash_usb_async(
+                    chip="rv1106", output_file=str(target), partition="",
+                    ddr="", usbplug="", loader="",
+                    wait=1.0, usb_path="", power_cycle=False, output="json",
+                )
+            )
+        except typer.Exit:
+            pass  # _usb_fail exits on the failure path; file state is asserted
+        return target, tmp_path / "backup.bin.partial"
+
+    def test_failed_dump_keeps_prior_backup_and_leaves_no_partial(
+        self, monkeypatch, tmp_path
+    ):
+        (tmp_path / "backup.bin").write_bytes(b"OLD-GOOD-BACKUP")
+
+        async def dump_impl(write):
+            write(b"partial")
+            raise RockusbError("read stalled mid-dump")
+
+        target, partial = self._drive(monkeypatch, tmp_path, dump_impl)
+        assert target.read_bytes() == b"OLD-GOOD-BACKUP"
+        assert not partial.exists()
+
+    def test_successful_dump_replaces_the_target(self, monkeypatch, tmp_path):
+        async def dump_impl(write):
+            write(b"NEW-DUMP")
+            return len(b"NEW-DUMP")
+
+        target, partial = self._drive(monkeypatch, tmp_path, dump_impl)
+        assert target.read_bytes() == b"NEW-DUMP"
+        assert not partial.exists()
