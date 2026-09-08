@@ -118,7 +118,7 @@ class TestRv1106Profile:
     def test_profile_json_is_minimal(self):
         """A USB profile carrying UART bytecode would mean someone copied the
         wrong template."""
-        data = json.loads((PROFILES_DIR / "rv1106.json").read_text())
+        data = json.loads((PROFILES_DIR / "rv1106.json").read_text(encoding="utf-8"))
         assert not {"DDRSTEP0", "PRESTEP0", "ADDRESS", "FILELEN"} & set(data)
 
 

@@ -68,7 +68,7 @@ def load_profile(chip_name: str, profiles_dir: Path | None = None) -> SoCProfile
         if not profile_path.exists():
             raise FileNotFoundError(f"No profile found for chip: {current}")
 
-        content = profile_path.read_text().strip()
+        content = profile_path.read_text(encoding="utf-8").strip()
 
         # Check if this is an alias (single token ending in .json)
         tokens = content.split()
@@ -141,7 +141,7 @@ def list_variants(chip_name: str, profiles_dir: Path | None = None) -> list[str]
         profile_path = profiles_dir / f"{current}.json"
         if not profile_path.exists():
             return []
-        content = profile_path.read_text().strip()
+        content = profile_path.read_text(encoding="utf-8").strip()
         tokens = content.split()
         if len(tokens) == 1 and tokens[0].endswith(".json"):
             current = tokens[0][:-5]

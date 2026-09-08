@@ -61,7 +61,7 @@ class TestSearchPath:
         """The map is what `defib agent` will accept; the Makefile is the truth."""
         makefile = (
             Path(__file__).parent.parent / "agent" / "Makefile"
-        ).read_text()
+        ).read_text(encoding="utf-8")
         built = {
             line.split("$(SOC),")[1].split(")")[0]
             for line in makefile.splitlines()

@@ -273,6 +273,13 @@ def _windows_interfaces() -> list[str]:
         logger.warning("Could not list adapters with netsh: %s", exc)
         return []
 
+    # Check the exit status, as the async twin does. Without this a netsh that
+    # failed left us parsing empty stdout and reporting "no adapters", which
+    # looks like a host with no network rather than a command that did not run.
+    if proc.returncode != 0:
+        logger.warning("netsh could not list adapters: %s", proc.stderr.strip())
+        return []
+
     return _parse_netsh_interfaces(proc.stdout)
 
 

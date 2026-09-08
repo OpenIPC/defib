@@ -396,7 +396,16 @@ async def _burn_async(
                 if output == "human":
                     console.print("[dim]--- Session closed ---[/dim]")
         else:
-            # Normal U-Boot shell — raw terminal passthrough
+            # Normal U-Boot shell — a real terminal, in both directions.
+            #
+            # It used to be one direction. The loop drained the port onto the
+            # screen and nothing read the keyboard, so `-t` handed you a live
+            # U-Boot prompt that ignored everything you typed
+            # (OpenIPC/firmware#2381). Keys are polled between serial reads
+            # rather than awaited on their own task: no thread, no executor,
+            # and nothing that can stall the loop holding the serial link.
+            from defib.cli.keyboard import raw_terminal, read_available_keys
+
             if output == "human":
                 console.print("[dim]--- Terminal mode (Ctrl-C to exit) ---[/dim]")
 
@@ -409,13 +418,20 @@ async def _burn_async(
             signal.signal(signal.SIGINT, on_sigint)
 
             try:
-                while not stop:
-                    try:
-                        data = await transport.read(256, timeout=0.1)
-                        _sys.stdout.buffer.write(data)
-                        _sys.stdout.buffer.flush()
-                    except Exception:
-                        pass
+                with raw_terminal():
+                    while not stop:
+                        typed = read_available_keys()
+                        if typed:
+                            try:
+                                await transport.write(typed)
+                            except Exception:
+                                break
+                        try:
+                            data = await transport.read(256, timeout=0.1)
+                            _sys.stdout.buffer.write(data)
+                            _sys.stdout.buffer.flush()
+                        except Exception:
+                            pass
             finally:
                 signal.signal(signal.SIGINT, signal.SIG_DFL)
                 if output == "human":

@@ -191,7 +191,9 @@ socat -,raw,echo=0 TCP:172.17.32.17:35240
 > on the same host as defib (or close to it on a LAN) is recommended.
 
 The `-t` flag auto-detects the post-boot mode:
-- **Normal U-Boot shell** (e.g. hi3516ev300): raw terminal passthrough — type commands directly
+- **Normal U-Boot shell** (e.g. hi3516ev300): a two-way serial terminal — your
+  keystrokes go to the board and its output comes back. Ctrl-C exits the
+  terminal rather than being sent on to U-Boot.
 - **Download command mode** (e.g. hi3516av200): interactive `defib>` prompt that wraps commands in HiSilicon's XHEAD/XCMD protocol, enabling flash operations on devices that enter `download_process()` after serial boot
 
 ```bash
