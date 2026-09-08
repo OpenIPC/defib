@@ -143,13 +143,19 @@ class TestRawTerminal:
 class TestTheDocsMatchTheCode:
     def test_terminal_mode_actually_reads_the_keyboard(self):
         """The regression itself: `-t` promised a console and gave a viewer."""
-        app = (Path(__file__).parent.parent / "src/defib/cli/app.py").read_text()
+        # encoding is not optional here: read_text() uses the locale codec,
+        # which on Windows is cp1252 and cannot decode this file.
+        app = (Path(__file__).parent.parent / "src/defib/cli/app.py").read_text(
+            encoding="utf-8",
+        )
         block = app.split("Normal U-Boot shell", 1)[1][:2000]
         assert "read_available_keys" in block
         assert "transport.write(typed)" in block
 
     def test_the_readme_does_not_promise_what_the_code_cannot_do(self):
-        readme = (Path(__file__).parent.parent / "README.md").read_text()
+        readme = (Path(__file__).parent.parent / "README.md").read_text(
+            encoding="utf-8",
+        )
         assert "type commands directly" not in readme or "keystrokes" in readme
 
 
