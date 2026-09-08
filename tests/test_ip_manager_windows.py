@@ -86,6 +86,20 @@ class TestWindowsInterfaceNames:
         monkeypatch.setattr(ip_manager, "_windows_interfaces", lambda: ["Ethernet"])
         assert list_interfaces() == ["Ethernet"]
 
+    @pytest.mark.skipif(
+        not sys.platform.startswith("win"), reason="needs a real netsh",
+    )
+    def test_real_netsh_yields_at_least_one_adapter(self):
+        """The mocks above pin the parser; this pins it against the real thing.
+
+        CI runs this matrix on windows-latest, so the one claim the fix rests
+        on -- that netsh can be asked for names netsh will accept -- is checked
+        on a real Windows host rather than only against a captured table.
+        """
+        assert _windows_interfaces(), (
+            "netsh listed no adapters; the parser or the command has drifted"
+        )
+
 
 class TestAddressAlreadyThere:
     @pytest.mark.asyncio
