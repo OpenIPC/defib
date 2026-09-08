@@ -474,7 +474,9 @@ class FlashDoctorScreen(Screen[None]):
         """Try connecting to running agent first, upload if needed."""
         import asyncio as aio
 
-        from defib.agent.client import FlashAgentClient, get_agent_binary
+        from defib.agent.client import (
+            FlashAgentClient, agent_binary_help, get_agent_binary,
+        )
         from defib.transport.serial import SerialTransport
 
         chip = self._chip
@@ -507,7 +509,7 @@ class FlashDoctorScreen(Screen[None]):
 
         agent_path = get_agent_binary(chip)
         if not agent_path:
-            self._log(f"[red]No agent binary for '{chip}'[/]")
+            self._log(f"[red]{agent_binary_help(chip)}[/]")
             return
         agent_data = agent_path.read_bytes()
 

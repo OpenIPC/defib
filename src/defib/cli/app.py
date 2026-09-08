@@ -1036,7 +1036,9 @@ async def _agent_upload_async(
 
     from rich.console import Console
 
-    from defib.agent.client import FlashAgentClient, get_agent_binary
+    from defib.agent.client import (
+        FlashAgentClient, agent_binary_help, get_agent_binary,
+    )
     from defib.firmware import get_cached_path
     from defib.profiles.loader import load_profile
     from defib.protocol.hisilicon_cv6xx import HiSiliconCV6xx
@@ -1052,7 +1054,10 @@ async def _agent_upload_async(
     # Find agent binary
     agent_path = get_agent_binary(chip)
     if not agent_path:
-        msg = f"No agent binary for '{chip}'"
+        # A bare "No agent binary for '<chip>'" reads as an unsupported chip,
+        # which sent the reporter in OpenIPC/firmware#2381 looking for another
+        # tool when the answer was that nothing had compiled it yet.
+        msg = agent_binary_help(chip)
         if output == "json":
             print(json_mod.dumps({"event": "error", "message": msg}))
         else:
@@ -1348,7 +1353,9 @@ async def _agent_flash_async(
 
     from rich.console import Console
 
-    from defib.agent.client import FlashAgentClient, get_agent_binary
+    from defib.agent.client import (
+        FlashAgentClient, agent_binary_help, get_agent_binary,
+    )
     from defib.firmware import get_cached_path
     from defib.profiles.loader import load_profile
     from defib.protocol.hisilicon_standard import HiSiliconStandard
@@ -1375,7 +1382,10 @@ async def _agent_flash_async(
     # --- Find agent binary ---
     agent_path = get_agent_binary(chip)
     if not agent_path:
-        msg = f"No agent binary for '{chip}'"
+        # A bare "No agent binary for '<chip>'" reads as an unsupported chip,
+        # which sent the reporter in OpenIPC/firmware#2381 looking for another
+        # tool when the answer was that nothing had compiled it yet.
+        msg = agent_binary_help(chip)
         if output == "json":
             print(json_mod.dumps({"event": "error", "message": msg}))
         else:

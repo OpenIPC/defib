@@ -1,0 +1,208 @@
+"""Temporary-IP management must not fight the host it is running on.
+
+OpenIPC/firmware#2381: a reporter recovering a bricked Hi3516CV300 on Windows
+got `defib install` as far as "Phase 2: Flash via TFTP" and no further. Three
+separate faults, all in this module:
+
+  * the adapter name came from ``socket.if_nameindex()`` ("ethernet_0"), which
+    netsh does not accept -- it answered "Failed to configure the DHCP service.
+    The interface may be disconnected." and they went looking for a cable;
+  * assigning an address that was already there was fatal ("The object already
+    exists"), so setting it up by hand first did not help either;
+  * netsh returns before the address can be bound, so the TFTP bind that came
+    next raced it, lost, and unwound the context manager -- which removed the
+    address, making the log read as though defib had taken away what it had
+    just assigned.
+
+These tests pin the three fixes and the promise that we only tear down what we
+put up.
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+
+import pytest
+
+from defib.network import ip_manager
+from defib.network.ip_manager import (
+    IPManagerError,
+    _windows_interfaces,
+    add_ip,
+    list_interfaces,
+    temporary_ip,
+)
+
+
+NETSH_SHOW_INTERFACE = """
+Admin State    State          Type             Interface Name
+-------------------------------------------------------------------------
+Enabled        Connected      Dedicated        Ethernet
+Enabled        Disconnected   Dedicated        Wi-Fi
+Enabled        Connected      Dedicated        Ethernet 2
+"""
+
+
+class TestWindowsInterfaceNames:
+    def test_names_come_from_netsh_not_if_nameindex(self, monkeypatch):
+        """The names must be the ones netsh will take back."""
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **k: subprocess.CompletedProcess(
+                a[0], 0, NETSH_SHOW_INTERFACE, "",
+            ),
+        )
+        assert _windows_interfaces() == ["Ethernet", "Wi-Fi", "Ethernet 2"]
+
+    def test_a_name_with_a_space_survives(self, monkeypatch):
+        """"Ethernet 2" is a real default name; splitting on whitespace loses it."""
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **k: subprocess.CompletedProcess(
+                a[0], 0, NETSH_SHOW_INTERFACE, "",
+            ),
+        )
+        assert "Ethernet 2" in _windows_interfaces()
+
+    def test_the_header_is_not_an_adapter(self, monkeypatch):
+        """netsh is localised, so the header is skipped by position, not by text."""
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **k: subprocess.CompletedProcess(
+                a[0], 0, NETSH_SHOW_INTERFACE, "",
+            ),
+        )
+        assert "Interface Name" not in _windows_interfaces()
+
+    def test_no_netsh_falls_back_rather_than_raising(self, monkeypatch):
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("netsh")),
+        )
+        assert _windows_interfaces() == []
+
+    def test_windows_does_not_go_through_if_nameindex(self, monkeypatch):
+        monkeypatch.setattr(ip_manager.sys, "platform", "win32")
+        monkeypatch.setattr(ip_manager, "_windows_interfaces", lambda: ["Ethernet"])
+        assert list_interfaces() == ["Ethernet"]
+
+
+class TestAddressAlreadyThere:
+    @pytest.mark.asyncio
+    async def test_an_address_already_up_is_success_not_failure(self, monkeypatch):
+        """"The object already exists" is the state we wanted."""
+        monkeypatch.setattr(ip_manager, "_bindable", lambda ip: True)
+
+        async def fail(cmd):
+            raise AssertionError("should not have run a command")
+
+        monkeypatch.setattr(ip_manager, "_run_command", fail)
+        assert await add_ip("Ethernet", "192.168.1.10") is False
+
+    @pytest.mark.asyncio
+    async def test_a_command_that_fails_but_leaves_it_usable_is_success(self, monkeypatch):
+        """Exit status is not the authority; bindability is."""
+        states = iter([False, True])
+        monkeypatch.setattr(ip_manager, "_bindable", lambda ip: next(states))
+
+        async def already_exists(cmd):
+            return 1, "", "The object already exists."
+
+        monkeypatch.setattr(ip_manager, "_run_command", already_exists)
+        assert await add_ip("Ethernet", "192.168.1.10") is False
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_failure_still_raises_and_names_the_adapters(self, monkeypatch):
+        monkeypatch.setattr(ip_manager, "_bindable", lambda ip: False)
+        monkeypatch.setattr(ip_manager.sys, "platform", "win32")
+        monkeypatch.setattr(ip_manager, "_windows_interfaces", lambda: ["Ethernet"])
+
+        async def disconnected(cmd):
+            return 1, "", "The interface may be disconnected."
+
+        monkeypatch.setattr(ip_manager, "_run_command", disconnected)
+        with pytest.raises(IPManagerError) as exc:
+            await add_ip("ethernet_0", "192.168.1.10")
+        # The message has to point at the name mismatch, which is the cause.
+        assert "friendly name" in str(exc.value)
+        assert "Ethernet" in str(exc.value)
+        assert "--nic" in str(exc.value)
+
+
+class TestBindRace:
+    @pytest.mark.asyncio
+    async def test_add_waits_for_the_address_to_become_usable(self, monkeypatch):
+        """netsh returns early; the caller binds immediately. Wait it out."""
+        calls = {"n": 0}
+
+        def bindable(ip):
+            calls["n"] += 1
+            return calls["n"] > 3   # not there, not there, not there, there
+
+        monkeypatch.setattr(ip_manager, "_bindable", bindable)
+
+        async def ok(cmd):
+            return 0, "", ""
+
+        monkeypatch.setattr(ip_manager, "_run_command", ok)
+        assert await add_ip("Ethernet", "192.168.1.10") is True
+        assert calls["n"] > 1, "did not poll at all"
+
+    @pytest.mark.asyncio
+    async def test_an_address_that_never_comes_up_says_so(self, monkeypatch):
+        monkeypatch.setattr(ip_manager, "_bindable", lambda ip: False)
+
+        async def ok(cmd):
+            return 0, "", ""
+
+        monkeypatch.setattr(ip_manager, "_run_command", ok)
+
+        async def instant(ip, timeout=10.0):
+            return False
+
+        monkeypatch.setattr(ip_manager, "_wait_until_bindable", instant)
+        with pytest.raises(IPManagerError, match="never became usable"):
+            await add_ip("Ethernet", "192.168.1.10")
+
+
+class TestTeardownOnlyUndoesWhatWeDid:
+    @pytest.mark.asyncio
+    async def test_an_address_we_added_is_removed(self, monkeypatch):
+        removed = []
+        monkeypatch.setattr(ip_manager, "add_ip", _returning(True))
+        monkeypatch.setattr(ip_manager, "remove_ip", _recording(removed))
+        async with temporary_ip("Ethernet", "192.168.1.10"):
+            pass
+        assert removed == [("Ethernet", "192.168.1.10")]
+
+    @pytest.mark.asyncio
+    async def test_an_address_that_was_already_there_is_left_alone(self, monkeypatch):
+        """Taking away the operator's own static IP is not ours to do."""
+        removed = []
+        monkeypatch.setattr(ip_manager, "add_ip", _returning(False))
+        monkeypatch.setattr(ip_manager, "remove_ip", _recording(removed))
+        async with temporary_ip("Ethernet", "192.168.1.10"):
+            pass
+        assert removed == []
+
+    @pytest.mark.asyncio
+    async def test_a_failure_inside_the_block_still_removes_ours(self, monkeypatch):
+        removed = []
+        monkeypatch.setattr(ip_manager, "add_ip", _returning(True))
+        monkeypatch.setattr(ip_manager, "remove_ip", _recording(removed))
+        with pytest.raises(RuntimeError):
+            async with temporary_ip("Ethernet", "192.168.1.10"):
+                raise RuntimeError("TFTP bind failed")
+        assert removed == [("Ethernet", "192.168.1.10")]
+
+
+def _returning(value):
+    async def _add(interface, ip, netmask="255.255.255.0"):
+        return value
+    return _add
+
+
+def _recording(sink):
+    async def _remove(interface, ip, netmask="255.255.255.0"):
+        sink.append((interface, ip))
+    return _remove
