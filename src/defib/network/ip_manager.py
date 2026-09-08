@@ -32,6 +32,11 @@ class IPManagerError(Exception):
     """Failed to manage IP address."""
 
 
+# netsh is the only source of adapter names netsh will accept.
+_NETSH_LIST_CMD = ["netsh", "interface", "show", "interface"]
+_NETSH_TIMEOUT = 10
+
+
 async def _run_command(cmd: list[str]) -> tuple[int, str, str]:
     """Run a shell command asynchronously and return (returncode, stdout, stderr)."""
     proc = await asyncio.create_subprocess_exec(
@@ -126,12 +131,20 @@ async def add_ip(interface: str, ip: str, netmask: str = "255.255.255.0") -> boo
         if _bindable(ip):
             logger.info("%s reported an error but %s is usable: %s", cmd[0], ip, detail)
             return False
-        raise IPManagerError(
-            f"Failed to add IP {ip} to {interface}: {detail}\n"
-            f"{_interface_name_advice(interface)}"
-        )
+        advice = await _interface_name_advice(interface)
+        raise IPManagerError(f"Failed to add IP {ip} to {interface}: {detail}\n{advice}")
 
-    if not await _wait_until_bindable(ip):
+    # From here the address is ours, so every way out of this function has to
+    # take it back down again -- `temporary_ip` cannot, because it does not
+    # learn that we own it until we return. Leaving it up would also make the
+    # next run read it as the operator's and never clean it up.
+    try:
+        ready = await _wait_until_bindable(ip)
+    except BaseException:
+        await _undo_add(interface, ip, netmask)
+        raise
+    if not ready:
+        await _undo_add(interface, ip, netmask)
         raise IPManagerError(
             f"{ip} was assigned to {interface} but never became usable. "
             f"Check that the adapter is connected and that {ip} does not "
@@ -141,11 +154,19 @@ async def add_ip(interface: str, ip: str, netmask: str = "255.255.255.0") -> boo
     return True
 
 
-def _interface_name_advice(interface: str) -> str:
+async def _undo_add(interface: str, ip: str, netmask: str) -> None:
+    """Best-effort rollback that must never replace the error that caused it."""
+    try:
+        await remove_ip(interface, ip, netmask)
+    except Exception:  # noqa: BLE001 - rollback failure must not mask the cause
+        logger.warning("Could not take %s back off %s", ip, interface, exc_info=True)
+
+
+async def _interface_name_advice(interface: str) -> str:
     """Point at the name mismatch that is nearly always the Windows cause."""
     if sys.platform != "win32":
         return f"Check that {interface} exists -- `ip -brief link` lists what does."
-    names = ", ".join(list_interfaces()) or "none found"
+    names = ", ".join(await list_interfaces_async()) or "none found"
     return (
         f"On Windows netsh wants the adapter's friendly name, which is not the "
         f"name Python reports for it. Adapters on this host: {names}. "
@@ -245,16 +266,42 @@ def _windows_interfaces() -> list[str]:
 
     try:
         proc = subprocess.run(
-            ["netsh", "interface", "show", "interface"],
-            capture_output=True, text=True, timeout=10,
+            _NETSH_LIST_CMD,
+            capture_output=True, text=True, timeout=_NETSH_TIMEOUT,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.warning("Could not list adapters with netsh: %s", exc)
         return []
 
+    return _parse_netsh_interfaces(proc.stdout)
+
+
+async def _windows_interfaces_async() -> list[str]:
+    """As `_windows_interfaces`, without standing on the event loop.
+
+    `list_interfaces()` is reached from the async install and network paths,
+    and from add_ip's own failure advice. A synchronous `subprocess.run` there
+    stops every other task until netsh returns -- which is the whole recovery,
+    including the serial link to a camera sitting in its bootrom window.
+    """
+    try:
+        returncode, stdout, stderr = await asyncio.wait_for(
+            _run_command(_NETSH_LIST_CMD), timeout=_NETSH_TIMEOUT,
+        )
+    except (OSError, asyncio.TimeoutError) as exc:
+        logger.warning("Could not list adapters with netsh: %s", exc)
+        return []
+    if returncode != 0:
+        logger.warning("netsh could not list adapters: %s", stderr.strip())
+        return []
+    return _parse_netsh_interfaces(stdout)
+
+
+def _parse_netsh_interfaces(stdout: str) -> list[str]:
+    """Pull the adapter names out of a `netsh interface show interface` table."""
     names: list[str] = []
     seen_separator = False
-    for line in proc.stdout.splitlines():
+    for line in stdout.splitlines():
         if line.strip().startswith("---"):
             # Everything above the rule is the header, in whatever language.
             seen_separator = True
@@ -270,11 +317,32 @@ def _windows_interfaces() -> list[str]:
     return names
 
 
+async def list_interfaces_async() -> list[str]:
+    """`list_interfaces` for callers that are already in an event loop."""
+    if sys.platform == "win32":
+        return await _windows_interfaces_async() or _fallback_interfaces()
+    return list_interfaces()
+
+
+def _fallback_interfaces() -> list[str]:
+    """Last resort when the platform will not enumerate."""
+    if sys.platform == "linux":
+        return ["eth0", "enp0s3"]
+    if sys.platform == "darwin":
+        return ["en0", "en1"]
+    if sys.platform == "win32":
+        return ["Ethernet", "Wi-Fi"]
+    return []
+
+
 def list_interfaces() -> list[str]:
     """List available network interfaces.
 
     Returns interface names that can be used with add_ip/remove_ip -- which is
     the whole point, and is why Windows does not go through if_nameindex.
+
+    Synchronous, so it belongs to the synchronous CLI commands;
+    `list_interfaces_async` is the one to reach for inside a coroutine.
     """
     import socket
 
@@ -291,13 +359,4 @@ def list_interfaces() -> list[str]:
         except OSError:
             pass
 
-    if not interfaces:
-        # Fallback: common defaults
-        if sys.platform == "linux":
-            interfaces = ["eth0", "enp0s3"]
-        elif sys.platform == "darwin":
-            interfaces = ["en0", "en1"]
-        elif sys.platform == "win32":
-            interfaces = ["Ethernet", "Wi-Fi"]
-
-    return interfaces
+    return interfaces or _fallback_interfaces()

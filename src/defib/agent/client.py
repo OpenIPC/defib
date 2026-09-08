@@ -225,10 +225,16 @@ def _agent_search_path(agent_name: str, chip: str = "") -> list[Path]:
 
 
 def get_agent_cache_dir() -> Path:
-    """Where a locally built agent binary can be dropped to be found."""
+    """Where a locally built agent binary can be dropped to be found.
+
+    Names the directory without making it. Building the search path must stay
+    free of side effects: an unwritable cache location used to raise out of
+    `get_agent_binary` even when DEFIB_AGENT_DIR held the binary, and out of
+    the help text whose whole job is to explain that nothing was found.
+    """
     from defib.firmware import get_cache_dir
 
-    return get_cache_dir().parent / "agent"
+    return get_cache_dir(create=False).parent / "agent"
 
 
 def agent_binary_help(chip: str) -> str:

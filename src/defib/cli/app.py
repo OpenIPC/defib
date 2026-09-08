@@ -829,7 +829,7 @@ async def _network_async(
 
     from rich.console import Console
 
-    from defib.network.ip_manager import list_interfaces, temporary_ip
+    from defib.network.ip_manager import list_interfaces_async, temporary_ip
     from defib.network.tftp_server import start_tftp_server
 
     console = Console()
@@ -851,7 +851,7 @@ async def _network_async(
 
     # Determine network interface
     if not nic:
-        interfaces = list_interfaces()
+        interfaces = await list_interfaces_async()
         if interfaces:
             nic = interfaces[0]
             if output == "human":
@@ -2227,7 +2227,7 @@ async def _install_async(
         has_firmware,
         pad_to_size,
     )
-    from defib.network.ip_manager import list_interfaces, temporary_ip
+    from defib.network.ip_manager import list_interfaces_async, temporary_ip
     from defib.network.tftp_server import start_tftp_server
     from defib.recovery.events import LogEvent, ProgressEvent
     from defib.recovery.session import RecoverySession
@@ -2600,7 +2600,7 @@ async def _install_async(
     if not use_pod_tftp:
         # Host TFTP needs a NIC + host_ip; pod path needs neither.
         if not nic:
-            interfaces = list_interfaces()
+            interfaces = await list_interfaces_async()
             if interfaces:
                 nic = interfaces[0]
             else:

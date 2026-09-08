@@ -19,6 +19,7 @@ put up.
 """
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 
@@ -27,9 +28,11 @@ import pytest
 from defib.network import ip_manager
 from defib.network.ip_manager import (
     IPManagerError,
+    _parse_netsh_interfaces,
     _windows_interfaces,
     add_ip,
     list_interfaces,
+    list_interfaces_async,
     temporary_ip,
 )
 
@@ -220,3 +223,159 @@ def _recording(sink):
     async def _remove(interface, ip, netmask="255.255.255.0"):
         sink.append((interface, ip))
     return _remove
+
+
+class TestTheAddressIsNeverStranded:
+    """Qodo review on OpenIPC/defib#135.
+
+    `add_ip` returns ownership to `temporary_ip`, so anything that raises
+    between assigning the address and returning happens while nobody is in a
+    position to clean up. A stranded address is not just litter: the next run
+    sees it already up and reads it as the operator's, so it is never removed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_wait_that_times_out_takes_the_address_back_down(self, monkeypatch):
+        removed = []
+        monkeypatch.setattr(ip_manager, "_bindable", lambda ip: False)
+
+        async def ok(cmd):
+            return 0, "", ""
+
+        async def never(ip, timeout=10.0):
+            return False
+
+        monkeypatch.setattr(ip_manager, "_run_command", ok)
+        monkeypatch.setattr(ip_manager, "_wait_until_bindable", never)
+        monkeypatch.setattr(ip_manager, "remove_ip", _recording(removed))
+
+        with pytest.raises(IPManagerError, match="never became usable"):
+            await add_ip("Ethernet", "192.168.1.10")
+        assert removed == [("Ethernet", "192.168.1.10")]
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_wait_takes_the_address_back_down(self, monkeypatch):
+        """Ctrl-C during a recovery must not leave the host reconfigured."""
+        removed = []
+        monkeypatch.setattr(ip_manager, "_bindable", lambda ip: False)
+
+        async def ok(cmd):
+            return 0, "", ""
+
+        async def cancelled(ip, timeout=10.0):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(ip_manager, "_run_command", ok)
+        monkeypatch.setattr(ip_manager, "_wait_until_bindable", cancelled)
+        monkeypatch.setattr(ip_manager, "remove_ip", _recording(removed))
+
+        with pytest.raises(asyncio.CancelledError):
+            await add_ip("Ethernet", "192.168.1.10")
+        assert removed == [("Ethernet", "192.168.1.10")]
+
+    @pytest.mark.asyncio
+    async def test_a_rollback_that_fails_does_not_hide_the_real_error(self, monkeypatch):
+        monkeypatch.setattr(ip_manager, "_bindable", lambda ip: False)
+
+        async def ok(cmd):
+            return 0, "", ""
+
+        async def never(ip, timeout=10.0):
+            return False
+
+        async def blows_up(interface, ip, netmask="255.255.255.0"):
+            raise OSError("netsh went away")
+
+        monkeypatch.setattr(ip_manager, "_run_command", ok)
+        monkeypatch.setattr(ip_manager, "_wait_until_bindable", never)
+        monkeypatch.setattr(ip_manager, "remove_ip", blows_up)
+
+        with pytest.raises(IPManagerError, match="never became usable"):
+            await add_ip("Ethernet", "192.168.1.10")
+
+    @pytest.mark.asyncio
+    async def test_an_address_that_was_already_there_is_not_rolled_back(self, monkeypatch):
+        removed = []
+        monkeypatch.setattr(ip_manager, "_bindable", lambda ip: True)
+        monkeypatch.setattr(ip_manager, "remove_ip", _recording(removed))
+        assert await add_ip("Ethernet", "192.168.1.10") is False
+        assert removed == []
+
+
+class TestNetshStaysOffTheEventLoop:
+    """Qodo review on OpenIPC/defib#135.
+
+    A synchronous `subprocess.run` reached from a coroutine stops every other
+    task until it returns -- during a recovery that includes the serial link to
+    a camera sitting in its bootrom window, which does not wait for us.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_async_path_does_not_call_subprocess_run(self, monkeypatch):
+        monkeypatch.setattr(ip_manager.sys, "platform", "win32")
+
+        def forbidden(*a, **k):
+            raise AssertionError("blocking subprocess.run on the event loop")
+
+        monkeypatch.setattr(subprocess, "run", forbidden)
+
+        async def fake(cmd):
+            return 0, NETSH_SHOW_INTERFACE, ""
+
+        monkeypatch.setattr(ip_manager, "_run_command", fake)
+        assert await list_interfaces_async() == ["Ethernet", "Wi-Fi", "Ethernet 2"]
+
+    @pytest.mark.asyncio
+    async def test_a_netsh_that_hangs_does_not_hang_the_recovery(self, monkeypatch):
+        monkeypatch.setattr(ip_manager.sys, "platform", "win32")
+        monkeypatch.setattr(ip_manager, "_NETSH_TIMEOUT", 0.05)
+
+        async def hangs(cmd):
+            await asyncio.sleep(30)
+            return 0, "", ""
+
+        monkeypatch.setattr(ip_manager, "_run_command", hangs)
+        # Falls back rather than stalling, and does so promptly.
+        assert await list_interfaces_async() == ["Ethernet", "Wi-Fi"]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_netsh_falls_back(self, monkeypatch):
+        monkeypatch.setattr(ip_manager.sys, "platform", "win32")
+
+        async def fails(cmd):
+            return 1, "", "The requested operation requires elevation."
+
+        monkeypatch.setattr(ip_manager, "_run_command", fails)
+        assert await list_interfaces_async() == ["Ethernet", "Wi-Fi"]
+
+    @pytest.mark.asyncio
+    async def test_the_failure_advice_is_async_too(self, monkeypatch):
+        """add_ip's own error message reaches the enumerator; that path counts."""
+        monkeypatch.setattr(ip_manager.sys, "platform", "win32")
+        monkeypatch.setattr(ip_manager, "_bindable", lambda ip: False)
+
+        def forbidden(*a, **k):
+            raise AssertionError("blocking subprocess.run on the event loop")
+
+        monkeypatch.setattr(subprocess, "run", forbidden)
+
+        async def dispatch(cmd):
+            if cmd[:2] == ["netsh", "interface"] and "show" in cmd:
+                return 0, NETSH_SHOW_INTERFACE, ""
+            return 1, "", "The interface may be disconnected."
+
+        monkeypatch.setattr(ip_manager, "_run_command", dispatch)
+        with pytest.raises(IPManagerError) as exc:
+            await add_ip("ethernet_0", "192.168.1.10")
+        assert "Ethernet" in str(exc.value)
+
+
+class TestTheParserIsSeparableFromTheCommand:
+    def test_parsing_needs_no_subprocess_at_all(self):
+        """Splitting the two is what let the async path reuse the parser."""
+        assert _parse_netsh_interfaces(NETSH_SHOW_INTERFACE) == [
+            "Ethernet", "Wi-Fi", "Ethernet 2",
+        ]
+
+    def test_an_empty_table_is_not_an_adapter(self):
+        assert _parse_netsh_interfaces("") == []

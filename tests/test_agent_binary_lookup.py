@@ -107,3 +107,46 @@ class TestTheMessage:
         for chip, build in _CHIP_TO_AGENT.items():
             assert agent_binary_for(chip) == build
         assert agent_binary_for("nonesuch") is None
+
+
+class TestLookupHasNoSideEffects:
+    """Qodo review on OpenIPC/defib#135.
+
+    Building the search path used to create the cache directory, so an
+    unwritable cache location raised out of `get_agent_binary` even when
+    DEFIB_AGENT_DIR held the binary -- and out of `agent_binary_help`, whose
+    entire job is to explain that nothing was found.
+    """
+
+    def test_searching_does_not_create_the_cache_directory(self, monkeypatch, tmp_path):
+        cache = tmp_path / "nonexistent-cache"
+        monkeypatch.setattr(
+            "defib.firmware.get_cache_dir",
+            lambda create=True: cache / "firmware",
+        )
+        _agent_search_path("hi3516cv300")
+        assert not cache.exists()
+
+    def test_a_binary_is_still_found_when_the_cache_cannot_be_made(
+        self, monkeypatch, tmp_path,
+    ):
+        def refuses(create=True):
+            if create:
+                raise OSError("read-only file system")
+            return tmp_path / "cache" / "firmware"
+
+        monkeypatch.setattr("defib.firmware.get_cache_dir", refuses)
+        monkeypatch.setenv("DEFIB_AGENT_DIR", str(tmp_path))
+        (tmp_path / "agent-hi3516cv300.bin").write_bytes(b"\x00" * 16)
+        assert get_agent_binary("hi3516cv300") == tmp_path / "agent-hi3516cv300.bin"
+
+    def test_the_help_text_still_renders_when_the_cache_cannot_be_made(
+        self, monkeypatch, tmp_path,
+    ):
+        def refuses(create=True):
+            if create:
+                raise OSError("read-only file system")
+            return tmp_path / "cache" / "firmware"
+
+        monkeypatch.setattr("defib.firmware.get_cache_dir", refuses)
+        assert "make SOC=hi3516cv300" in agent_binary_help("hi3516cv300")
