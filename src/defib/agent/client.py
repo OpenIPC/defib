@@ -7,6 +7,7 @@ communicates via the COBS binary protocol for fast flash operations.
 from __future__ import annotations
 
 import logging
+import os
 import struct
 import zlib
 from dataclasses import dataclass, field
@@ -142,6 +143,28 @@ DEFAULT_FAST_BAUD = 921600    # ~82 KB/s both directions
 FALLBACK_BAUD = 115200        # Always works
 
 
+# Which agent build a chip uses. Several chips share one because they share a
+# memory map, so the build name is not the chip name. Module scope so the "no
+# binary" help text lists exactly what the lookup accepts.
+_CHIP_TO_AGENT = {
+    "hi3516ev300": "hi3516ev300",
+    "hi3516ev200": "hi3516ev200",
+    "gk7205v200": "gk7205v200",
+    "gk7205v300": "gk7205v200",
+    "gk7202v300": "gk7205v200",
+    "hi3516cv300": "hi3516cv300",
+    "hi3516cv500": "hi3516cv500",
+    "hi3516av300": "hi3516cv500",  # cv500-family, same memory map
+    "hi3516dv300": "hi3516cv500",  # cv500-family, same memory map
+    "hi3519v101": "hi3519v101",
+    "hi3516av200": "hi3519v101",   # 3519v101 family, same memory map
+    "hi3516cv610": "hi3516cv610",
+    "hi3516cv608": "hi3516cv610",  # cv6xx-family, same memory map
+    "hi3518ev200": "hi3518ev200",
+    "hi3520dv200": "hi3520dv200",  # V1-era, HISFC350 SPI controller
+}
+
+
 def get_agent_binary(chip: str) -> Path | None:
     """Get the path to the pre-compiled agent binary for a chip.
 
@@ -149,35 +172,94 @@ def get_agent_binary(chip: str) -> Path | None:
     the variant only affects DDR init, not the agent binary, so we strip
     it before the lookup.
     """
-    chip = chip.split(":", 1)[0]
-    chip_to_agent = {
-        "hi3516ev300": "hi3516ev300",
-        "gk7205v200": "gk7205v200",
-        "gk7205v300": "gk7205v200",
-        "gk7202v300": "gk7205v200",
-        "hi3516cv300": "hi3516cv300",
-        "hi3516cv500": "hi3516cv500",
-        "hi3516av300": "hi3516cv500",  # cv500-family, same memory map
-        "hi3516dv300": "hi3516cv500",  # cv500-family, same memory map
-        "hi3519v101": "hi3519v101",
-        "hi3516av200": "hi3519v101",   # 3519v101 family, same memory map
-        "hi3516cv610": "hi3516cv610",
-        "hi3516cv608": "hi3516cv610",  # cv6xx-family, same memory map
-        "hi3518ev200": "hi3518ev200",
-        "hi3520dv200": "hi3520dv200",  # V1-era, HISFC350 SPI controller
-    }
-
-    agent_name = chip_to_agent.get(chip.lower())
+    agent_name = agent_binary_for(chip)
     if not agent_name:
         return None
 
-    candidates = [
-        Path(__file__).parent.parent.parent.parent / "agent" / f"agent-{agent_name}.bin",
-    ]
-    for path in candidates:
+    for path in _agent_search_path(agent_name, chip):
         if path.exists():
             return path
     return None
+
+
+def agent_binary_for(chip: str) -> str | None:
+    """The agent build this chip uses, or None if there is no agent for it.
+
+    Several chips share one binary because they share a memory map, so the
+    build name is not the chip name.
+    """
+    return _CHIP_TO_AGENT.get(chip.split(":", 1)[0].lower())
+
+
+def _agent_search_path(agent_name: str, chip: str = "") -> list[Path]:
+    """Where an agent binary may be found, nearest first.
+
+    The only entry this used to have was the git checkout, four levels up from
+    this module. In an installed package that resolves inside site-packages and
+    can never exist, so `defib agent` was unreachable for anyone who installed
+    defib the documented way -- the reporter in OpenIPC/firmware#2381 hit it on
+    a uv tool install. The binary still has to be compiled per SoC, so the
+    honest fix is to look where a compiled one plausibly is and to say how to
+    build one when it is not there.
+
+    Both names are tried in every directory. `make` names its output after the
+    SOC it was given, and several chips map onto another chip's build, so
+    `make SOC=gk7205v300` leaves an agent-gk7205v300.bin that a search for the
+    mapped agent-gk7205v200.bin would walk straight past.
+    """
+    names = [n for n in (chip.split(":", 1)[0].lower(), agent_name) if n]
+    filenames = list(dict.fromkeys(f"agent-{n}.bin" for n in names))
+
+    directories = []
+    override = os.environ.get("DEFIB_AGENT_DIR")
+    if override:
+        directories.append(Path(override))
+    # Shipped inside the package, for a wheel that carries prebuilt agents.
+    directories.append(Path(__file__).parent / "binaries")
+    # Built by hand and dropped in the cache next to downloaded firmware.
+    directories.append(get_agent_cache_dir())
+    # A git checkout with `make SOC=<soc>` already run in agent/.
+    directories.append(Path(__file__).parent.parent.parent.parent / "agent")
+
+    return [d / f for d in directories for f in filenames]
+
+
+def get_agent_cache_dir() -> Path:
+    """Where a locally built agent binary can be dropped to be found.
+
+    Names the directory without making it. Building the search path must stay
+    free of side effects: an unwritable cache location used to raise out of
+    `get_agent_binary` even when DEFIB_AGENT_DIR held the binary, and out of
+    the help text whose whole job is to explain that nothing was found.
+    """
+    from defib.firmware import get_cache_dir
+
+    return get_cache_dir(create=False).parent / "agent"
+
+
+def agent_binary_help(chip: str) -> str:
+    """Say why there is no agent binary, and what to do about it."""
+    agent_name = agent_binary_for(chip)
+    if not agent_name:
+        supported = ", ".join(sorted(set(_CHIP_TO_AGENT)))
+        return (
+            f"There is no flash agent for '{chip}'. The agent supports: "
+            f"{supported}. Use `defib install` or `defib restore`, which drive "
+            f"U-Boot over TFTP instead and work on every supported chip."
+        )
+    looked_in = "\n  ".join(str(p) for p in _agent_search_path(agent_name, chip))
+    return (
+        f"No agent binary for '{chip}' (it uses the {agent_name} build).\n"
+        f"The agent is bare-metal C compiled per SoC, and no prebuilt binary "
+        f"ships in the package -- build it from a defib checkout:\n"
+        f"  git clone https://github.com/OpenIPC/defib && cd defib/agent\n"
+        f"  make SOC={agent_name}          # needs arm-none-eabi-gcc\n"
+        f"then either run defib from that checkout, copy agent-{agent_name}.bin "
+        f"into {get_agent_cache_dir()}, or point DEFIB_AGENT_DIR at it.\n"
+        f"Looked in:\n  {looked_in}\n"
+        f"Or skip the agent: `defib install` and `defib restore` drive U-Boot "
+        f"over TFTP and need nothing compiled."
+    )
 
 
 class FlashAgentClient:

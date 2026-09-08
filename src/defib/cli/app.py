@@ -829,7 +829,7 @@ async def _network_async(
 
     from rich.console import Console
 
-    from defib.network.ip_manager import list_interfaces, temporary_ip
+    from defib.network.ip_manager import list_interfaces_async, temporary_ip
     from defib.network.tftp_server import start_tftp_server
 
     console = Console()
@@ -851,7 +851,7 @@ async def _network_async(
 
     # Determine network interface
     if not nic:
-        interfaces = list_interfaces()
+        interfaces = await list_interfaces_async()
         if interfaces:
             nic = interfaces[0]
             if output == "human":
@@ -1036,7 +1036,9 @@ async def _agent_upload_async(
 
     from rich.console import Console
 
-    from defib.agent.client import FlashAgentClient, get_agent_binary
+    from defib.agent.client import (
+        FlashAgentClient, agent_binary_help, get_agent_binary,
+    )
     from defib.firmware import get_cached_path
     from defib.profiles.loader import load_profile
     from defib.protocol.hisilicon_cv6xx import HiSiliconCV6xx
@@ -1052,7 +1054,10 @@ async def _agent_upload_async(
     # Find agent binary
     agent_path = get_agent_binary(chip)
     if not agent_path:
-        msg = f"No agent binary for '{chip}'"
+        # A bare "No agent binary for '<chip>'" reads as an unsupported chip,
+        # which sent the reporter in OpenIPC/firmware#2381 looking for another
+        # tool when the answer was that nothing had compiled it yet.
+        msg = agent_binary_help(chip)
         if output == "json":
             print(json_mod.dumps({"event": "error", "message": msg}))
         else:
@@ -1348,7 +1353,9 @@ async def _agent_flash_async(
 
     from rich.console import Console
 
-    from defib.agent.client import FlashAgentClient, get_agent_binary
+    from defib.agent.client import (
+        FlashAgentClient, agent_binary_help, get_agent_binary,
+    )
     from defib.firmware import get_cached_path
     from defib.profiles.loader import load_profile
     from defib.protocol.hisilicon_standard import HiSiliconStandard
@@ -1375,7 +1382,10 @@ async def _agent_flash_async(
     # --- Find agent binary ---
     agent_path = get_agent_binary(chip)
     if not agent_path:
-        msg = f"No agent binary for '{chip}'"
+        # A bare "No agent binary for '<chip>'" reads as an unsupported chip,
+        # which sent the reporter in OpenIPC/firmware#2381 looking for another
+        # tool when the answer was that nothing had compiled it yet.
+        msg = agent_binary_help(chip)
         if output == "json":
             print(json_mod.dumps({"event": "error", "message": msg}))
         else:
@@ -2217,7 +2227,7 @@ async def _install_async(
         has_firmware,
         pad_to_size,
     )
-    from defib.network.ip_manager import list_interfaces, temporary_ip
+    from defib.network.ip_manager import list_interfaces_async, temporary_ip
     from defib.network.tftp_server import start_tftp_server
     from defib.recovery.events import LogEvent, ProgressEvent
     from defib.recovery.session import RecoverySession
@@ -2590,7 +2600,7 @@ async def _install_async(
     if not use_pod_tftp:
         # Host TFTP needs a NIC + host_ip; pod path needs neither.
         if not nic:
-            interfaces = list_interfaces()
+            interfaces = await list_interfaces_async()
             if interfaces:
                 nic = interfaces[0]
             else:

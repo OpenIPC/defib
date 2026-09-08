@@ -68,8 +68,13 @@ CHIP_TO_FIRMWARE: dict[str, str] = {
 }
 
 
-def get_cache_dir() -> Path:
-    """Get platform-appropriate cache directory for downloaded firmware."""
+def get_cache_dir(create: bool = True) -> Path:
+    """Get platform-appropriate cache directory for downloaded firmware.
+
+    `create=False` just names the directory. Callers that are only searching
+    should use it: an unwritable cache location must not stop a lookup that
+    would have found the file somewhere else entirely.
+    """
     if sys.platform == "darwin":
         base = Path.home() / "Library" / "Caches"
     elif sys.platform == "win32":
@@ -77,7 +82,8 @@ def get_cache_dir() -> Path:
     else:
         base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     cache_dir = base / "defib" / "firmware"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    if create:
+        cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
 

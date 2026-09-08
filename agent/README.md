@@ -83,6 +83,24 @@ Requires `arm-none-eabi-gcc` (Arch: `pacman -S arm-none-eabi-gcc arm-none-eabi-n
 
 Addresses from [qemu-hisilicon](https://github.com/OpenIPC/LoTool) hardware definitions.
 
+### Where defib looks for a built binary
+
+No prebuilt agent ships in the pip/uv package -- the binary is bare-metal ARM
+compiled per SoC, so it has to be built here first. `defib agent` searches, in
+order:
+
+1. `$DEFIB_AGENT_DIR`
+2. `defib/agent/binaries/` inside the installed package
+3. the agent cache directory (`defib agent` prints the path when it finds
+   nothing) -- next to the downloaded-firmware cache
+4. this `agent/` directory, which is what a git checkout gets for free
+
+Both `agent-<chip>.bin` and `agent-<build>.bin` are tried in each, so a
+`make SOC=gk7205v300` build is found even though that chip shares the
+gk7205v200 memory map. If you installed defib rather than cloning it, build
+here and copy the `.bin` into the cache directory, or point `DEFIB_AGENT_DIR`
+at this one.
+
 `hi3520dv200` is a V1-era DVR/NVR SoC: Cortex-A9 (single core), `0x2xxxxxxx`
 peripheral map, and a HISFC350 SPI flash controller (NOT the FMC100 used by
 all other supported SoCs). The HISFC350 driver lives in
