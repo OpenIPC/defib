@@ -695,17 +695,38 @@ def dump_flash_cmd(
     output_file: str = typer.Option("flash_dump.bin", "-o", "--output", help="Output binary file"),
     size: str = typer.Option("", "--size", help="Flash size (e.g., 8MB, 16MB) — auto-detect if empty"),
     output: str = typer.Option("human", "--output-mode", help="Output mode: human, json"),
+    chip: str = typer.Option("", "-c", "--chip", help="Chip model. Only needed for chips that dump over USB rather than a U-Boot console."),
+    partition: str = typer.Option("", "--partition", help="USB-recovery chips: dump one named partition instead of the whole flash"),
+    ddr: str = typer.Option("", "--ddr", help="USB-recovery chips: DDR-init blob (rkbin rv1106_ddr_*.bin)"),
+    usbplug: str = typer.Option("", "--usbplug", help="USB-recovery chips: usbplug blob (rkbin rv1106_usbplug_*.bin)"),
+    loader: str = typer.Option("", "--loader", help="USB-recovery chips: RKBOOT container (MiniLoaderAll.bin), instead of --ddr/--usbplug"),
+    wait: float = typer.Option(30.0, "--wait", help="USB-recovery chips: seconds to wait for the board to enumerate"),
+    usb_path: str = typer.Option("", "--usb-path", help="USB-recovery chips: pin to one physical port path (e.g. 1-4.2)"),
+    power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via the configured controller"),
 ) -> None:
-    """Dump flash contents via U-Boot serial console.
+    """Dump flash contents.
 
-    Requires U-Boot to be running on the device (connect to serial
-    console first, or use after 'defib burn').
+    For most chips this drives a U-Boot serial console, so U-Boot must
+    already be running (connect first, or use after 'defib burn').
+
+    Chips whose boot ROM only answers on USB (Rockchip) are read directly
+    over USB instead — pass -c along with --ddr/--usbplug, and -p is not
+    consulted. Use --partition to pull a single named region rather than the
+    whole device.
     """
     import asyncio
-    asyncio.run(_dump_flash_async(port, output_file, size, output))
+    asyncio.run(_dump_flash_async(
+        port, output_file, size, output, chip, partition,
+        ddr, usbplug, loader, wait, usb_path, power_cycle,
+    ))
 
 
-async def _dump_flash_async(port: str, output_file: str, size: str, output: str) -> None:
+async def _dump_flash_async(
+    port: str, output_file: str, size: str, output: str,
+    chip: str = "", partition: str = "",
+    ddr: str = "", usbplug: str = "", loader: str = "",
+    wait: float = 30.0, usb_path: str = "", power_cycle: bool = False,
+) -> None:
     import json as json_mod
 
     from rich.console import Console
@@ -714,6 +735,13 @@ async def _dump_flash_async(port: str, output_file: str, size: str, output: str)
     from defib.transport.serial_platform import create_transport, normalize_port_name
 
     console = Console()
+
+    if chip and _recovery_mode_or_exit(chip, output) == "usb":
+        await _dump_flash_usb_async(
+            chip, output_file, partition, ddr, usbplug, loader,
+            wait, usb_path, power_cycle, output,
+        )
+        return
 
     # Parse size
     flash_size = None
@@ -3728,7 +3756,12 @@ async def _open_usb_target(
     """
     from rich.console import Console
 
-    from defib.rockusb.device import DeviceMode, RockusbDevice, wait_for_device
+    from defib.rockusb.device import (
+        DeviceMode,
+        RockusbDevice,
+        RockusbUsbError,
+        wait_for_device,
+    )
     from defib.rockusb.recovery import RockchipRecovery
 
     console = Console()
@@ -3753,6 +3786,25 @@ async def _open_usb_target(
     device = RockusbDevice(found)
     device.open()
     recovery = RockchipRecovery(device)
+
+    # A usbplug left running by a previous invocation is not safe to reuse: it
+    # reliably wedges on the next command from a fresh process. Every tool in
+    # this space re-uploads the loader each run for that reason. So if we find
+    # one already in loader mode, send it back to MaskROM and start clean.
+    if found.mode is DeviceMode.LOADER:
+        if output == "human":
+            console.print("  Found a stale loader; returning it to MaskROM...")
+        try:
+            await recovery.return_to_maskrom(
+                usb_path=found.usb_path, recovery_ids=recovery_ids
+            )
+        except RockusbUsbError as e:
+            recovery.close()
+            raise RockusbUsbError(
+                f"{e}. A previous run left the loader wedged and it will not "
+                "reset — power-cycle the board (BOOT + replug) and retry."
+            ) from e
+        found = recovery.device_info
 
     if found.mode is DeviceMode.MASKROM:
         if output == "human":
@@ -3838,6 +3890,112 @@ async def _burn_usb_async(
         console.print(
             "\n[green bold]Device is awake[/green bold] and in loader mode, "
             "ready for a flashing tool."
+        )
+
+
+async def _dump_flash_usb_async(
+    chip: str, output_file: str, partition: str,
+    ddr: str, usbplug: str, loader: str,
+    wait: float, usb_path: str, power_cycle: bool, output: str,
+) -> None:
+    """``dump-flash`` for chips whose boot ROM only answers on USB.
+
+    Reads through the usbplug's LBA space, which maps directly onto the
+    kernel's mtd partitions — a partition dumped here compares byte for byte
+    against one taken with ``cat /dev/mtdN`` on a running board.
+
+    Streams to disk: a full RV1106 is 255 MiB and there is no reason for it
+    to pass through memory twice.
+    """
+    import json as json_mod
+    from pathlib import Path
+
+    from rich.console import Console
+
+    from defib.profiles.loader import load_profile
+    from defib.rockusb.loader import LoaderFormatError
+    from defib.rockusb.protocol import SECTOR_SIZE, RockusbError
+
+    console = Console()
+    profile = load_profile(chip)
+
+    extent = None
+    if partition:
+        extent = profile.partitions.get(partition)
+        if extent is None:
+            known = ", ".join(sorted(profile.partitions)) or "(none declared)"
+            _usb_fail(output, f"{chip} declares no partition {partition!r}. Known: {known}")
+            return
+
+    recovery = None
+    written = 0
+    try:
+        blobs = _resolve_usb_loader(chip, ddr, usbplug, loader)
+        recovery = await _open_usb_target(
+            blobs, power_cycle, output, wait, "", usb_path,
+            profile.usb_recovery_ids,
+        )
+
+        info = await recovery.read_flash_info()
+        if output == "human":
+            console.print(f"  Flash: {info}")
+
+        if extent is not None:
+            start, sectors = extent.lba, extent.sectors
+        else:
+            start, sectors = 0, info.sectors
+
+        # Never read past what the device says it holds: the LBA commands
+        # stop answering there, and a dump that ends in a stall is worse than
+        # one that refuses to start.
+        if start + sectors > info.sectors:
+            _usb_fail(
+                output,
+                f"{partition or 'full dump'} runs to sector {start + sectors} "
+                f"but the flash reports only {info.sectors}",
+            )
+            return
+
+        target = Path(output_file)
+        if output == "human":
+            what = f"partition {partition!r}" if partition else "whole flash"
+            console.print(
+                f"  Dumping {what}: {sectors * SECTOR_SIZE / 1024 / 1024:.1f} MiB "
+                f"from lba {start} -> {target}"
+            )
+
+        # Stream to a temp file beside the destination and atomically replace
+        # it only once the whole transfer lands: a failure part-way must not
+        # truncate an existing backup or strand a partial image at the path.
+        tmp = target.with_name(target.name + ".partial")
+        ok = False
+        try:
+            with tmp.open("wb") as fh:
+                written = await recovery.dump_image(
+                    start, sectors, fh.write,
+                    on_progress=_usb_progress_printer(output),
+                )
+            tmp.replace(target)
+            ok = True
+        finally:
+            if not ok:
+                tmp.unlink(missing_ok=True)
+    except (RockusbError, LoaderFormatError, OSError, typer.BadParameter) as e:
+        _usb_fail(output, str(e))
+        return
+    finally:
+        if recovery is not None:
+            recovery.close()
+
+    if output == "json":
+        print(json_mod.dumps({
+            "event": "done", "success": True,
+            "file": output_file, "bytes": written,
+        }))
+    else:
+        console.print(
+            f"\n[green bold]Dumped {written / 1024 / 1024:.1f} MiB[/green bold] "
+            f"to {output_file}"
         )
 
 

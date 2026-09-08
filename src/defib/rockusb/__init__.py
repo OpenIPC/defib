@@ -30,21 +30,26 @@ from defib.rockusb.codec import RK_RC4_KEY, rc4, rk_crc16
 from defib.rockusb.loader import LoaderBlobs, LoaderFormatError, parse_loader
 from defib.rockusb.maskrom import CODE_471, CODE_472, build_maskrom_chunks
 from defib.rockusb.protocol import (
+    FLASH_INFO_LENGTH,
     SECTOR_SIZE,
     CommandStatus,
+    FlashInfo,
     Opcode,
     ResetSubcode,
     RockusbError,
     build_cbw,
     parse_csw,
+    parse_flash_info,
 )
 
 __all__ = [
     "CODE_471",
     "CODE_472",
+    "FLASH_INFO_LENGTH",
     "RK_RC4_KEY",
     "SECTOR_SIZE",
     "CommandStatus",
+    "FlashInfo",
     "LoaderBlobs",
     "LoaderFormatError",
     "Opcode",
@@ -53,6 +58,7 @@ __all__ = [
     "build_cbw",
     "build_maskrom_chunks",
     "parse_csw",
+    "parse_flash_info",
     "parse_loader",
     "rc4",
     "rk_crc16",

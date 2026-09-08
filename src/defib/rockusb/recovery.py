@@ -24,15 +24,19 @@ from typing import Callable
 from defib.recovery.events import ProgressEvent, Stage
 from defib.rockusb.device import (
     DeviceMode,
+    FoundDevice,
     RockusbDevice,
     wait_for_device,
 )
 from defib.rockusb.loader import LoaderBlobs
 from defib.rockusb.maskrom import CODE_471, CODE_472, build_maskrom_chunks
 from defib.rockusb.protocol import (
+    FLASH_INFO_LENGTH,
     SECTOR_SIZE,
+    FlashInfo,
     Opcode,
     ResetSubcode,
+    parse_flash_info,
     split_lba_transfers,
 )
 
@@ -188,11 +192,87 @@ class RockchipRecovery:
             )
         return bytes(out)
 
+    async def read_flash_info(self) -> FlashInfo:
+        """Capacity and geometry as the FTL sees it."""
+        return parse_flash_info(
+            await asyncio.to_thread(
+                self._device.command,
+                Opcode.READ_FLASH_INFO,
+                read_length=FLASH_INFO_LENGTH,
+            )
+        )
+
+    async def dump_image(
+        self,
+        start_lba: int,
+        sectors: int,
+        sink: Callable[[bytes], None],
+        on_progress: Callable[[ProgressEvent], None] | None = None,
+    ) -> int:
+        """Read ``sectors`` sectors, handing each chunk straight to ``sink``.
+
+        Streams rather than returning bytes: a full RV1106 dump is 255 MiB,
+        and holding that in memory to write it out again helps nobody.
+
+        Returns the number of bytes read.
+        """
+        done = 0
+        total = sectors * SECTOR_SIZE
+        for lba, count in split_lba_transfers(start_lba, sectors):
+            chunk = await asyncio.to_thread(
+                self._device.command,
+                Opcode.READ_LBA,
+                address=lba,
+                count=count,
+                read_length=count * SECTOR_SIZE,
+            )
+            sink(chunk)
+            done += len(chunk)
+            _emit(on_progress, ProgressEvent(Stage.FLASH_READ, done, total, f"lba {lba}"))
+        return done
+
     async def read_flash_id(self) -> bytes:
         """Flash ID bytes — a cheap "is the usbplug really alive" probe."""
         return await asyncio.to_thread(
             self._device.command, Opcode.READ_FLASH_ID, read_length=5
         )
+
+    @property
+    def device_info(self) -> FoundDevice:
+        """The currently-held device's :class:`FoundDevice`."""
+        return self._device._found
+
+    async def return_to_maskrom(
+        self,
+        usb_path: str | None = None,
+        recovery_ids: Sequence[int] | None = None,
+        timeout: float = 15.0,
+    ) -> RockusbDevice:
+        """Send a running usbplug back to MaskROM and re-acquire it there.
+
+        Reusing a usbplug a previous process left behind wedges the next
+        command, so a fresh run resets to MaskROM and re-uploads. Returns the
+        new MaskROM-mode device handle; the old one is closed.
+
+        Raises:
+            RockusbUsbError: if the loader will not accept the reset (already
+                wedged) or MaskROM never reappears.
+        """
+        if self._device.mode is DeviceMode.MASKROM:
+            return self._device
+
+        await self.reset(ResetSubcode.MASKROM)
+        self._device.close()
+        await asyncio.sleep(USBPLUG_SETTLE)
+
+        found = await wait_for_device(
+            timeout=timeout, mode=DeviceMode.MASKROM,
+            usb_path=usb_path, recovery_ids=recovery_ids,
+        )
+        device = RockusbDevice(found)
+        device.open()
+        self._device = device
+        return device
 
     def close(self) -> None:
         """Release the underlying device.

@@ -12,6 +12,7 @@ tested without libusb.
 from __future__ import annotations
 
 import struct
+from dataclasses import dataclass
 from enum import IntEnum
 
 CBW_SIGNATURE = b"USBC"
@@ -69,6 +70,80 @@ def cdb_length(opcode: Opcode | int) -> int:
         CDB_LENGTH_ADDRESSED
         if opcode in _ADDRESSED_OPCODES
         else CDB_LENGTH_SHORT
+    )
+
+
+#: Bytes READ_FLASH_INFO returns.
+FLASH_INFO_LENGTH = 11
+
+
+@dataclass(frozen=True)
+class FlashInfo:
+    """What the usbplug reports about the flash behind it.
+
+    Sizes are the FTL's view, not the raw part: an RV1106 with a 256 MiB SPI
+    NAND reports 255.5 MiB, the remainder being the translation layer's own
+    reserve. That is the number a dump should trust — it is exactly the span
+    the LBA commands will answer for.
+    """
+
+    sectors: int
+    block_sectors: int
+    page_sectors: int
+    ecc_bits: int
+    access_time: int
+    manufacturer: int
+    flash_mask: int
+
+    @property
+    def size_bytes(self) -> int:
+        return self.sectors * SECTOR_SIZE
+
+    @property
+    def block_bytes(self) -> int:
+        """Erase block size. Matches the kernel's mtd ``erasesize``."""
+        return self.block_sectors * SECTOR_SIZE
+
+    @property
+    def page_bytes(self) -> int:
+        return self.page_sectors * SECTOR_SIZE
+
+    def __str__(self) -> str:
+        return (
+            f"{self.size_bytes / 1024 / 1024:.1f} MiB "
+            f"({self.sectors} sectors), "
+            f"block {self.block_bytes // 1024} KiB, page {self.page_bytes} B"
+        )
+
+
+def parse_flash_info(data: bytes) -> FlashInfo:
+    """Parse a READ_FLASH_INFO reply.
+
+    Raises:
+        RockusbError: on a short reply, or one claiming zero capacity — both
+            mean the usbplug never got the flash up, and dumping from it would
+            produce a convincing file full of nothing.
+    """
+    if len(data) < FLASH_INFO_LENGTH:
+        raise RockusbError(
+            f"short flash info: got {len(data)} bytes, want {FLASH_INFO_LENGTH}"
+        )
+    sectors, block, page, ecc, access, mfr, mask = struct.unpack_from(
+        "<IHBBBBB", data
+    )
+    if sectors == 0:
+        raise RockusbError(
+            "flash reports zero capacity — the loader is running but has not "
+            "brought the flash up"
+        )
+    return FlashInfo(
+        sectors=sectors,
+        block_sectors=block,
+        page_sectors=page,
+        ecc_bits=ecc,
+        access_time=access,
+        manufacturer=mfr,
+        flash_mask=mask,
     )
 
 
