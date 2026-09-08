@@ -36,7 +36,19 @@ class TestNothingTypedIsNothingSent:
         assert read_available_keys() == b""
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="select() takes only sockets on Windows, and this path never runs there",
+)
 class TestPosixReading:
+    """The POSIX reader, on the platforms it actually runs on.
+
+    `read_available_keys` dispatches on the platform, so `_read_posix` is never
+    reached on Windows. Forcing it there tests nothing and fails for a reason
+    that is not a defect: Windows `select()` accepts sockets only, so the pipe
+    these tests use is rejected and the read comes back empty.
+    """
+
     def test_what_was_typed_comes_back(self, monkeypatch):
         r, w = os.pipe()
         os.write(w, b"sf probe 0\n")
