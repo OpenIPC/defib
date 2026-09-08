@@ -14,15 +14,23 @@ serial link to the board.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from contextlib import contextmanager
-from typing import Iterator, Protocol
+from typing import Any, Iterator, Protocol
+
+logger = logging.getLogger(__name__)
 
 # Windows reports a special key (arrows, function keys, keypad) as a marker
 # byte followed by a scan code. Neither means anything to U-Boot, and passing
 # them through types garbage at the prompt.
 _WINDOWS_SPECIAL_PREFIXES = (b"\x00", b"\xe0")
+
+# Most one poll may collect before handing the loop back. A person types a
+# few bytes; a pipe never stops, and draining it until it pauses would keep
+# the serial read and the stop flag waiting for as long as the producer runs.
+_MAX_BYTES_PER_POLL = 4096
 
 
 class _HasFileno(Protocol):
@@ -61,10 +69,7 @@ def raw_terminal(stream: _HasFileno | None = None) -> Iterator[None]:
         tty.setcbreak(fd)
         yield
     finally:
-        try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-        except Exception:
-            pass
+        _restore_terminal(fd, saved)
 
 
 def read_available_keys() -> bytes:
@@ -85,7 +90,7 @@ def _read_windows() -> bytes:
         return b""
 
     out = bytearray()
-    while msvcrt.kbhit():  # type: ignore[attr-defined]
+    while len(out) < _MAX_BYTES_PER_POLL and msvcrt.kbhit():  # type: ignore[attr-defined]
         char = msvcrt.getch()  # type: ignore[attr-defined]
         if char in _WINDOWS_SPECIAL_PREFIXES:
             msvcrt.getch()  # type: ignore[attr-defined]  # drop the scan code
@@ -103,7 +108,7 @@ def _read_posix() -> bytes:
         return b""
 
     out = bytearray()
-    while True:
+    while len(out) < _MAX_BYTES_PER_POLL:
         try:
             ready, _, _ = select.select([fd], [], [], 0)
         except (OSError, ValueError):
@@ -111,10 +116,42 @@ def _read_posix() -> bytes:
         if not ready:
             break
         try:
-            chunk = os.read(fd, 256)
+            chunk = os.read(fd, min(256, _MAX_BYTES_PER_POLL - len(out)))
         except OSError:
             break
         if not chunk:  # EOF on a pipe
             break
         out += chunk
     return bytes(out)
+
+
+def _restore_terminal(fd: int, saved: Any) -> None:
+    """Put the terminal back the way it was, and say so if that fails.
+
+    This is the only thing between a failed restore and a shell with no echo
+    and no line editing. Discarding the failure -- which is what this used to
+    do -- leaves the operator with a broken terminal and nothing to explain it.
+
+    TCSADRAIN waits for pending output and so can be the half that fails; it is
+    the right first choice because it does not truncate what the board was
+    printing, and TCSANOW is worth trying before giving up.
+
+    Never raises. The body may already be unwinding with the error that
+    actually matters, and a cleanup failure must not replace it.
+    """
+    import termios
+
+    for when in (termios.TCSADRAIN, termios.TCSANOW):
+        try:
+            termios.tcsetattr(fd, when, saved)
+            return
+        except Exception as exc:  # noqa: PERF203 - the retry is the point
+            logger.debug("tcsetattr(%s) failed: %s", when, exc)
+
+    # stderr rather than logging alone: this has to reach someone whose
+    # terminal has just stopped echoing, whatever their logging setup is.
+    print(
+        "defib could not restore your terminal settings. "
+        "Run `stty sane` (you may have to type it blind) to get echo back.",
+        file=sys.stderr,
+    )

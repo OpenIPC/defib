@@ -15,7 +15,13 @@ from pathlib import Path
 import pytest
 
 from defib.cli import keyboard
-from defib.cli.keyboard import _read_posix, raw_terminal, read_available_keys
+from defib.cli.keyboard import (
+    _MAX_BYTES_PER_POLL,
+    _read_posix,
+    _restore_terminal,
+    raw_terminal,
+    read_available_keys,
+)
 
 
 class TestNothingTypedIsNothingSent:
@@ -178,3 +184,101 @@ class _FakeMsvcrt:
 
     def getch(self) -> bytes:
         return bytes([self._keys.pop(0)])
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="select() takes only sockets on Windows, and this path never runs there",
+)
+class TestOnePollCannotRunAway:
+    """Qodo review on OpenIPC/defib#136.
+
+    The reader drained stdin for as long as it stayed readable. A person types
+    a few bytes and it returns at once, but a pipe that keeps producing never
+    stops being readable -- so the serial read, the stop flag and the transport
+    cleanup all waited for the producer rather than the board.
+    """
+
+    def test_a_flood_returns_after_a_bounded_read(self, monkeypatch):
+        # The cap is lowered rather than the write enlarged: filling a pipe
+        # past its buffer would block this test on the platform with the
+        # smallest one, and pipe capacity is not what is under test.
+        monkeypatch.setattr(keyboard, "_MAX_BYTES_PER_POLL", 64)
+        r, w = os.pipe()
+        os.write(w, b"x" * 1024)
+        monkeypatch.setattr(keyboard.sys, "platform", "linux")
+        monkeypatch.setattr(keyboard.sys, "stdin", _Fd(r))
+        try:
+            got = _read_posix()
+        finally:
+            os.close(w)
+            os.close(r)
+        assert len(got) == 64
+
+    def test_the_default_cap_is_far_above_human_typing(self):
+        assert _MAX_BYTES_PER_POLL >= 1024
+
+    def test_a_short_burst_is_not_truncated(self, monkeypatch):
+        """The bound must be invisible to anyone actually typing."""
+        r, w = os.pipe()
+        os.write(w, b"sf erase 0x0 0x1000000\n")
+        os.close(w)
+        monkeypatch.setattr(keyboard.sys, "platform", "linux")
+        monkeypatch.setattr(keyboard.sys, "stdin", _Fd(r))
+        try:
+            assert _read_posix() == b"sf erase 0x0 0x1000000\n"
+        finally:
+            os.close(r)
+
+
+class TestABrokenRestoreIsNeverSilent:
+    """Qodo review on OpenIPC/defib#136.
+
+    cbreak leaves the shell with no echo and no line editing. If putting it
+    back fails and we say nothing, the operator is left with a terminal that
+    appears dead and no idea why.
+    """
+
+    def test_it_falls_back_to_tcsanow(self, monkeypatch):
+        termios = pytest.importorskip("termios")
+        attempts = []
+
+        def tcsetattr(fd, when, attrs):
+            attempts.append(when)
+            if when == termios.TCSADRAIN:
+                raise OSError("interrupted")
+
+        monkeypatch.setattr(termios, "tcsetattr", tcsetattr)
+        _restore_terminal(0, ["saved"])
+        assert attempts == [termios.TCSADRAIN, termios.TCSANOW]
+
+    def test_a_total_failure_tells_the_operator_how_to_recover(
+        self, monkeypatch, capsys,
+    ):
+        termios = pytest.importorskip("termios")
+
+        def always_fails(fd, when, attrs):
+            raise OSError("gone")
+
+        monkeypatch.setattr(termios, "tcsetattr", always_fails)
+        _restore_terminal(0, ["saved"])
+        err = capsys.readouterr().err
+        assert "stty sane" in err
+
+    def test_it_does_not_raise_and_so_cannot_mask_the_real_error(
+        self, monkeypatch, capsys,
+    ):
+        termios = pytest.importorskip("termios")
+        monkeypatch.setattr(keyboard.sys, "platform", "linux")
+        monkeypatch.setattr(termios, "tcgetattr", lambda fd: ["saved"])
+        monkeypatch.setattr(
+            termios, "tcsetattr",
+            lambda fd, when, attrs: (_ for _ in ()).throw(OSError("gone")),
+        )
+        monkeypatch.setattr("tty.setcbreak", lambda fd: None)
+
+        # The serial failure is what the caller needs to see, not our cleanup.
+        with pytest.raises(RuntimeError, match="serial went away"):
+            with raw_terminal(_Fd(0)):
+                raise RuntimeError("serial went away")
+        assert "stty sane" in capsys.readouterr().err
