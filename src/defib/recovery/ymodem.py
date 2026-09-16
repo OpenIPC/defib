@@ -126,13 +126,17 @@ class YModemSender:
 
     async def _send_packet(self, packet: bytes, label: str) -> None:
         for attempt in range(1, self._packet_retries + 1):
-            await self._transport.write(packet)
-            await self._transport.flush_output()
             try:
+                # write() and flush_output() are inside the try because both
+                # block on the TX queue and raise TransportTimeout when it
+                # stalls.  A hung adapter should cost one retry, not abort the
+                # chainload with a raw transport error.
+                await self._transport.write(packet)
+                await self._transport.flush_output()
                 value = await self._read_control(
                     {ACK, NAK, CRC_REQUEST, CAN}, self._control_timeout
                 )
-            except YModemError:
+            except (YModemError, TransportTimeout):
                 value = -1
 
             if value == ACK:

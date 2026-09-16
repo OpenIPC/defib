@@ -137,3 +137,50 @@ async def test_sender_retries_one_nak_then_completes_handshake():
     assert stats.retries == 1
     assert transport.data_attempts == {1: 2}
     assert transport.eot_count == 2
+
+
+class StalledTxReceiver(ScriptedYModemReceiver):
+    """Receiver whose TX queue refuses to drain for the first data packets.
+
+    A stalled queue means the packet never fully reached the receiver, so the
+    stalled attempt is recorded but deliberately left unacknowledged.
+    """
+
+    def __init__(self, *, stall_attempts: int = 2) -> None:
+        super().__init__()
+        self.stall_attempts = stall_attempts
+        self.stalls = 0
+        self._stall_this_flush = False
+
+    async def write(self, data: bytes) -> None:
+        is_data = bool(data) and data[0] in (SOH, STX) and data[1] != 0
+        if is_data and self.stalls < self.stall_attempts:
+            self.stalls += 1
+            self._stall_this_flush = True
+            self.tx.append(bytes(data))
+            return
+        await super().write(data)
+
+    async def flush_output(self) -> None:
+        if self._stall_this_flush:
+            self._stall_this_flush = False
+            raise TransportTimeout("simulated TX queue stall")
+
+
+@pytest.mark.asyncio
+async def test_sender_retries_a_stalled_tx_queue_instead_of_aborting():
+    """A TX-queue stall must cost one retry, not abort the transfer.
+
+    SerialTransport.flush_output() waits for queued bytes to drain and raises
+    TransportTimeout when they do not.  It runs on every packet attempt, so if
+    it sits outside the retry try block a hung USB-UART aborts the chainload
+    with a raw transport error instead of retrying.
+    """
+    transport = StalledTxReceiver(stall_attempts=2)
+    sender = YModemSender(transport, control_timeout=0.05, start_timeout=0.05)
+
+    stats = await sender.send(b"payload", filename="u-boot.bin")
+
+    assert transport.stalls == 2, "the stall must actually have been exercised"
+    assert stats.bytes_sent == len(b"payload")
+    assert stats.retries >= 2, "each stall should cost one retry, not the transfer"
