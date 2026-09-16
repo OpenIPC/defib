@@ -194,9 +194,14 @@ class HiSiliconStandard(BootProtocol):
         )
         import asyncio as _aio
         for attempt in range(retries):
-            await transport.flush_input()
-            await transport.flush_output()
             try:
+                # Both flushes belong inside the try: flush_output() now waits
+                # for the TX queue to drain and raises TransportTimeout when it
+                # does not (hung PL2303/FT232R, asserted flow control). Outside
+                # the try that bypassed the retry loop entirely — the same
+                # failure mode transport.write() was moved in here to fix.
+                await transport.flush_input()
+                await transport.flush_output()
                 await transport.write(frame_data)
                 # Read until ACK_BYTE found or per-attempt timeout fires.
                 # Tolerates leading garbage (BootROM banner residue, late

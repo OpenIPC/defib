@@ -551,6 +551,33 @@ class TestWriteTimeoutRetry:
         ok = await protocol._send_head(transport, length=64, address=0x04017000)
         assert ok, "retry loop must recover from transient write timeouts"
 
+    @pytest.mark.asyncio
+    async def test_transient_output_drain_timeout_is_retried(self):
+        """A stalled TX queue must be retried, not raised past the caller.
+
+        SerialTransport.flush_output() waits for queued bytes to drain and
+        raises TransportTimeout when they do not. The flush runs before every
+        retransmission, so if it sits outside the try block a hung adapter
+        aborts the whole burn instead of costing one attempt.
+        """
+        class StalledDrainTransport(MockTransport):
+            """Fails flush_output() the first N times, then drains normally."""
+            def __init__(self, fail_flushes: int) -> None:
+                super().__init__(flush_clears_buffer=False)
+                self._remaining_failures = fail_flushes
+
+            async def flush_output(self) -> None:
+                if self._remaining_failures > 0:
+                    self._remaining_failures -= 1
+                    raise TransportTimeout("simulated TX queue stall")
+
+        transport = StalledDrainTransport(fail_flushes=2)
+        transport.enqueue_rx(ACK_BYTE)
+
+        protocol = HiSiliconStandard()
+        ok = await protocol._send_head(transport, length=64, address=0x04017000)
+        assert ok, "retry loop must recover from a transient output-drain stall"
+
 
 class TestFrameAckSkipsLeadingGarbage:
     """Regression for the rack-pod TCP-bridge failure mode.
