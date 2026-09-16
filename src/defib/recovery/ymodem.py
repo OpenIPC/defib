@@ -127,6 +127,13 @@ class YModemSender:
     async def _send_packet(self, packet: bytes, label: str) -> None:
         for attempt in range(1, self._packet_retries + 1):
             try:
+                # Discard anything still buffered before every attempt, the
+                # way HiSiliconStandard._send_frame_with_retry does.  A stalled
+                # drain leaves the packet queued, so a retransmission can put
+                # two copies on the wire and draw two responses; without this
+                # the spare response is read as the NEXT packet's answer and a
+                # NAK the receiver actually sent is silently treated as an ACK.
+                await self._transport.flush_input()
                 # write() and flush_output() are inside the try because both
                 # block on the TX queue and raise TransportTimeout when it
                 # stalls.  A hung adapter should cost one retry, not abort the
@@ -159,6 +166,9 @@ class YModemSender:
         raise YModemError(f"{label} not ACKed after {self._packet_retries} attempts")
 
     async def _finish(self) -> None:
+        # The last data packet may have been retransmitted, leaving a spare
+        # response behind that would otherwise be read as the EOT answer.
+        await self._transport.flush_input()
         await self._transport.write(bytes((EOT,)))
         await self._transport.flush_output()
         first = await self._read_control(

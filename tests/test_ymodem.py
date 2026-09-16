@@ -184,3 +184,99 @@ async def test_sender_retries_a_stalled_tx_queue_instead_of_aborting():
     assert transport.stalls == 2, "the stall must actually have been exercised"
     assert stats.bytes_sent == len(b"payload")
     assert stats.retries >= 2, "each stall should cost one retry, not the transfer"
+
+
+class DuplicatingStalledReceiver(Transport):
+    """Holds a stalled packet, then delivers both copies once the link returns.
+
+    Models a USB-UART whose TX queue stalls: ``flush_output()`` times out with
+    the packet still queued, the sender retransmits, and when the link recovers
+    the receiver sees that packet twice and answers twice.
+    """
+
+    def __init__(self, *, stall_seq: int, nak_seq: int) -> None:
+        self.rx = bytearray((CRC_REQUEST,))
+        self.stall_seq = stall_seq
+        self.nak_seq = nak_seq
+        self.held: int | None = None
+        self.header_seen = False
+        self.seen: list[int] = []
+        self.naked_once = False
+
+    def _respond(self, sequence: int) -> None:
+        self.seen.append(sequence)
+        if sequence == 0:
+            if not self.header_seen:
+                self.header_seen = True
+                self.rx.extend((ACK, CRC_REQUEST))
+            else:
+                self.rx.extend((ACK,))
+            return
+        if sequence == self.nak_seq and not self.naked_once:
+            self.naked_once = True
+            self.rx.extend((NAK,))
+        else:
+            self.rx.extend((ACK,))
+
+    async def write(self, data: bytes) -> None:
+        if data == bytes((EOT,)):
+            self.rx.extend((ACK, CRC_REQUEST))
+            return
+        if not data or data[0] not in (SOH, STX):
+            return
+        sequence = data[1]
+        if sequence == self.stall_seq and self.held is None:
+            self.held = sequence
+            return
+        if self.held is not None:
+            self._respond(self.held)
+            self.held = None
+        self._respond(sequence)
+
+    async def flush_output(self) -> None:
+        if self.held is not None:
+            raise TransportTimeout("TX queue still holding a packet")
+
+    async def read(self, size: int, timeout: float | None = None) -> bytes:
+        if not self.rx:
+            raise TransportTimeout("scripted receiver is idle")
+        data = bytes(self.rx[:size])
+        del self.rx[:size]
+        return data
+
+    async def flush_input(self) -> None:
+        self.rx.clear()
+
+    async def bytes_waiting(self) -> int:
+        return len(self.rx)
+
+    async def unread(self, data: bytes) -> None:
+        self.rx = bytearray(data) + self.rx
+
+    async def close(self) -> None:
+        pass
+
+    async def set_baudrate(self, baud: int) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_duplicate_response_cannot_acknowledge_a_later_packet():
+    """A spare response must never be attributed to the next packet.
+
+    Retransmitting after a stalled drain can put two copies of one packet on
+    the wire, drawing two responses. If the extra one survives into the next
+    packet's read window it masks that packet's real answer -- a NAK reads as
+    an ACK and the receiver never gets the data it asked to have resent.
+    """
+    receiver = DuplicatingStalledReceiver(stall_seq=1, nak_seq=2)
+    sender = YModemSender(
+        receiver, control_timeout=0.05, start_timeout=0.05, packet_retries=6
+    )
+
+    await sender.send(b"A" * 2048, filename="u-boot.bin")
+
+    assert receiver.naked_once, "the scenario must actually exercise a NAK"
+    assert receiver.seen.count(2) >= 2, (
+        "a NAKed packet must be retransmitted, not covered by a stale ACK"
+    )
