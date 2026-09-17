@@ -215,29 +215,38 @@ but with per-chunk acknowledgment:
 The firmware file contains three concatenated sections:
 
 **GSL (Generic SoC Library)**:
-- Magic: `0x4BB4D22D` at file offset 2048 (little-endian uint32)
-- Length: at file offset 2084 (little-endian uint32)
-- Total size: length + 3072 bytes
+- Magic: `0x4BB4D22D` in an aligned image header near the start of the file
+- Known image-tool layouts place this header at `0x800` or `0x1200`
+- Structure length: at magic+8 (little-endian uint32)
+- Payload length: at magic+36 (little-endian uint32)
+- Total size: magic offset + structure length + payload length
 - Data: file bytes 0 through gsl_size-1
 
 **DDR Parameters**:
-- Magic: `0x4B87A52D` at offset (gsl_size + 1024)
-- Table offset: at magic+32 (uint32 LE)
+- Magic: `0x4B87A52D` in the REE-key/header area following the GSL
+- Structure length: at magic+8 (uint32 LE)
+- Parameter-area offset: at magic+32 (uint32 LE)
 - Table size: at magic+36 (uint32 LE)
 - Table count: at magic+40 (uint32 LE)
 - Board mapping: 8 bytes at magic+300 (maps board_id → table_index)
-- DDR table data: header (2048 bytes from gsl_size) + selected table
+- First table: magic + structure length + parameter-area offset
+- DDR transfer data: bytes from gsl_size through the first table + selected table
 
 **U-Boot**:
-- Magic: `0x4BF01E2D` (searched after DDR params section)
-- Length: at magic+36 (uint32 LE)
-- Total size: length + 1024 bytes
+- Magic: `0x4BF01E2D` immediately after all declared DDR tables
+- Structure length: at magic+8 (uint32 LE)
+- Payload length: at magic+36 (uint32 LE)
+- Total size: structure length + payload length
+
+The parser must validate the complete GSL/DDR/U-Boot chain before accepting
+a magic match. This prevents magic-like payload bytes from being interpreted
+as image headers.
 
 ### Phase 4: Transfer Sequence
 
 All data transfers use the V500-style HEAD/DATA/TAIL with per-chunk ACK.
 
-1. **Send GSL** to address `0x04020000`
+1. **Send GSL** to address `0x04021A00` (`CP_STEP1_ADDR`)
 2. **Query Board ID** (Phase 2 above)
 3. **Build DDR table**: select table using board_mapping[board_id]
 4. **Send DDR table** to address `0x41000000`
@@ -250,7 +259,7 @@ All data transfers use the V500-style HEAD/DATA/TAIL with per-chunk ACK.
 
 1. Respond to `DEADBEEF` handshake with `uart ddr\n`
 2. Respond to `CE` board ID query with appropriate CPU ID and board ID
-3. Accept GSL transfer at 0x04020000 — this is the initial boot code
+3. Accept GSL transfer at 0x04021A00 — this is the initial boot code
 4. Accept DDR table at 0x41000000 — use this to configure emulated DDR
 5. Output DDR training status text (e.g., "DDR training OK\n")
 6. Accept U-Boot transfer at 0x41000000
@@ -260,9 +269,9 @@ All data transfers use the V500-style HEAD/DATA/TAIL with per-chunk ACK.
 
 | Magic | Location | Purpose |
 |-------|----------|---------|
-| `0x4BB4D22D` | File offset 2048 | GSL section marker |
-| `0x4B87A52D` | After GSL + 1024 | DDR params section marker |
-| `0x4BF01E2D` | After DDR params | U-Boot section marker |
+| `0x4BB4D22D` | Aligned header near file start | GSL section marker |
+| `0x4B87A52D` | REE-key/header area after GSL | DDR params section marker |
+| `0x4BF01E2D` | Immediately after DDR tables | U-Boot section marker |
 | `0xDEADBEEF` | Handshake frame (reversed as EF BE AD DE) | CV6xx handshake magic |
 
 ---

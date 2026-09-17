@@ -450,7 +450,7 @@ async function cv6xxSendFirmware(firmware) {
 
   setStage('ddr');
   log(`Sending GSL (${parts.gslData.length} bytes)...`, 'info');
-  if (!await sendDataToBootrom(parts.gslData, 0x04020000, 'GSL', (s,t) => setProgress(s,t,'GSL'))) return fail('GSL failed');
+  if (!await sendDataToBootrom(parts.gslData, CV6XX_GSL_LOAD_ADDR, 'GSL', (s,t) => setProgress(s,t,'GSL'))) return fail('GSL failed');
 
   log(`Sending DDR table (${parts.ddrTable.length} bytes)...`, 'info');
   if (!await sendDataToBootrom(parts.ddrTable, 0x41000000, 'DDR', (s,t) => setProgress(s,t,'DDR'))) return fail('DDR table failed');
