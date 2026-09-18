@@ -103,6 +103,7 @@ class TestPoePortOverride:
         assert "--stage" in out
         assert "--skip-stage" in out
         assert "rootfs-data" in out
+        assert "--wipe-rootfs-data" in out
 
     def test_restore_help_documents_poe_port(self):
         result = runner.invoke(app, ["restore", "--help"])

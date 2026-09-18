@@ -75,6 +75,7 @@ class InstallRequest:
     nor_size: int = 0
     nand: bool = False
     wipe_env: bool = False
+    wipe_rootfs_data: bool = False
     final_reset: bool = True
     stages: tuple[str, ...] = ()
     skip_stages: tuple[str, ...] = ()

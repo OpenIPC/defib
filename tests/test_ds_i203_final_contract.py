@@ -7,6 +7,7 @@ stock-to-OpenIPC NOR install sequence around the published DDR U-Boot variant.
 from __future__ import annotations
 
 import io
+import json
 import sys
 import tarfile
 from dataclasses import dataclass
@@ -648,9 +649,12 @@ async def test_stock_env_verify_failure_before_tftp_closes_uart(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("crc_failure", [None, "tftp", "readback", "env"])
+@pytest.mark.parametrize(
+    "crc_failure",
+    [None, "tftp", "tftp-once", "readback", "env"],
+)
 async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_policy(
-    monkeypatch, tmp_path, crc_failure
+    monkeypatch, tmp_path, crc_failure, capsys
 ):
     """Exercise the complete stock->OpenIPC NOR install contract.
 
@@ -666,6 +670,8 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
 
     from defib.install import orchestrator
     from defib.install.layout import nor_mtdparts
+
+    assert orchestrator.TFTP_RAM_VERIFY_RETRIES == 1
     from defib.recovery.events import RecoveryResult
     from defib.vendors.base import UBootBootstrapResult
 
@@ -752,15 +758,22 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
     class FakeTFTPProtocol:
         def __init__(self, files):
             self._files = dict(files)
+            self.blocksize_caps: list[int] = []
+
+        def set_max_blocksize(self, blocksize: int) -> None:
+            self.blocksize_caps.append(blocksize)
 
     tftp_files: dict[str, bytes] = {}
+    tftp_protocol_obj: FakeTFTPProtocol | None = None
 
     async def fake_start_tftp_server(*, files, bind_addr, port, done_count):
+        nonlocal tftp_protocol_obj
         assert bind_addr == "192.168.1.11"
         assert done_count == 3
         tftp_files.clear()
         tftp_files.update(files)
-        return FakeTFTPTransport(), FakeTFTPProtocol(files)
+        tftp_protocol_obj = FakeTFTPProtocol(files)
+        return FakeTFTPTransport(), tftp_protocol_obj
 
     env: dict[str, str] = {"ethaddr": FACTORY_MAC}
     saved_env: dict[str, str] = {}
@@ -842,8 +855,10 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
 
         if command.startswith("crc32 "):
             crc_calls += 1
-            if crc_failure == "tftp" and crc_calls == 1:
-                return "CRC32 command timed out\nOpenIPC # "
+            if crc_failure == "tftp" and crc_calls <= 2:
+                return "==> 00000000\nOpenIPC # "
+            if crc_failure == "tftp-once" and crc_calls == 1:
+                return "==> 00000000\nOpenIPC # "
             if crc_failure == "readback" and crc_calls == 2:
                 return "CRC32 output truncated\nOpenIPC # "
             parts = command.split()
@@ -922,7 +937,7 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
         output="json",
     )
 
-    if crc_failure is None:
+    if crc_failure in (None, "tftp-once"):
         await orchestrator.run_install(request)
     else:
         with pytest.raises(typer.Exit) as exc_info:
@@ -939,6 +954,49 @@ async def test_ds_i203_stock_install_persists_detected_layout_but_not_camera_pol
             assert "sf read 0x82000000 0x40000 0x10000" in commands
             assert any(cmd.startswith("cmp.l 0x82000000 ") for cmd in commands)
         return
+
+    if crc_failure == "tftp-once":
+        assert commands.count("tftpboot u") == 2
+        assert tftp_protocol_obj is not None
+        assert tftp_protocol_obj.blocksize_caps == [512]
+
+        warning_lines = [
+            line
+            for line in capsys.readouterr().out.splitlines()
+            if '"event": "warning"' in line
+        ]
+        assert len(warning_lines) == 1
+        warning = json.loads(warning_lines[0])
+        assert warning["message"].startswith(
+            "Attempt 2: fetching TFTP file 'u' again for U-Boot "
+        )
+        assert "CRC expected=" in warning["message"]
+        assert "using 512-byte blocks." in warning["message"]
+
+        uboot_tftp = [
+            index
+            for index, command in enumerate(commands)
+            if command == "tftpboot u"
+        ]
+        uboot_crc = [
+            index
+            for index, command in enumerate(commands)
+            if command.startswith("crc32 0x82000000 0x40000")
+        ]
+        first_erase = next(
+            index
+            for index, command in enumerate(commands)
+            if command.startswith("sf erase ")
+        )
+        assert len(uboot_tftp) == 2
+        assert len(uboot_crc) >= 2
+        assert (
+            uboot_tftp[0]
+            < uboot_crc[0]
+            < uboot_tftp[1]
+            < uboot_crc[1]
+            < first_erase
+        )
 
     expected_mtdparts = nor_mtdparts(16)
 

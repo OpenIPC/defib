@@ -2179,6 +2179,15 @@ def install(
             "their captured factory ethaddr is restored."
         ),
     ),
+    wipe_rootfs_data: bool = typer.Option(
+        False,
+        "--wipe-rootfs-data",
+        help=(
+            "Erase and CRC-verify the persistent rootfs_data overlay on NOR. "
+            "Generic installs preserve it unless this flag is given; registered "
+            "stock-U-Boot migrations keep their existing migration behavior."
+        ),
+    ),
     final_reset: bool = typer.Option(
         True,
         "--final-reset/--no-final-reset",
@@ -2234,6 +2243,7 @@ def install(
         nor_size=nor_size,
         nand=nand,
         wipe_env=wipe_env,
+        wipe_rootfs_data=wipe_rootfs_data,
         final_reset=final_reset,
         stages=tuple(stage or ()),
         skip_stages=tuple(skip_stage or ()),

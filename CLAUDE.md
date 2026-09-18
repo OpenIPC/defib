@@ -221,6 +221,10 @@ Safety properties already built in — do not re-derive or undo them:
   stage. Generic wipes can lose `ethaddr`; registered stock-U-Boot migrations
   capture and restore the factory MAC instead of falling back to OpenIPC's
   compiled-in `00:00:23:34:45:66`.
+- Generic NOR installs preserve the persistent `rootfs_data` overlay unless
+  `--wipe-rootfs-data` is explicitly requested. The wipe is destructive and
+  must be CRC-verified after erase. Registered stock-U-Boot migrations retain
+  their existing cleanup behavior; do not silently change either default.
 - `install` defaults to the complete production stage plan. Development runs may
   use repeated `--stage` for an exact subset or repeated `--skip-stage` to
   subtract stages. The stage names are `uboot`, `kernel`, `rootfs`,

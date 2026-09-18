@@ -130,6 +130,27 @@ class TestTFTPServerProtocol:
         pkt = transport.sent[1][0]
         assert len(pkt[4:]) == 1024  # Negotiated blocksize
 
+    def test_blocksize_cap_is_explicitly_negotiated(self):
+        """A runtime cap should OACK the smaller block size requested by policy."""
+        file_data = b"\x00" * 2048
+        protocol = TFTPServerProtocol(file_data)
+        protocol.set_max_blocksize(DEFAULT_BLOCKSIZE)
+        transport = MockDatagramTransport()
+        protocol.connection_made(transport)
+        addr = ("10.0.0.1", 1234)
+
+        rrq = struct.pack("!H", OPCODE_RRQ)
+        rrq += b"fw.bin\x00octet\x00blksize\x001468\x00"
+        protocol.datagram_received(rrq, addr)
+
+        oack = transport.sent[0][0]
+        assert struct.unpack("!H", oack[:2])[0] == 6
+        assert b"blksize\x00512\x00" in oack
+
+        protocol.datagram_received(struct.pack("!HH", OPCODE_ACK, 0), addr)
+        data = transport.sent[1][0]
+        assert len(data[4:]) == DEFAULT_BLOCKSIZE
+
     def test_error_response(self):
         """Client error should be handled gracefully."""
         protocol = TFTPServerProtocol(b"data")

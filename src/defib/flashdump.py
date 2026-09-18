@@ -316,7 +316,14 @@ async def send_command(
                 return buf.decode("ascii", errors="replace")
             continue
 
-    return buf.decode("ascii", errors="replace")
+    response = buf.decode("ascii", errors="replace")
+    if wait_for:
+        partial = response.strip()[-200:] or "<no response>"
+        raise TransportTimeout(
+            f"Timed out waiting for {wait_for!r} after U-Boot command {cmd!r}; "
+            f"partial response: {partial}"
+        )
+    return response
 
 
 async def tftp_to_ram(
