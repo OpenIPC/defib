@@ -88,7 +88,9 @@ def uboot_flash_command_error(response: str) -> str | None:
         if not line:
             continue
         text = line.lower()
-        if text.startswith(("error:", "unknown command", "usage: sf", "usage: nand")):
+        if text.startswith(("error:", "unknown command", "usage:")):
+            return line
+        if re.match(r"failed\b", text):
             return line
         if "no spi flash selected" in text:
             return line
@@ -99,6 +101,33 @@ def uboot_flash_command_error(response: str) -> str | None:
         if text.startswith(result_prefixes) and re.search(r"\b(?:failed|failure)\b", text):
             return line
     return None
+
+
+def uboot_sf_lock_unsupported(response: str) -> bool:
+    """Return True only when the U-Boot build lacks a usable sf lock command."""
+
+    lines = [line.strip().lower() for line in response.splitlines() if line.strip()]
+    for line in lines:
+        mentions_sf_lock = "sf" in line or "lock" in line
+        if mentions_sf_lock and "unknown command" in line:
+            return True
+        if mentions_sf_lock and ("not supported" in line or "unsupported" in line):
+            return True
+
+    # Older U-Boot variants often print the whole sf usage table for an unknown
+    # subcommand. That is compatibility information only when the table itself
+    # contains no sf lock entry. If sf lock is listed, a Usage response means our
+    # invocation was rejected and must remain a hard failure.
+    usage_seen = any(line.startswith("usage:") for line in lines)
+    sf_usage: list[str] = []
+    for line in lines:
+        candidate = line.removeprefix("usage:").strip() if line.startswith("usage:") else line
+        if re.match(r"^sf(?:\s|$)", candidate):
+            sf_usage.append(candidate)
+    if usage_seen and sf_usage:
+        return not any(re.match(r"^sf\s+lock(?:\s|$)", line) for line in sf_usage)
+
+    return False
 
 
 async def set_uboot_env_verified(

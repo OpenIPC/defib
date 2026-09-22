@@ -23,6 +23,7 @@ import time
 from typing import Callable
 
 from defib.transport.base import Transport, TransportTimeout
+from defib.uboot_tftp import run_uboot_tftp
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +270,7 @@ async def send_command(
     timeout: float = 5.0,
     wait_for: str | None = None,
     verify_echo: bool = False,
+    require_prompt: bool = False,
 ) -> str:
     """Send a command to U-Boot and collect the response.
 
@@ -276,6 +278,11 @@ async def send_command(
     the command is entered one character at a time and U-Boot must echo every
     byte correctly before the final carriage return is sent.  This prevents a
     corrupted ``sf erase/write/read`` line from ever being executed.
+
+    Historically callers using ``wait_for`` received the partial buffer when the
+    deadline expired. Keep that behavior by default because dump/restore probes
+    use timeout as capability information. Installer writes opt into strict prompt
+    completion with ``require_prompt=True``.
     """
     # Clear any pending input.
     try:
@@ -316,7 +323,14 @@ async def send_command(
                 return buf.decode("ascii", errors="replace")
             continue
 
-    return buf.decode("ascii", errors="replace")
+    response = buf.decode("ascii", errors="replace")
+    if wait_for and require_prompt:
+        partial = response.strip()[-200:] or "<no response>"
+        raise TransportTimeout(
+            f"Timed out waiting for {wait_for!r} after U-Boot command {cmd!r}; "
+            f"partial response: {partial}"
+        )
+    return response
 
 
 async def tftp_to_ram(
@@ -325,22 +339,24 @@ async def tftp_to_ram(
     filename: str,
     timeout: float = 120.0,
 ) -> str:
-    """Download a file via TFTP into RAM.
+    """Download a file via TFTP into RAM using legacy lenient prompt handling."""
 
-    Tries ``tftpboot`` first; falls back to ``tftp`` if the U-Boot
-    build doesn't have the ``tftpboot`` alias.
+    async def run_command(command: str, command_timeout: float) -> tuple[bool, str]:
+        response = await send_command(
+            transport,
+            command,
+            timeout=command_timeout,
+            wait_for="# ",
+        )
+        return True, response
 
-    Returns the command response text.  Raises RuntimeError on failure.
-    """
-    cmd = f"tftpboot 0x{addr:x} {filename}"
-    resp = await send_command(transport, cmd, timeout=timeout, wait_for="# ")
-    if "unknown command" in resp.lower():
-        logger.debug("tftpboot not available, falling back to tftp")
-        cmd = f"tftp 0x{addr:x} {filename}"
-        resp = await send_command(transport, cmd, timeout=timeout, wait_for="# ")
-    if "done" not in resp.lower() and "bytes transferred" not in resp.lower():
-        raise RuntimeError(f"TFTP download failed: {resp.strip()[-200:]}")
-    return resp
+    return await run_uboot_tftp(
+        run_command,
+        filename,
+        addr,
+        use_loadaddr=False,
+        timeout=timeout,
+    )
 
 
 def detect_flash_from_text(text: str) -> int | None:
@@ -421,11 +437,18 @@ async def detect_flash(
 
 
 async def _detect_crc32(transport: Transport) -> bool:
-    """Check if U-Boot has the crc32 command."""
+    """Check if U-Boot has the crc32 command without making backup depend on it."""
     resp = await send_command(transport, "crc32 0 0", timeout=3.0, wait_for="# ")
-    # If crc32 exists, it will output a CRC value or usage.
-    # If not, it will say "Unknown command"
-    return "unknown command" not in resp.lower()
+    text = resp.lower()
+    if "unknown command" in text:
+        return False
+    # A supported crc32 command prints either a checksum or usage/help text.
+    # No/partial response is inconclusive, so keep dump-flash usable without
+    # per-block CRC verification rather than treating silence as support.
+    return bool(
+        re.search(r"==>\s*[0-9a-f]{8}|crc32 for", text)
+        or ("usage:" in text and "crc32" in text)
+    )
 
 
 async def _get_device_crc32(

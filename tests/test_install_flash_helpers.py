@@ -4,6 +4,7 @@ import zlib
 import pytest
 
 from defib.install.firmware import uboot_tftp_commands
+from defib.uboot_tftp import run_uboot_tftp
 from defib.install.layout import (
     align_up,
     detect_nor_size_mb,
@@ -14,6 +15,7 @@ from defib.install.layout import (
     select_nor_size_mb,
     set_uboot_env_verified,
     uboot_flash_command_error,
+    uboot_sf_lock_unsupported,
     verify_spi_environment_crc,
 )
 
@@ -30,6 +32,68 @@ def test_vendor_tftp_uses_verified_loadaddr_for_short_command():
         "tftpboot k",
         "tftp k",
     )
+
+
+def test_shared_tftp_runner_falls_back_from_tftpboot():
+    calls: list[tuple[str, float]] = []
+
+    async def run_command(command: str, timeout: float) -> tuple[bool, str]:
+        calls.append((command, timeout))
+        if command.startswith("tftpboot "):
+            return False, "Unknown command 'tftpboot'\nOpenIPC # "
+        return True, "Bytes transferred = 1024\nOpenIPC # "
+
+    response = asyncio.run(
+        run_uboot_tftp(
+            run_command,
+            "k",
+            0x82000000,
+            use_loadaddr=False,
+            timeout=17.0,
+        )
+    )
+
+    assert "Bytes transferred = 1024" in response
+    assert calls == [
+        ("tftpboot 0x82000000 k", 17.0),
+        ("tftp 0x82000000 k", 17.0),
+    ]
+
+
+def test_shared_tftp_runner_preserves_non_fallback_failure_status():
+    async def run_command(command: str, timeout: float) -> tuple[bool, str]:
+        return False, "network timeout"
+
+    with pytest.raises(RuntimeError, match="failed or timed out"):
+        asyncio.run(
+            run_uboot_tftp(
+                run_command,
+                "k",
+                0x82000000,
+                use_loadaddr=False,
+            )
+        )
+
+
+
+def test_shared_tftp_runner_ignores_unrelated_unknown_command():
+    calls: list[str] = []
+
+    async def run_command(command: str, timeout: float) -> tuple[bool, str]:
+        calls.append(command)
+        return False, "Unknown command 'crc32'\n"
+
+    with pytest.raises(RuntimeError, match="failed or timed out"):
+        asyncio.run(
+            run_uboot_tftp(
+                run_command,
+                "k",
+                0x82000000,
+                use_loadaddr=False,
+            )
+        )
+
+    assert calls == ["tftpboot 0x82000000 k"]
 
 
 def test_align_up_for_nand_page_write():
@@ -99,6 +163,28 @@ def test_uboot_flash_error_detects_spi_write_failure():
 
 def test_uboot_flash_error_detects_missing_spi_probe():
     response = "No SPI flash selected. Please run `sf probe'\nOpenIPC # "
+    assert uboot_flash_command_error(response) is not None
+
+
+def test_uboot_flash_error_detects_failed_to_initialize_probe():
+    response = "Failed to initialize SPI flash at 0:0 (error -2)\nOpenIPC # "
+    assert uboot_flash_command_error(response) is not None
+
+
+def test_sf_lock_usage_without_lock_entry_is_unsupported():
+    response = (
+        "Usage:\n"
+        "sf probe [[bus:]cs] [hz] [mode]\n"
+        "sf read addr offset len\n"
+        "sf write addr offset len\n"
+        "OpenIPC # "
+    )
+    assert uboot_sf_lock_unsupported(response) is True
+
+
+def test_sf_lock_usage_with_lock_entry_is_not_unsupported():
+    response = "Usage:\nsf lock [offset] [len]\nOpenIPC # "
+    assert uboot_sf_lock_unsupported(response) is False
     assert uboot_flash_command_error(response) is not None
 
 

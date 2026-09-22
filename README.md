@@ -96,6 +96,14 @@ The `env` stage on a stock-U-Boot NOR migration requires explicit
 and restores the captured factory `ethaddr`. Other selected stages can be run
 without wiping the environment.
 
+Generic NOR installs preserve the existing `rootfs_data` overlay by default.
+Add `--wipe-rootfs-data` when a clean persistent overlay is desired; Defib
+erases the region and verifies the erased contents by CRC before continuing.
+When an exact `--stage` plan is used, that plan must include
+`--stage rootfs-data`; `--skip-stage rootfs-data` conflicts with an explicit
+wipe. Registered stock-U-Boot migrations retain their existing `rootfs_data`
+cleanup behavior.
+
 The release U-Boot owns boot-critical hardware initialization such as DDR
 cold-init and RAM probing limits. Defib owns the layout it actually flashes: it
 detects NOR capacity, selects the standard OpenIPC 8/16/32 MiB layout, and
@@ -125,6 +133,11 @@ defib install -c hi3518ev100:hiwatch-ds-i203 \
   --firmware hi3518ev100_lite_hiwatch-ds-i203-nor.tgz \
   --uboot u-boot-hi3518ev100-ddr3-256m-universal.bin \
   --wipe-env --stage uboot --stage env -p /dev/ttyUSB0 -d
+
+# Generic NOR install with a clean persistent overlay.
+defib install -c hi3516ev200 \
+  --firmware openipc.hi3516ev200-nor-lite.tgz \
+  --wipe-rootfs-data -p /dev/ttyUSB0
 
 # Full production plan except kernel/rootfs writes.
 defib install -c hi3518ev100:hiwatch-ds-i203 \

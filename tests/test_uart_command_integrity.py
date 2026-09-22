@@ -87,3 +87,59 @@ async def test_echo_verification_refuses_unacknowledged_command() -> None:
             wait_for="# ",
             verify_echo=True,
         )
+
+
+
+class PartialResponseNoPromptTransport(MockTransport):
+    async def write(self, data: bytes) -> None:
+        await super().write(data)
+        if b"\r" in data:
+            self.enqueue_rx(b"Bytes transferred = 1558411\n")
+
+
+@pytest.mark.asyncio
+async def test_wait_for_prompt_rejects_partial_command_response() -> None:
+    transport = PartialResponseNoPromptTransport(flush_clears_buffer=False)
+
+    with pytest.raises(TransportTimeout, match="waiting for '# '"):
+        await send_command(
+            transport,
+            "tftpboot 0x82000000 k",
+            timeout=0.05,
+            wait_for="# ",
+            require_prompt=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_wait_for_prompt_keeps_legacy_partial_response_when_not_required() -> None:
+    transport = PartialResponseNoPromptTransport(flush_clears_buffer=False)
+
+    response = await send_command(
+        transport,
+        "tftpboot 0x82000000 k",
+        timeout=0.05,
+        wait_for="# ",
+    )
+
+    assert "Bytes transferred = 1558411" in response
+
+
+
+class SilentAfterCommandTransport(MockTransport):
+    async def write(self, data: bytes) -> None:
+        await super().write(data)
+
+
+@pytest.mark.asyncio
+async def test_legacy_wait_for_allows_reset_without_returned_prompt() -> None:
+    transport = SilentAfterCommandTransport(flush_clears_buffer=False)
+
+    response = await send_command(
+        transport,
+        "reset",
+        timeout=0.05,
+        wait_for="# ",
+    )
+
+    assert response == ""

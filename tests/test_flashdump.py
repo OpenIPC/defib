@@ -199,6 +199,18 @@ class TestGetRamStagingAddr:
 class TestCrc32Detection:
     """Test CRC32 command detection and parsing."""
 
+    @pytest.mark.asyncio
+    async def test_crc32_probe_silence_degrades_to_unverified_dump(self):
+        from defib.flashdump import _detect_crc32
+
+        class SilentTransport(MockTransport):
+            async def write(self, data: bytes) -> None:
+                self._tx_log.append(data)
+
+        transport = SilentTransport()
+        assert await _detect_crc32(transport) is False
+
+
     def test_parse_crc32_response(self):
         """U-Boot crc32 output: '... ==> abcd1234'."""
         import re

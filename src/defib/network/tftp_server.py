@@ -52,6 +52,7 @@ ERR_FILE_EXISTS = 6
 ERR_NO_SUCH_USER = 7
 
 DEFAULT_BLOCKSIZE = 512
+MAX_BLOCKSIZE = 65464
 DEFAULT_PORT = 69
 DEFAULT_TIMEOUT = 5.0
 MAX_RETRIES = 5
@@ -103,6 +104,11 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
         self.stats = TFTPServerStats()
         self._done_count = done_count
         self._done_event = asyncio.Event()
+        self._max_blocksize = MAX_BLOCKSIZE
+
+    def set_max_blocksize(self, blocksize: int) -> None:
+        """Cap future RFC2348 negotiations without disturbing active transfers."""
+        self._max_blocksize = max(8, min(blocksize, MAX_BLOCKSIZE))
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = transport  # type: ignore[assignment]
@@ -153,18 +159,26 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
             options[opt_name] = opt_value
             i += 2
 
+        blksize_negotiated = False
         if "blksize" in options:
             try:
                 requested_bs = int(options["blksize"])
-                blocksize = max(8, min(requested_bs, 65464))
+                blocksize = max(8, min(requested_bs, self._max_blocksize))
+                blksize_negotiated = True
+                logger.debug(
+                    "TFTP blksize requested=%d negotiated=%d",
+                    requested_bs,
+                    blocksize,
+                )
             except ValueError:
                 pass
 
         transfer = TFTPTransfer(addr=addr, data=serve_data, blocksize=blocksize)
         self._transfers[addr] = transfer
 
-        # Send OACK if options were negotiated
-        if options and blocksize != DEFAULT_BLOCKSIZE:
+        # Send OACK whenever the blksize option was accepted, including an
+        # explicit fallback to the RFC1350 default of 512 bytes.
+        if blksize_negotiated:
             oack = struct.pack("!H", OPCODE_OACK)
             oack += b"blksize\x00" + str(blocksize).encode() + b"\x00"
             self._send(addr, oack)
