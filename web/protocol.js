@@ -100,38 +100,116 @@ function chunkData(data, size = 1024) {
 }
 
 // CV6xx boot file parser
-function parseCv6xxBoot(data) {
-  const view = new DataView(data.buffer, data.byteOffset);
-  // GSL
-  const gslMagic = view.getUint32(2048, true);
-  if (gslMagic !== 0x4BB4D22D) throw new Error(`Invalid GSL magic: 0x${gslMagic.toString(16)}`);
-  const gslLen = view.getUint32(2084, true);
-  const gslSize = gslLen + 3072;
-  const gslData = data.slice(0, gslSize);
-  // DDR params
-  const paramsStart = gslSize + 1024;
-  const paramsMagic = view.getUint32(paramsStart, true);
-  if (paramsMagic !== 0x4B87A52D) throw new Error(`Invalid DDR params magic: 0x${paramsMagic.toString(16)}`);
-  const offset32 = view.getUint32(paramsStart + 32, true);
-  const tableSize = view.getUint32(paramsStart + 36, true);
-  const tableCount = view.getUint32(paramsStart + 40, true);
-  const boardMapping = data.slice(paramsStart + 300, paramsStart + 308);
-  // U-Boot
-  let ubootOffset = -1;
-  for (let i = paramsStart; i < data.length - 4; i++) {
-    if (data[i]===0x2d && data[i+1]===0x1e && data[i+2]===0xf0 && data[i+3]===0x4b) { ubootOffset = i; break; }
-  }
-  if (ubootOffset < 0) throw new Error('U-Boot magic not found');
-  const ubootLen = view.getUint32(ubootOffset + 36, true);
-  const ubootData = data.slice(ubootOffset, ubootOffset + ubootLen + 1024);
-  // DDR table for board_id=0
-  const mappedIdx = Math.min(boardMapping[0], tableCount - 1);
-  const ddrBuf = new Uint8Array(2048 + tableSize);
-  ddrBuf.set(data.slice(gslSize, gslSize + 2048));
-  const tblOff = gslSize + 2048 + offset32 + mappedIdx * tableSize;
-  ddrBuf.set(data.slice(tblOff, tblOff + tableSize), 2048);
+const CV6XX_GSL_LOAD_ADDR = 0x04021A00;
+const CV6XX_IMAGE_ALIGNMENT = 0x100;
+const CV6XX_CODE_ALIGNMENT = 0x200;
+const CV6XX_HEADER_FIELDS_SIZE = 40;
+const CV6XX_DDR_FIELDS_SIZE = 308;
+const CV6XX_MAX_GSL_HEADER_OFFSET = 0x10000;
+const CV6XX_MAX_SECTION_GAP = 0x1000;
+const CV6XX_MAX_DDR_TABLES = 8;
 
-  return { gslData, gslSize, ddrTable: ddrBuf, ubootData, tableCount, tableSize };
+function cv6xxMagicOffsets(view, magic, start, end) {
+  const offsets = [];
+  const limit = Math.min(end, view.byteLength) - 4;
+  let offset = Math.ceil(start / CV6XX_IMAGE_ALIGNMENT) * CV6XX_IMAGE_ALIGNMENT;
+  for (; offset <= limit; offset += CV6XX_IMAGE_ALIGNMENT) {
+    if (view.getUint32(offset, true) === magic) offsets.push(offset);
+  }
+  return offsets;
+}
+
+function parseCv6xxCodeImage(view, offset, magic) {
+  if (offset + CV6XX_HEADER_FIELDS_SIZE > view.byteLength) return null;
+  if (view.getUint32(offset, true) !== magic) return null;
+
+  const version = view.getUint32(offset + 4, true);
+  const structureLength = view.getUint32(offset + 8, true);
+  const signatureLength = view.getUint32(offset + 12, true);
+  const payloadLength = view.getUint32(offset + 36, true);
+  if (version === 0 || structureLength < CV6XX_HEADER_FIELDS_SIZE ||
+      structureLength % CV6XX_IMAGE_ALIGNMENT !== 0 || signatureLength === 0 ||
+      signatureLength > structureLength || payloadLength === 0 ||
+      payloadLength % CV6XX_CODE_ALIGNMENT !== 0) return null;
+
+  const imageEnd = offset + structureLength + payloadLength;
+  if (imageEnd > view.byteLength) return null;
+  return { offset, end: imageEnd };
+}
+
+function parseCv6xxDdrParams(data, view, offset) {
+  if (offset + CV6XX_DDR_FIELDS_SIZE > view.byteLength) return null;
+  if (view.getUint32(offset, true) !== 0x4B87A52D) return null;
+
+  const version = view.getUint32(offset + 4, true);
+  const structureLength = view.getUint32(offset + 8, true);
+  const signatureLength = view.getUint32(offset + 12, true);
+  const paramsAreaOffset = view.getUint32(offset + 32, true);
+  const tableSize = view.getUint32(offset + 36, true);
+  const tableCount = view.getUint32(offset + 40, true);
+  if (version === 0 || structureLength < CV6XX_DDR_FIELDS_SIZE ||
+      structureLength % CV6XX_IMAGE_ALIGNMENT !== 0 || signatureLength === 0 ||
+      signatureLength > structureLength ||
+      paramsAreaOffset % CV6XX_IMAGE_ALIGNMENT !== 0 || tableSize === 0 ||
+      tableSize % CV6XX_IMAGE_ALIGNMENT !== 0 || tableCount < 1 ||
+      tableCount > CV6XX_MAX_DDR_TABLES) return null;
+
+  const boardMapping = data.slice(offset + 300, offset + 308);
+  if (![...boardMapping].some(index => index < tableCount)) return null;
+  if ([...boardMapping].some(index => index !== 0xff && index >= tableCount)) return null;
+
+  const tableOffset = offset + structureLength + paramsAreaOffset;
+  const tablesEnd = tableOffset + tableSize * tableCount;
+  if (tablesEnd > view.byteLength) return null;
+  return { offset, structureLength, tableOffset, tablesEnd,
+           tableSize, tableCount, boardMapping };
+}
+
+function parseCv6xxBoot(data) {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const layouts = [];
+  const gslScanEnd = Math.min(data.length, CV6XX_MAX_GSL_HEADER_OFFSET + 4);
+
+  for (const gslOffset of cv6xxMagicOffsets(view, 0x4BB4D22D, 0, gslScanEnd)) {
+    const gsl = parseCv6xxCodeImage(view, gslOffset, 0x4BB4D22D);
+    if (!gsl) continue;
+
+    const paramsScanEnd = Math.min(data.length, gsl.end + CV6XX_MAX_SECTION_GAP + 4);
+    for (const paramsOffset of cv6xxMagicOffsets(
+      view, 0x4B87A52D, gsl.end, paramsScanEnd,
+    )) {
+      const params = parseCv6xxDdrParams(data, view, paramsOffset);
+      if (!params) continue;
+      const uboot = parseCv6xxCodeImage(view, params.tablesEnd, 0x4BF01E2D);
+      if (!uboot) continue;
+      layouts.push({ gsl, params, uboot });
+    }
+  }
+
+  if (layouts.length === 0) {
+    throw new Error('No structurally valid CV6xx GSL/DDR/U-Boot layout found');
+  }
+  if (layouts.length > 1) {
+    throw new Error('Ambiguous CV6xx boot image: multiple valid GSL layouts found');
+  }
+
+  const { gsl, params, uboot } = layouts[0];
+  const mapped = params.boardMapping[0];
+  const mappedIndex = mapped < params.tableCount ? mapped : 0;
+  const ddrPrefixLength = params.tableOffset - gsl.end;
+  const ddrTable = new Uint8Array(ddrPrefixLength + params.tableSize);
+  ddrTable.set(data.slice(gsl.end, params.tableOffset));
+  const selectedTable = params.tableOffset + mappedIndex * params.tableSize;
+  ddrTable.set(data.slice(selectedTable, selectedTable + params.tableSize), ddrPrefixLength);
+
+  return {
+    gslData: data.slice(0, gsl.end),
+    gslSize: gsl.end,
+    ddrTable,
+    ubootData: data.slice(uboot.offset, uboot.end),
+    tableCount: params.tableCount,
+    tableSize: params.tableSize,
+  };
 }
 
 // V500/CV6xx SoC lists
@@ -339,7 +417,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     CRC_TABLE, calcCrc, appendCrc, appendCrcLE, verifyCrc,
     buildHeadFrame, buildDataFrame, buildTailFrame, chunkData,
-    parseCv6xxBoot, V500_SOCS, CV6XX_SOCS,
+    parseCv6xxBoot, CV6XX_GSL_LOAD_ADDR, V500_SOCS, CV6XX_SOCS,
     FRAME_BLAST_SOCS, needsFrameBlast,
     FW_RELEASE_API, FW_DIRECT_BASE, FW_ASSET_RE, FW_PROXIES,
     CHIP_FW_ALIAS, fwNameForChip, parseReleaseAssets, parseDigest,
