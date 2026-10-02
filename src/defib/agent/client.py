@@ -343,6 +343,7 @@ class FlashAgentClient:
     CAP_SELFUPDATE = 1 << 5
     CAP_SCAN = 1 << 6
     CAP_MEMBW = 1 << 7
+    CAP_NAND = 1 << 8
 
     async def get_info(self) -> dict[str, int | str]:
         """Request device info from the agent."""

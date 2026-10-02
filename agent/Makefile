@@ -245,6 +245,8 @@ LIBGCC := $(shell $(CC) -mcpu=$(CPU_TYPE) -print-libgcc-file-name)
 SPI_DRIVER ?= fmc100
 ifeq ($(SPI_DRIVER),fmc100)
   SPI_FLASH_SRC = spi_flash.c
+  # CMD_NAND (SPI NAND study ops) drives the FMC100 page engine.
+  CFLAGS += -DHAVE_NAND_STUDY
 else
   SPI_FLASH_SRC = spi_flash_$(SPI_DRIVER).c
 endif
