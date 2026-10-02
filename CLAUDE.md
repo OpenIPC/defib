@@ -126,7 +126,7 @@ the handshake, reverting to 115200 after ~30 s idle. 13 commands: `INFO 0x01`,
 optional features through a capability bitmask (`client.py`).
 
 Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
-`emmc_himci.c`. Eleven SoCs are supported; each has its own `ifeq` stanza in
+`emmc_himci.c`. Twelve SoCs are supported; each has its own `ifeq` stanza in
 `agent/Makefile` carrying `LOAD_ADDR` (and `SPI_DRIVER` where it differs).
 `link.ld` itself is generic — it just places `. = LOAD_ADDR`.
 

@@ -257,7 +257,15 @@ def download_firmware(
     # Download
     name = asset_name(chip)
     assert name is not None  # firmware_url() is None otherwise
-    dest = get_cache_dir() / name
+    return _download(url, get_cache_dir() / name, on_progress)
+
+
+def _download(
+    url: str,
+    dest: Path,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> Path:
+    """Fetch ``url`` into ``dest``, removing any partial file on failure."""
     logger.info("Downloading firmware from %s", url)
 
     try:
@@ -287,3 +295,26 @@ def download_firmware(
         if isinstance(e, (ValueError, ConnectionError)):
             raise
         raise ConnectionError(f"Failed to download firmware: {e}") from e
+
+
+# V500-family (gk7205v500/v510/v530) U-Boot is built in OpenIPC/u-boot-xmedia,
+# not OpenIPC/firmware. defib only needs its boot-image header and DDR-init
+# (aux) code to carry the flash agent, and those do not depend on the flash
+# type, so the smaller NOR build is the donor.
+XMEDIA_UBOOT_BASE_URL = (
+    "https://github.com/OpenIPC/u-boot-xmedia/releases/download/latest"
+)
+
+
+def download_v500_donor(chip: str) -> Path:
+    """Fetch (or reuse the cached) V500 U-Boot used as the agent's boot image.
+
+    Raises:
+        ConnectionError: If the download fails.
+    """
+    name = f"u-boot-{_strip_variant(chip)}-nor.bin"
+    dest = get_cache_dir() / name
+    if dest.exists():
+        logger.info("Using cached V500 donor: %s", dest)
+        return dest
+    return _download(f"{XMEDIA_UBOOT_BASE_URL}/{name}", dest)

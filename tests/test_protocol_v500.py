@@ -152,3 +152,71 @@ class TestV500FirmwareTransfer:
         assert Stage.HEAD_AREA in result.stages_completed
         assert Stage.AUX_AREA in result.stages_completed
         assert Stage.BOOT_IMAGE in result.stages_completed
+
+
+def _donor(aux_len: int = 0x5000, code_len: int = 0x800) -> bytes:
+    from defib.protocol.hisilicon_v500 import V500_BOOT_TAIL_LEN, V500_KEY_AREA_LEN
+
+    total = V500_KEY_AREA_LEN + aux_len + code_len + V500_BOOT_TAIL_LEN
+    image = bytearray(b"\xa5" * total)
+    struct.pack_into("<6I", image, 0x400, aux_len, code_len,
+                     code_len + V500_BOOT_TAIL_LEN, 0x12345678, 0x12345678, 0x40707000)
+    return bytes(image)
+
+
+class TestWrapV500Payload:
+    def test_layout(self):
+        from defib.protocol.hisilicon_v500 import V500_AGENT_LOAD_ADDR, wrap_v500_payload
+
+        donor = _donor()
+        agent = b"\x00\x00\x00\xea" + b"\x11" * 1000
+        image = wrap_v500_payload(donor, agent, V500_AGENT_LOAD_ADDR)
+
+        # Header, params and aux (DDR init) area come from the donor.
+        assert image[:0x400] == donor[:0x400]
+        assert image[0x40c:0x7000] == donor[0x40c:0x7000]
+        # Boot code is the agent, padded to 1 KiB, followed by the zero tail.
+        assert image[0x7000:0x7000 + len(agent)] == agent
+        assert len(image) == 0x7000 + 0x400 + 0x200
+        assert image[0x7000 + len(agent):] == b"\x00" * (len(image) - 0x7000 - len(agent))
+        aux, code, total = struct.unpack_from("<3I", image, 0x400)
+        assert (aux, code, total) == (0x5000, 0x400, 0x600)
+
+    def test_load_address_must_match_code_offset(self):
+        from defib.protocol.hisilicon_v500 import wrap_v500_payload
+
+        with pytest.raises(ValueError, match="linked at 0x40707000"):
+            wrap_v500_payload(_donor(), b"\x00" * 16, 0x40707000)
+        # A donor with a different aux area moves the code, so the same
+        # agent no longer fits.
+        with pytest.raises(ValueError, match="runs at 0x41006000"):
+            wrap_v500_payload(_donor(aux_len=0x4000), b"\x00" * 16, 0x41007000)
+
+    @pytest.mark.parametrize("aux_len", [0, 0x123, 0x100000])
+    def test_rejects_implausible_donor(self, aux_len):
+        from defib.protocol.hisilicon_v500 import wrap_v500_payload
+
+        donor = bytearray(_donor())
+        struct.pack_into("<I", donor, 0x400, aux_len)
+        with pytest.raises(ValueError, match="aux-area length"):
+            wrap_v500_payload(bytes(donor), b"\x00" * 16, 0x41007000)
+
+    def test_rejects_short_donor(self):
+        from defib.protocol.hisilicon_v500 import wrap_v500_payload
+
+        with pytest.raises(ValueError, match="too short"):
+            wrap_v500_payload(b"\x00" * 0x100, b"\x00", 0x41007000)
+
+    @pytest.mark.asyncio
+    async def test_wrapped_image_sends_patched_header(self):
+        """HEAD carries the patched lengths, so the bootrom loads only the agent."""
+        from defib.protocol.hisilicon_v500 import V500_AGENT_LOAD_ADDR, wrap_v500_payload
+
+        image = wrap_v500_payload(_donor(), b"\x22" * 2048, V500_AGENT_LOAD_ADDR)
+        transport = MockTransport()
+        transport.enqueue_rx(ACK_BYTE * 500)
+        result = await HiSiliconV500().send_firmware(transport, image)
+        assert result.success
+        sent = transport.all_tx_data
+        # The BOOT stage HEAD frame announces the wrapped size at 0x41000000.
+        assert b"\xfe\x00\xff\x01" + struct.pack(">II", len(image), 0x41000000) in sent

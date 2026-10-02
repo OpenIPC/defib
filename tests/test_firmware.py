@@ -223,3 +223,35 @@ class TestClassicBoardVariants:
         dedicated = cache / "u-boot-hi3518ev100-ddr3-256m-universal.bin"
         dedicated.write_bytes(b"D" * 182580)
         assert get_cached_path("hi3518ev100:hiwatch-ds-i203") == dedicated
+
+
+class TestV500Donor:
+    def test_downloads_the_nor_build_once(self, monkeypatch, tmp_path):
+        import io
+
+        from defib import firmware
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        urls: list[str] = []
+
+        class Resp(io.BytesIO):
+            headers: dict[str, str] = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self.close()
+
+        def fake_urlopen(req, timeout=None):
+            urls.append(req.full_url)
+            return Resp(b"\x00" * 4096)
+
+        monkeypatch.setattr(firmware.urllib.request, "urlopen", fake_urlopen)
+        first = firmware.download_v500_donor("gk7205v510")
+        again = firmware.download_v500_donor("gk7205v510")
+        assert first == again == get_cache_dir() / "u-boot-gk7205v510-nor.bin"
+        assert urls == [
+            "https://github.com/OpenIPC/u-boot-xmedia/releases/download/latest/"
+            "u-boot-gk7205v510-nor.bin"
+        ]

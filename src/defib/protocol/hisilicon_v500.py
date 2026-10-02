@@ -42,6 +42,57 @@ MAX_NAK_RETRIES = 10
 BOOT_LOAD_ADDR = 0x41000000
 
 
+# V500 boot image layout (u-boot-xmedia include/configs/xm72050500.h):
+#   0x0000  key area (8 KiB; RSA key fields, zero when unsigned)
+#   0x0400  params: aux-area length, boot-code length, total boot length
+#           (= code + 0x200 tail), aux/boot encryption flags, boot entry
+#   0x2000  aux area (DDR init/training code), aux-area-length bytes
+#   then    boot code
+# After a UART download the bootrom runs the boot code in place, at
+# BOOT_LOAD_ADDR + its file offset; the entry field in the params is not
+# used on this path (a probe placed there reported pc=0x41007000, not the
+# 0x40707000 the field holds).
+V500_KEY_AREA_LEN = 0x2000
+V500_AUX_AREA_LEN_OFF = 0x400
+V500_BOOT_CODE_LEN_OFF = 0x404
+V500_TOTAL_BOOT_LEN_OFF = 0x408
+V500_BOOT_TAIL_LEN = 0x200
+V500_BOOT_CODE_ALIGN = 0x400
+# Where agent/Makefile links the gk7205v500 agent: BOOT_LOAD_ADDR + key area
+# + the 20 KiB aux area every published V500 U-Boot carries.
+V500_AGENT_LOAD_ADDR = 0x41007000
+
+
+def wrap_v500_payload(donor: bytes, payload: bytes, load_addr: int) -> bytes:
+    """Put ``payload`` in the boot-code area of a V500 boot image.
+
+    ``donor`` is a complete V500 U-Boot image (e.g. OpenIPC u-boot-xmedia's
+    ``u-boot-gk7205v500-nor.bin``). Its key area, params and aux (DDR init)
+    area are kept verbatim; its boot code is replaced by ``payload`` and the
+    two length fields are patched to match. The bootrom runs the boot code
+    in place, so ``payload`` must be linked at BOOT_LOAD_ADDR plus the
+    donor's boot-code offset; ``load_addr`` is checked against that to catch
+    a mismatch before it turns into a silent hang on the board.
+    """
+    if len(donor) < V500_TOTAL_BOOT_LEN_OFF + 4:
+        raise ValueError("donor is too short to be a V500 boot image")
+    aux_len = struct.unpack_from("<I", donor, V500_AUX_AREA_LEN_OFF)[0]
+    code_pos = V500_KEY_AREA_LEN + aux_len
+    if aux_len == 0 or aux_len % V500_BOOT_CODE_ALIGN or code_pos > len(donor):
+        raise ValueError(f"donor aux-area length 0x{aux_len:x} is not plausible")
+    if BOOT_LOAD_ADDR + code_pos != load_addr:
+        raise ValueError(
+            f"donor boot code runs at 0x{BOOT_LOAD_ADDR + code_pos:08x}, but the "
+            f"payload is linked at 0x{load_addr:08x}"
+        )
+    code = bytearray(payload)
+    code += b"\x00" * (-len(code) % V500_BOOT_CODE_ALIGN)
+    image = bytearray(donor[:code_pos]) + code + b"\x00" * V500_BOOT_TAIL_LEN
+    struct.pack_into("<I", image, V500_BOOT_CODE_LEN_OFF, len(code))
+    struct.pack_into("<I", image, V500_TOTAL_BOOT_LEN_OFF, len(code) + V500_BOOT_TAIL_LEN)
+    return bytes(image)
+
+
 def _emit(callback: Callable[[ProgressEvent], None] | None, event: ProgressEvent) -> None:
     if callback is not None:
         callback(event)

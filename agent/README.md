@@ -75,12 +75,18 @@ Requires `arm-none-eabi-gcc` (Arch: `pacman -S arm-none-eabi-gcc arm-none-eabi-n
 | gk7205v200 | 0x12040000 | 0x14000000 | 0x40000000 | 0x41000000 |
 | gk7205v300 | 0x12040000 | 0x14000000 | 0x40000000 | 0x41000000 |
 | gk7605v100 | 0x12040000 | 0x14000000 | 0x40000000 | 0x41000000 |
+| gk7205v500 | 0x12040000 | 0x14000000 | 0x40000000 | 0x41007000 |
 | hi3516cv300 | 0x12100000 | 0x14000000 | 0x80000000 | 0x81000000 |
 | hi3516cv500 | 0x12100000 | 0x14000000 | 0x80000000 | 0x81000000 |
 | hi3518ev200 | 0x12100000 | 0x14000000 | 0x80000000 | 0x81000000 |
 | hi3516cv610 | 0x11040000 | 0x14000000 | 0x40000000 | 0x41000000 |
 | hi3519v101 | 0x12100000 | 0x14000000 | 0x80000000 | 0x81000000 |
 | hi3520dv200 | 0x20080000 | 0x58000000 | 0x80000000 | 0x81000000 |
+
+gk7205v500 also serves gk7205v510/v530. The V500 bootrom has no SPL stage:
+`defib agent upload` puts the agent in the boot-code slot of an OpenIPC
+u-boot-xmedia image (downloaded, or `-f` for your own), whose DDR-init code
+runs first; the bootrom then executes the slot in place at `0x41007000`.
 
 Addresses from [qemu-hisilicon](https://github.com/OpenIPC/LoTool) hardware definitions.
 
