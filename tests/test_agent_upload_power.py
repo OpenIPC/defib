@@ -22,12 +22,12 @@ class RecordingPower(PowerController):
         return "recording"
 
     async def power_off(self, port: str) -> None:
-        self.events.append("off")
+        self.events.append(f"off{port}")
         if self.fail_on == "off":
             raise PowerControllerError("relay offline")
 
     async def power_on(self, port: str) -> None:
-        self.events.append("on")
+        self.events.append(f"on{port}")
         if self.fail_on == "on":
             raise PowerControllerError("relay offline")
 
@@ -44,11 +44,11 @@ async def test_handshake_starts_before_power_on() -> None:
         return HandshakeResult(success=True)
 
     hs = await _power_cycle_into_handshake(
-        RecordingPower(events), MockTransport(), handshake, lambda _m: None,
+        RecordingPower(events), "ether3", MockTransport(), handshake, lambda _m: None,
         off_duration=0.0,
     )
     assert hs.success
-    assert events == ["off", "handshake", "on"]
+    assert events == ["offether3", "handshake", "onether3"]
 
 
 async def test_retries_with_fresh_cycle_on_timeout() -> None:
@@ -65,11 +65,11 @@ async def test_retries_with_fresh_cycle_on_timeout() -> None:
 
     logs: list[str] = []
     hs = await _power_cycle_into_handshake(
-        RecordingPower(events), MockTransport(), handshake, logs.append,
+        RecordingPower(events), "ether3", MockTransport(), handshake, logs.append,
         off_duration=0.0, handshake_timeout=0.05,
     )
     assert hs.success
-    assert events == ["off", "handshake", "on", "off", "handshake", "on"]
+    assert events == ["offether3", "handshake", "onether3"] * 2
     assert any("attempt 2/2" in m for m in logs)
 
 
@@ -78,7 +78,7 @@ async def test_gives_up_after_attempts() -> None:
         return HandshakeResult(success=False, message="bad marker")
 
     hs = await _power_cycle_into_handshake(
-        RecordingPower([]), MockTransport(), handshake, lambda _m: None,
+        RecordingPower([]), "", MockTransport(), handshake, lambda _m: None,
         off_duration=0.0, attempts=2,
     )
     assert not hs.success
@@ -98,7 +98,64 @@ async def test_power_on_failure_cancels_handshake() -> None:
 
     with pytest.raises(PowerControllerError):
         await _power_cycle_into_handshake(
-            RecordingPower([], fail_on="on"), MockTransport(), handshake,
+            RecordingPower([], fail_on="on"), "", MockTransport(), handshake,
             lambda _m: None, off_duration=0.0,
         )
     assert cancelled.is_set()
+
+
+class PulseOnlyPower(RecordingPower):
+    supports_independent_power = False
+
+    async def power_off(self, port: str) -> None:
+        raise PowerControllerError("pulse only")
+
+    async def power_on(self, port: str) -> None:
+        raise PowerControllerError("pulse only")
+
+    async def power_cycle(self, port: str, off_duration: float = 3.0) -> None:
+        self.events.append("pulse")
+
+
+@pytest.mark.parametrize(("proactive", "order"), [
+    (False, ["pulse", "handshake"]),   # reactive: let the OS die first
+    (True, ["handshake", "pulse"]),    # proactive: magic on the wire first
+])
+async def test_pulse_only_controller(proactive: bool, order: list[str]) -> None:
+    events: list[str] = []
+
+    async def handshake() -> HandshakeResult:
+        events.append("handshake")
+        await asyncio.sleep(0)
+        return HandshakeResult(success=True)
+
+    hs = await _power_cycle_into_handshake(
+        PulseOnlyPower(events), "", MockTransport(), handshake, lambda _m: None,
+        off_duration=0.0, proactive=proactive,
+    )
+    assert hs.success
+    assert events == order
+
+
+class TestResolvePowerPort:
+    async def test_single_outlet_controllers_take_no_port(self) -> None:
+        from defib.cli.app import _resolve_power_port
+
+        assert await _resolve_power_port(RecordingPower([]), "/dev/uart-CAM", "ether9") == ""
+
+    async def test_routeros_override_and_discovery(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from defib.cli.app import _resolve_power_port
+        from defib.power.routeros import RouterOSController
+
+        searched: list[str] = []
+
+        async def find(self: RouterOSController, search: str) -> str:
+            searched.append(search)
+            return "ether4"
+
+        monkeypatch.setattr(RouterOSController, "find_port_by_comment", find)
+        ctrl = RouterOSController.__new__(RouterOSController)
+        assert await _resolve_power_port(ctrl, "/dev/uart-IVG85HG50PYA-S", "ether3") == "ether3"
+        assert searched == []
+        assert await _resolve_power_port(ctrl, "/dev/uart-IVG85HG50PYA-S", "") == "ether4"
+        assert searched == ["IVG85HG50PYA-S"]

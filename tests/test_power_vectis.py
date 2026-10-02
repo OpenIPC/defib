@@ -147,3 +147,12 @@ class TestStandalone:
         # should be a safe no-op.
         await ctrl.close()
         await ctrl.close()
+
+
+def test_vectis_is_pulse_only() -> None:
+    """Callers must not sequence Vectis with separate off/on calls."""
+    from defib.power.base import PowerController
+    from defib.power.vectis import VectisController
+
+    assert VectisController.supports_independent_power is False
+    assert PowerController.supports_independent_power is True

@@ -1082,16 +1082,18 @@ def agent_upload(
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
     file: str | None = typer.Option(None, "-f", "--file", help="CV6xx composite boot file (GSL+DDR+U-Boot); required for CV6xx, ignored for other protocols"),
     power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via configured controller (DEFIB_POWER_TYPE)"),
+    poe_port_override: str = typer.Option("", "--poe-port", help="Explicit MikroTik ether port (e.g. ether3) — overrides comment-based auto-discovery. Requires --power-cycle."),
 ) -> None:
     """Upload flash agent to device via boot protocol (requires power-cycle)."""
     import asyncio
-    asyncio.run(_agent_upload_async(chip, port, output, file, power_cycle))
+    asyncio.run(_agent_upload_async(chip, port, output, file, power_cycle, poe_port_override))
 
 
 async def _agent_upload_async(
     chip: str, port: str, output: str,
     composite_path: str | None = None,
     power_cycle: bool = False,
+    poe_port_override: str = "",
 ) -> None:
     import json as json_mod
 
@@ -1172,11 +1174,15 @@ async def _agent_upload_async(
         spl_source = f"full U-Boot ({len(spl_data)} bytes — boundary auto-detected)"
 
     power = None
+    power_port = ""
     if power_cycle:
         from defib.power.factory import power_controller_from_env
         try:
             power = power_controller_from_env()
+            power_port = await _resolve_power_port(power, port, poe_port_override)
         except Exception as e:
+            if power is not None:
+                await power.close()
             if output == "json":
                 print(json_mod.dumps({"event": "error", "message": str(e)}))
             else:
@@ -1190,6 +1196,8 @@ async def _agent_upload_async(
             console.print("\n[yellow]Power-cycle the camera now![/yellow]\n")
 
     transport = await create_transport(normalize_port_name(port))
+    if power is not None:
+        _attach_power_transport(power, transport)
     protocol = HiSiliconStandard()
     protocol.set_profile(profile)
 
@@ -1211,7 +1219,7 @@ async def _agent_upload_async(
 
         try:
             hs = await _power_cycle_into_handshake(
-                power, transport,
+                power, power_port, transport,
                 lambda: protocol.handshake(transport, on_progress),
                 on_power_log,
             )
@@ -1280,14 +1288,46 @@ async def _agent_upload_async(
     await transport.close()
 
 
+async def _resolve_power_port(
+    power: PowerController, serial_port: str, poe_port_override: str,
+) -> str:
+    """The controller port that powers the camera on ``serial_port``.
+
+    Only RouterOS addresses ports by name: ``--poe-port`` wins, otherwise
+    the interface whose comment names the device (``/dev/uart-<NAME>`` ->
+    ``<NAME>``).  Single-outlet controllers ignore the port, so ``""``.
+    """
+    from pathlib import Path
+
+    from defib.power.routeros import RouterOSController
+
+    if not isinstance(power, RouterOSController):
+        return ""
+    if poe_port_override:
+        return poe_port_override
+    label = Path(serial_port).name.removeprefix("uart-")
+    return await power.find_port_by_comment(label)
+
+
+def _attach_power_transport(power: PowerController, transport: Transport) -> None:
+    """Let Vectis pulse reset over the UART connection defib already holds."""
+    from defib.power.vectis import VectisController
+    from defib.transport.rfc2217 import Rfc2217Transport
+
+    if isinstance(power, VectisController) and isinstance(transport, Rfc2217Transport):
+        power.attach_transport(transport)
+
+
 async def _power_cycle_into_handshake(
     power: PowerController,
+    power_port: str,
     transport: Transport,
     start_handshake: Callable[[], Coroutine[Any, Any, HandshakeResult]],
     log: Callable[[str], None],
     off_duration: float = 3.0,
     handshake_timeout: float = 15.0,
     attempts: int = 2,
+    proactive: bool = False,
 ) -> HandshakeResult:
     """Power the device off, start the handshake, then power it back on.
 
@@ -1296,6 +1336,13 @@ async def _power_cycle_into_handshake(
     markers, and the blaster is already on the wire when the bootrom's
     catch window opens.  This holds however long the controller takes
     to answer ``power_on`` — cloud-backed relays can lag by seconds.
+
+    Pulse-only controllers (``supports_independent_power`` False) cannot
+    hold the device off, so the order follows RecoverySession: a
+    ``proactive`` handshake (V500, CV6xx: the magic must already be on the
+    wire when the bootrom wakes) starts before the pulse; a reactive one
+    (HiSilicon standard, which counts 0x20 markers that a running OS could
+    also print) starts after it.
 
     A handshake that does not complete within ``handshake_timeout`` is
     retried with a fresh power cycle, up to ``attempts`` times in all.
@@ -1308,16 +1355,25 @@ async def _power_cycle_into_handshake(
     hs = HandshakeResult(success=False, message="no attempt made")
     for attempt in range(1, attempts + 1):
         suffix = f" (attempt {attempt}/{attempts})" if attempt > 1 else ""
-        log(f"Powering off via {power.name()}{suffix}...")
-        await power.power_off("")
-        await asyncio.sleep(off_duration)
+        if power.supports_independent_power:
+            log(f"Powering off via {power.name()}{suffix}...")
+            await power.power_off(power_port)
+            await asyncio.sleep(off_duration)
+        pulse_first = not power.supports_independent_power and not proactive
+        if pulse_first:
+            log(f"Power-cycling via {power.name()}{suffix}...")
+            await power.power_cycle(power_port)
         await transport.flush_input()
         task = asyncio.create_task(start_handshake())
         # Yield so the first frames reach the wire before power returns.
         await asyncio.sleep(0.05)
         try:
-            log("Powering on...")
-            await power.power_on("")
+            if power.supports_independent_power:
+                log("Powering on...")
+                await power.power_on(power_port)
+            elif not pulse_first:
+                log(f"Power-cycling via {power.name()}{suffix}...")
+                await power.power_cycle(power_port)
         except BaseException:
             task.cancel()
             try:

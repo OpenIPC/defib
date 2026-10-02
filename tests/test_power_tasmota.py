@@ -44,9 +44,6 @@ class FakePlug:
         if self.reply_override is not None:
             return FakeResponse(self.reply_override)
         parts = cmnd.split()
-        if parts[0] == "Backlog":
-            self.state = "ON"
-            return FakeResponse(b'{"POWER":"OFF"}')
         if len(parts) == 2:
             self.state = parts[1]
         return FakeResponse(json.dumps({self.relay_key: self.state}).encode())
@@ -57,17 +54,6 @@ def plug(monkeypatch: pytest.MonkeyPatch) -> FakePlug:
     fake = FakePlug()
     monkeypatch.setattr(tasmota_mod.urllib.request, "urlopen", fake)
     return fake
-
-
-@pytest.fixture
-def no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    sleeps: list[float] = []
-
-    async def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-
-    monkeypatch.setattr(tasmota_mod.asyncio, "sleep", fake_sleep)
-    return sleeps
 
 
 class TestFromEnv:
@@ -137,47 +123,30 @@ class TestPowerOps:
 
 
 class TestPowerCycle:
-    async def test_cycle_runs_on_plug(self, plug: FakePlug, no_sleep: list[float]) -> None:
-        ctrl = TasmotaController(host="x")
-        await ctrl.power_cycle("", off_duration=3.0)
-        assert plug.cmnds == ["Backlog Power OFF; Delay 30; Power ON", "Power"]
-        assert no_sleep == [3.0]
-
-    @pytest.mark.parametrize(("off", "delay"), [(0.0, 2), (0.24, 2), (1.26, 13), (9999.0, 3600)])
-    async def test_delay_clamped_and_rounded(
-        self, plug: FakePlug, no_sleep: list[float], off: float, delay: int,
+    async def test_cycle_is_verified_off_then_on(
+        self, plug: FakePlug, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        ctrl = TasmotaController(host="x")
-        await ctrl.power_cycle("", off_duration=off)
-        assert plug.cmnds[0] == f"Backlog Power OFF; Delay {delay}; Power ON"
+        sleeps: list[float] = []
 
-    async def test_cycle_polls_until_on(
-        self, monkeypatch: pytest.MonkeyPatch, no_sleep: list[float],
+        async def fake_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        monkeypatch.setattr("defib.power.base.asyncio.sleep", fake_sleep)
+        await TasmotaController(host="x").power_cycle("", off_duration=3.0)
+        # No Backlog: commands sent during its Delay cut the delay short.
+        assert plug.cmnds == ["Power OFF", "Power ON"]
+        assert sleeps == [3.0]
+
+    async def test_cycle_fails_if_plug_does_not_switch_off(
+        self, plug: FakePlug, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        replies = iter([b'{"POWER":"OFF"}', b'{"POWER":"OFF"}', b'{"POWER":"OFF"}', b'{"POWER":"ON"}'])
-        calls: list[str] = []
+        async def fake_sleep(seconds: float) -> None:
+            return None
 
-        def fake(url: str, timeout: float | None = None) -> FakeResponse:
-            calls.append(url)
-            return FakeResponse(next(replies))
-
-        monkeypatch.setattr(tasmota_mod.urllib.request, "urlopen", fake)
-        ctrl = TasmotaController(host="x")
-        await ctrl.power_cycle("", off_duration=3.0)
-        assert len(calls) == 4
-
-    async def test_cycle_gives_up(
-        self, monkeypatch: pytest.MonkeyPatch, no_sleep: list[float],
-    ) -> None:
-        def fake(url: str, timeout: float | None = None) -> FakeResponse:
-            return FakeResponse(b'{"POWER":"OFF"}')
-
-        clock = iter(range(0, 10_000, 5))
-        monkeypatch.setattr(tasmota_mod.urllib.request, "urlopen", fake)
-        monkeypatch.setattr(tasmota_mod.time, "monotonic", lambda: float(next(clock)))
-        ctrl = TasmotaController(host="x", timeout=10.0)
-        with pytest.raises(PowerControllerError, match="did not come back ON"):
-            await ctrl.power_cycle("", off_duration=3.0)
+        monkeypatch.setattr("defib.power.base.asyncio.sleep", fake_sleep)
+        plug.reply_override = b'{"POWER":"ON"}'
+        with pytest.raises(PowerControllerError, match="asked for OFF"):
+            await TasmotaController(host="x").power_cycle("", off_duration=3.0)
 
 
 class TestErrorMapping:

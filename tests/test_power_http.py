@@ -29,8 +29,8 @@ class FakeResponse(io.BytesIO):
 def calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     seen: list[str] = []
 
-    def fake(url: str, timeout: float | None = None) -> FakeResponse:
-        seen.append(url)
+    def fake(req: Any, timeout: float | None = None) -> FakeResponse:
+        seen.append(req.full_url)
         return FakeResponse(b'{"state":"on"}')
 
     monkeypatch.setattr(http_mod.urllib.request, "urlopen", fake)
@@ -99,3 +99,64 @@ class TestPowerOps:
         monkeypatch.setattr(http_mod.urllib.request, "urlopen", fail)
         with pytest.raises(PowerControllerError, match="unreachable"):
             await HttpRelayController(on_url=ON, off_url=OFF).power_off("")
+
+
+class TestRedaction:
+    SECRET_ON = "http://admin:hunter2@relay.local:8080/relay/on?token=s3cret"
+
+    async def test_logs_hide_credentials(
+        self, calls: list[str], caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        caplog.set_level(logging.INFO, logger="defib.power.http")
+        await HttpRelayController(on_url=self.SECRET_ON, off_url=OFF).power_on("")
+        # The query still goes out; the user info moves into a header.
+        assert calls == ["http://relay.local:8080/relay/on?token=s3cret"]
+        assert "hunter2" not in caplog.text
+        assert "s3cret" not in caplog.text
+        assert "http://relay.local:8080/relay/on?..." in caplog.text
+
+    async def test_errors_hide_credentials(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fail(url: str, timeout: float | None = None) -> Any:  # noqa: ANN401
+            raise urllib.error.HTTPError(
+                url.full_url, 401, "Unauthorized", {}, io.BytesIO(b"bad token s3cret"),  # type: ignore[attr-defined, arg-type]
+            )
+
+        monkeypatch.setattr(http_mod.urllib.request, "urlopen", fail)
+        with pytest.raises(PowerControllerError) as exc:
+            await HttpRelayController(on_url=self.SECRET_ON, off_url=OFF).power_on("")
+        assert "hunter2" not in str(exc.value)
+        assert "s3cret" not in str(exc.value)
+        assert "401" in str(exc.value)
+
+    async def test_unreachable_message_hides_credentials(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def fail(url: str, timeout: float | None = None) -> Any:  # noqa: ANN401
+            raise urllib.error.URLError(f"cannot reach {url}")
+
+        monkeypatch.setattr(http_mod.urllib.request, "urlopen", fail)
+        with pytest.raises(PowerControllerError) as exc:
+            await HttpRelayController(on_url=self.SECRET_ON, off_url=OFF).power_on("")
+        assert "hunter2" not in str(exc.value)
+        assert "s3cret" not in str(exc.value)
+
+
+class TestBasicAuth:
+    async def test_userinfo_becomes_basic_auth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import base64
+
+        seen: list[Any] = []
+
+        def fake(req: Any, timeout: float | None = None) -> FakeResponse:
+            seen.append(req)
+            return FakeResponse(b"ok")
+
+        monkeypatch.setattr(http_mod.urllib.request, "urlopen", fake)
+        url = "http://admin:p%40ss@relay.local/relay/off"
+        await HttpRelayController(on_url=ON, off_url=url).power_off("")
+        req = seen[0]
+        assert req.full_url == "http://relay.local/relay/off"
+        expected = base64.b64encode(b"admin:p@ss").decode()
+        assert req.get_header("Authorization") == f"Basic {expected}"

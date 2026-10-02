@@ -17,6 +17,11 @@ class PowerController(ABC):
     smart PDU outlet, relay board).
     """
 
+    #: Whether ``power_off`` and ``power_on`` work on their own.  Controllers
+    #: that can only pulse (Vectis) set this False and support only
+    #: ``power_cycle``.
+    supports_independent_power: bool = True
+
     @classmethod
     @abstractmethod
     def name(cls) -> str:

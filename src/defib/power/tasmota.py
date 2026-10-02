@@ -7,10 +7,13 @@ power brick, or an inline USB relay.
 Like :class:`~defib.power.rack.RackController`, each plug owns exactly
 one camera, so the ``port`` argument is ignored.  Pass ``""`` from the CLI.
 
-Power cycling runs on the plug itself as a ``Backlog`` (``Power OFF;
-Delay N; Power ON``), so the off window does not depend on host or
-network latency, and a dropped HTTP connection mid-cycle still leaves the
-camera powered.
+Power cycling is the base class's off / wait / on, with each switch
+confirmed by the plug's reply.  A ``Backlog Power OFF; Delay N; Power ON``
+looks tempting (timed on the plug), but its reply is ``{}`` whatever the
+commands do, so it cannot be verified without polling — and on Tasmota
+14.3 any command sent during the ``Delay`` cuts the delay short: the off
+window shrank from ~4.5 s to ~2 s and the camera behind a mains brick
+never booted.
 """
 
 from __future__ import annotations
@@ -19,7 +22,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,11 +29,6 @@ import urllib.request
 from defib.power.base import PowerController, PowerControllerError
 
 logger = logging.getLogger(__name__)
-
-# Tasmota's Backlog ``Delay`` is in 0.1 s units and accepts 2..3600.
-_DELAY_MIN = 2
-_DELAY_MAX = 3600
-
 
 class TasmotaController(PowerController):
     """Drives one relay of a Tasmota plug over HTTP."""
@@ -94,23 +91,6 @@ class TasmotaController(PowerController):
 
     async def power_on(self, port: str) -> None:
         await self._set("ON")
-
-    async def power_cycle(self, port: str, off_duration: float = 3.0) -> None:
-        delay = max(_DELAY_MIN, min(_DELAY_MAX, round(off_duration * 10)))
-        cmd = self._power_cmd
-        await self._cmnd(f"Backlog {cmd} OFF; Delay {delay}; {cmd} ON")
-        # The backlog runs asynchronously on the plug.  Wait for the relay
-        # to come back so callers can rely on "power is on" afterwards.
-        deadline = time.monotonic() + delay / 10 + self._timeout
-        await asyncio.sleep(delay / 10)
-        while True:
-            if await self._state() == "ON":
-                return
-            if time.monotonic() > deadline:
-                raise PowerControllerError(
-                    f"Tasmota {self._host}: relay did not come back ON after cycle"
-                )
-            await asyncio.sleep(0.2)
 
     async def close(self) -> None:
         # Stateless HTTP — nothing to release.

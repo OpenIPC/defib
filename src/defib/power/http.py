@@ -13,9 +13,11 @@ whatever latency the relay's backend adds.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from defib.power.base import PowerController, PowerControllerError
@@ -73,14 +75,59 @@ class HttpRelayController(PowerController):
         return None
 
     def _get_sync(self, url: str) -> None:
-        logger.info("http relay GET %s", url)
+        shown = _redact(url)
+        logger.info("http relay GET %s", shown)
         try:
-            with urllib.request.urlopen(url, timeout=self._timeout) as resp:
+            with urllib.request.urlopen(_request(url), timeout=self._timeout) as resp:
                 resp.read()
         except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")[:300]
+            detail = _redact_text(e.read().decode("utf-8", "replace")[:300], url)
             raise PowerControllerError(
-                f"HTTP relay {e.code} on GET {url}: {detail}"
+                f"HTTP relay {e.code} on GET {shown}: {detail}"
             ) from e
         except (urllib.error.URLError, TimeoutError, OSError) as e:
-            raise PowerControllerError(f"HTTP relay unreachable at {url}: {e}") from e
+            raise PowerControllerError(
+                f"HTTP relay unreachable at {shown}: {_redact_text(str(e), url)}"
+            ) from e
+
+
+def _request(url: str) -> urllib.request.Request:
+    """A GET for ``url``, sending any ``user:pass@`` as HTTP Basic auth.
+
+    urllib does not do that itself: it would try to connect to a host
+    literally named ``user:pass@host``.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.username is None:
+        return urllib.request.Request(url)
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    bare = urllib.parse.urlunsplit(parts._replace(netloc=netloc))
+    creds = f"{urllib.parse.unquote(parts.username)}:{urllib.parse.unquote(parts.password or '')}"
+    token = base64.b64encode(creds.encode()).decode()
+    return urllib.request.Request(bare, headers={"Authorization": f"Basic {token}"})
+
+
+def _redact(url: str) -> str:
+    """The URL without user info or query, which may carry credentials."""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+    query = "?..." if parts.query else ""
+    return f"{parts.scheme}://{host}{parts.path}{query}"
+
+
+def _redact_text(text: str, url: str) -> str:
+    """Strip the URL's secrets from a message that may echo them."""
+    parts = urllib.parse.urlsplit(url)
+    secrets = [parts.password, parts.query]
+    secrets += [value for _, value in urllib.parse.parse_qsl(parts.query)]
+    # Longest first, so a query value never leaves part of the full query.
+    for secret in sorted(filter(None, secrets), key=len, reverse=True):
+        # Skip trivially short values ("1", "on"): blanking them would
+        # mangle the message without hiding anything worth hiding.
+        if len(secret) >= 3:
+            text = text.replace(secret, "...")
+    return text

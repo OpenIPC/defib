@@ -52,6 +52,8 @@ class VectisController(PowerController):
       suitable for driving a recovery flow.
     """
 
+    supports_independent_power = False
+
     def __init__(
         self,
         host: str,

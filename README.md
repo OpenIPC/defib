@@ -271,8 +271,8 @@ socat -,raw,echo=0 TCP:172.17.32.17:35240
 
 Any plug running [Tasmota](https://tasmota.github.io/) (or a firmware that
 speaks the same `/cm?cmnd=` HTTP API) in front of the camera's power supply.
-Power cycles run on the plug as a `Backlog`, so the off window is timed by
-the plug rather than by the network:
+Each switch is confirmed from the plug's reply, so a cycle that did not
+happen is an error rather than a silent no-op:
 
 ```bash
 export DEFIB_POWER_TYPE=tasmota
