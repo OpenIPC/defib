@@ -35,6 +35,21 @@ V500_SOCS = frozenset([
 ])
 
 HANDSHAKE_TIMEOUT = 20.0  # seconds
+
+# Chip ID in the handshake reply -> V500 family member.  0x72050510 was read
+# from a GK7205V510; the other two follow the same pattern and are unverified.
+# The xm7205v5x0 parts are the same silicon under another name.
+V500_CHIP_IDS = {
+    0x72050500: "v500",
+    0x72050510: "v510",
+    0x72050530: "v530",
+}
+
+
+def v500_member(chip: str) -> str | None:
+    """``"v510"`` for ``gk7205v510`` / ``xm7205v510:anything``, else None."""
+    base = chip.lower().split(":", 1)[0]
+    return base[-4:] if base in V500_SOCS else None
 HANDSHAKE_BURST_FRAMES = 8  # 112 B, ~10 ms at 115200 baud
 HANDSHAKE_REPLY_LEN = 14
 CHUNK_ACK_TIMEOUT = 4.0   # seconds

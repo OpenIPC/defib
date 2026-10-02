@@ -312,7 +312,7 @@ def download_v500_donor(chip: str) -> Path:
     Raises:
         ConnectionError: If the download fails.
     """
-    name = f"u-boot-{_strip_variant(chip)}-nor.bin"
+    name = f"u-boot-{_strip_variant(chip).lower()}-nor.bin"
     dest = get_cache_dir() / name
     if dest.exists():
         logger.info("Using cached V500 donor: %s", dest)

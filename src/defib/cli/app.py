@@ -1412,6 +1412,10 @@ async def _power_cycle_into_handshake(
     return hs
 
 
+# How long agent upload waits for a human to power-cycle a V500 board.
+MANUAL_HANDSHAKE_TIMEOUT = 60.0
+
+
 async def _agent_upload_v500(
     *,
     chip: str,
@@ -1425,6 +1429,7 @@ async def _agent_upload_v500(
     poe_port_override: str = "",
 ) -> None:
     """Upload the agent to a V500-family SoC inside a donor boot image."""
+    import asyncio
     import json as json_mod
     from pathlib import Path
 
@@ -1432,7 +1437,8 @@ async def _agent_upload_v500(
     from defib.firmware import download_v500_donor
     from defib.power.base import PowerControllerError
     from defib.protocol.hisilicon_v500 import (
-        V500_AGENT_LOAD_ADDR, HiSiliconV500, wrap_v500_payload,
+        V500_AGENT_LOAD_ADDR, V500_CHIP_IDS, HiSiliconV500, v500_member,
+        wrap_v500_payload,
     )
     from defib.recovery.events import ProgressEvent, Stage
     from defib.transport.serial_platform import (
@@ -1480,7 +1486,12 @@ async def _agent_upload_v500(
             elif output == "json":
                 print(json_mod.dumps({"event": "progress", "message": e.message}), flush=True)
 
-    transport = await create_transport(normalize_port_name(port))
+    try:
+        transport = await create_transport(normalize_port_name(port))
+    except Exception as e:
+        if power is not None:
+            await power.close()
+        fail(f"Cannot open {port}: {e}")
     if power is not None:
         _attach_power_transport(power, transport)
     try:
@@ -1502,9 +1513,27 @@ async def _agent_upload_v500(
             finally:
                 await power.close()
         else:
-            hs = await protocol.handshake(transport, on_progress)
+            # Without a power controller nobody retries for us; give the
+            # human a generous window, then report instead of hanging.
+            try:
+                hs = await asyncio.wait_for(
+                    protocol.handshake(transport, on_progress),
+                    timeout=MANUAL_HANDSHAKE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                fail(f"No bootrom response within {MANUAL_HANDSHAKE_TIMEOUT:.0f}s")
         if not hs.success:
             fail("Handshake failed")
+
+        # The donor's DDR init is per family member: a gk7205v500 image does
+        # not bring up a V510's DDR, and then the agent just never answers.
+        detected = V500_CHIP_IDS.get(hs.chip_id or 0)
+        if detected and not donor_path and detected != v500_member(chip):
+            fail(
+                f"The board answered as a {detected.upper()} (chip ID "
+                f"0x{hs.chip_id:08x}), not {chip}: its boot image carries the "
+                f"wrong DDR init. Re-run with -c gk7205{detected}."
+            )
 
         result = await protocol.send_firmware(transport, wrapped, on_progress)
         if not result.success:
