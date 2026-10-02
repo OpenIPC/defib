@@ -35,6 +35,8 @@ V500_SOCS = frozenset([
 ])
 
 HANDSHAKE_TIMEOUT = 20.0  # seconds
+HANDSHAKE_BURST_FRAMES = 8  # 112 B, ~10 ms at 115200 baud
+HANDSHAKE_REPLY_LEN = 14
 CHUNK_ACK_TIMEOUT = 4.0   # seconds
 MAX_NAK_RETRIES = 10
 BOOT_LOAD_ADDR = 0x41000000
@@ -74,25 +76,47 @@ class HiSiliconV500(BootProtocol):
         handshake_frame = append_crc(
             V500_HANDSHAKE_MAGIC + b"\x00\x00\x00\x00\x00\x00\x00\x00"
         )
+        # The bootrom only listens for a few tens of ms after reset before
+        # it falls through to flash boot, so the line must never go idle:
+        # one 14-byte frame is ~1.2 ms on the wire, and waiting 100 ms for
+        # a reply after each one left the window uncovered ~99% of the time.
+        burst = handshake_frame * HANDSHAKE_BURST_FRAMES
 
+        buffer = bytearray()
         while True:
-            await transport.write(handshake_frame)
+            await transport.write(burst)
             try:
-                response = await transport.read(14, timeout=0.1)
-                if response.startswith(b"\xbd\x00") and len(response) >= 12:
-                    chip_id = struct.unpack(">I", response[8:12])[0]
-                    self._chip_id = chip_id
-                    _emit(on_progress, ProgressEvent(
-                        stage=Stage.HANDSHAKE, bytes_sent=1, bytes_total=1,
-                        message=f"Detected SoC: {hex(chip_id)}",
-                    ))
-                    return HandshakeResult(
-                        success=True,
-                        chip_id=chip_id,
-                        message=f"Detected SoC: {hex(chip_id)}",
-                    )
+                waiting = await transport.bytes_waiting()
+                if waiting > 0:
+                    buffer += await transport.read(waiting, timeout=0.01)
             except TransportTimeout:
-                continue
+                pass
+
+            # The reply can land anywhere in the stream — after boot noise
+            # from a still-running OS, or mid-way through a burst.
+            idx = buffer.find(b"\xbd\x00")
+            if idx != -1 and len(buffer) - idx >= HANDSHAKE_REPLY_LEN:
+                chip_id = struct.unpack(">I", buffer[idx + 8:idx + 12])[0]
+                self._chip_id = chip_id
+                # The rest of the burst is still in flight and the bootrom
+                # answers each frame; let that settle and drop it so the
+                # replies are not mistaken for ACKs during the HEAD stage.
+                await asyncio.sleep(0.1)
+                await transport.flush_input()
+                _emit(on_progress, ProgressEvent(
+                    stage=Stage.HANDSHAKE, bytes_sent=1, bytes_total=1,
+                    message=f"Detected SoC: {hex(chip_id)}",
+                ))
+                return HandshakeResult(
+                    success=True,
+                    chip_id=chip_id,
+                    message=f"Detected SoC: {hex(chip_id)}",
+                )
+            if idx == -1:
+                # Keep a trailing 0xBD: it may be the start of a reply.
+                del buffer[:max(0, len(buffer) - 1)]
+            else:
+                del buffer[:idx]
 
     async def _send_frame_wait_ack(
         self,
