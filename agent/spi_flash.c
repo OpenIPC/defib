@@ -117,7 +117,7 @@
 #define NAND_STATUS_E_FAIL  (1 << 2)     /* Erase Fail */
 #define NAND_STATUS_P_FAIL  (1 << 3)     /* Program Fail */
 
-/* NAND geometry — currently only MX35LF1GE4AB (1Gbit) is recognized.
+/* NAND geometry shared by every nand_ids[] part (1 Gbit).
  * On-chip ECC is enabled by default; reads return ECC-corrected data. */
 #define NAND_PAGE_SIZE   2048
 #define NAND_BLOCK_SIZE  (64 * NAND_PAGE_SIZE)   /* 128 KiB */
@@ -421,16 +421,30 @@ static void nand_write_enable(void) {
     fmc_wait_ready();
 }
 
-/* Identify SPI NAND chip from JEDEC ID. Returns 1 if recognized, 0 otherwise.
- * Currently only MX35LF1GE4AB (Macronix, c2 12, 1Gbit / 128MB).  The agent's
- * flash_read_id reads bytes [0..2] of an 8-byte fetch; some SPI NAND chips
- * return the manufacturer ID with a leading dummy byte, so we accept the ID
- * shifted by one position too. */
+/* SPI NAND chips the agent drives, by manufacturer + first device ID byte.
+ * All are 1 Gbit, 2 KiB pages, 64 pages per 128 KiB block — the geometry
+ * flash_init hardcodes.  Only two ID bytes are matched because a chip that
+ * answers 0x9F with a leading dummy byte pushes its third byte out of the
+ * three-byte window flash_read_id captures (W25N01GV reads back 00 EF AA).
+ * None of these pairs collides with a SPI NOR ID.
+ *
+ * An unrecognised NAND falls through to the NOR path, which is not just
+ * wrong but can hang: flash_global_unlock() polls a NOR status register a
+ * NAND does not implement (GD5F1GM7 never clears "WIP"). */
+static const uint8_t nand_ids[][2] = {
+    { 0xC2, 0x12 },     /* Macronix MX35LF1GE4AB */
+    { 0xEF, 0xAA },     /* Winbond W25N01GV (EF AA 21) */
+    { 0xC8, 0x91 },     /* GigaDevice GD5F1GM7UE, 3.3 V */
+    { 0xC8, 0x81 },     /* GigaDevice GD5F1GM7RE, 1.8 V */
+};
+
+/* Returns 1 if id[] is a known SPI NAND, read either directly or shifted
+ * by one dummy byte (id[0] = dummy). */
 static int nand_identify(const uint8_t id[3]) {
-    /* Direct: id[0]=0xC2 id[1]=0x12 */
-    if (id[0] == 0xC2 && id[1] == 0x12) return 1;
-    /* Shifted by 1 (dummy byte at id[0]): id[1]=0xC2 id[2]=0x12 */
-    if (id[1] == 0xC2 && id[2] == 0x12) return 1;
+    for (unsigned i = 0; i < sizeof(nand_ids) / sizeof(nand_ids[0]); i++) {
+        if (id[0] == nand_ids[i][0] && id[1] == nand_ids[i][1]) return 1;
+        if (id[1] == nand_ids[i][0] && id[2] == nand_ids[i][1]) return 1;
+    }
     return 0;
 }
 
@@ -459,7 +473,7 @@ int flash_init(flash_info_t *info) {
          * memory-mapped boot mode and uses different protection (BP bits
          * via SET_FEATURE 0xA0 instead of write-status-register). */
         info->flash_type = FLASH_TYPE_NAND;
-        info->size = 128u * 1024u * 1024u;     /* MX35LF1GE4AB = 128 MiB */
+        info->size = 128u * 1024u * 1024u;     /* every nand_ids[] part is 1 Gbit */
         info->sector_size = NAND_BLOCK_SIZE;    /* 128 KiB erase block */
         info->page_size = NAND_PAGE_SIZE;       /* 2 KiB read/program page */
         current_flash_type = FLASH_TYPE_NAND;

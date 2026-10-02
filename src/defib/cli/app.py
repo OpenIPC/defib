@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Coroutine
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import typer
 
@@ -1080,7 +1080,7 @@ def agent_upload(
     chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial device (/dev/ttyUSB0), tcp://host:port, rfc2217://host:port, or socket:///path"),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
-    file: str | None = typer.Option(None, "-f", "--file", help="CV6xx composite boot file (GSL+DDR+U-Boot); required for CV6xx, ignored for other protocols"),
+    file: str | None = typer.Option(None, "-f", "--file", help="CV6xx: composite boot file (GSL+DDR+U-Boot), required. V500: U-Boot image whose header and DDR-init code carry the agent (default: OpenIPC u-boot-xmedia download). Ignored for other protocols"),
     power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via configured controller (DEFIB_POWER_TYPE)"),
     poe_port_override: str = typer.Option("", "--poe-port", help="Explicit MikroTik ether port (e.g. ether3) — overrides comment-based auto-discovery. Requires --power-cycle."),
 ) -> None:
@@ -1107,6 +1107,7 @@ async def _agent_upload_async(
     from defib.profiles.loader import load_profile
     from defib.protocol.hisilicon_cv6xx import HiSiliconCV6xx
     from defib.protocol.hisilicon_standard import HiSiliconStandard
+    from defib.protocol.hisilicon_v500 import HiSiliconV500
     from defib.protocol.registry import find_protocol
     from defib.recovery.events import ProgressEvent, Stage
     from defib.transport.serial_platform import (
@@ -1149,7 +1150,24 @@ async def _agent_upload_async(
         )
         return
 
-    # HiSiliconStandard / V500 path — needs SoC profile for the SPL+agent
+    # V500 has no SPL stage and no profile: the agent replaces the boot code
+    # of a V500 boot image, and the bootrom runs it after the image's own
+    # DDR-init (aux) code.
+    if protocol_cls is HiSiliconV500:
+        await _agent_upload_v500(
+            chip=chip,
+            port=port,
+            output=output,
+            console=console,
+            agent_path=agent_path,
+            agent_data=agent_data,
+            donor_path=composite_path,
+            power_cycle=power_cycle,
+            poe_port_override=poe_port_override,
+        )
+        return
+
+    # HiSiliconStandard path — needs SoC profile for the SPL+agent
     # two-stage upload.
     profile = load_profile(chip)
     cached_fw = get_cached_path(chip)
@@ -1392,6 +1410,154 @@ async def _power_cycle_into_handshake(
             return hs
         log(f"Handshake failed: {hs.message}")
     return hs
+
+
+# How long agent upload waits for a human to power-cycle a V500 board.
+MANUAL_HANDSHAKE_TIMEOUT = 60.0
+
+
+async def _agent_upload_v500(
+    *,
+    chip: str,
+    port: str,
+    output: str,
+    console: Any,
+    agent_path: Any,
+    agent_data: bytes,
+    donor_path: str | None,
+    power_cycle: bool,
+    poe_port_override: str = "",
+) -> None:
+    """Upload the agent to a V500-family SoC inside a donor boot image."""
+    import asyncio
+    import json as json_mod
+    from pathlib import Path
+
+    from defib.agent.client import FlashAgentClient
+    from defib.firmware import download_v500_donor
+    from defib.power.base import PowerControllerError
+    from defib.protocol.hisilicon_v500 import (
+        V500_AGENT_LOAD_ADDR, V500_CHIP_IDS, HiSiliconV500, v500_member,
+        wrap_v500_payload,
+    )
+    from defib.recovery.events import ProgressEvent, Stage
+    from defib.transport.serial_platform import (
+        create_transport, normalize_port_name,
+    )
+
+    def fail(message: str) -> NoReturn:
+        if output == "json":
+            print(json_mod.dumps({"event": "error", "message": message}))
+        else:
+            console.print(f"[red]{message}[/red]")
+        raise typer.Exit(1)
+
+    try:
+        donor_file = Path(donor_path) if donor_path else download_v500_donor(chip)
+        wrapped = wrap_v500_payload(
+            donor_file.read_bytes(), agent_data, V500_AGENT_LOAD_ADDR,
+        )
+    except (OSError, ValueError, ConnectionError) as e:
+        fail(f"Cannot build the V500 boot image: {e}")
+
+    power = None
+    power_port = ""
+    if power_cycle:
+        from defib.power.factory import power_controller_from_env
+        try:
+            power = power_controller_from_env()
+            power_port = await _resolve_power_port(power, port, poe_port_override)
+        except Exception as e:
+            if power is not None:
+                await power.close()
+            fail(f"Power controller error: {e}")
+
+    if output == "human":
+        console.print(f"Agent: [cyan]{agent_path.name}[/cyan] ({len(agent_data)} bytes)")
+        console.print(f"Boot image: [cyan]{donor_file.name}[/cyan] header + DDR init, "
+                      f"{len(wrapped)} bytes with the agent")
+        if power is None:
+            console.print("\n[yellow]Power-cycle the camera now![/yellow]\n")
+
+    def on_progress(e: ProgressEvent) -> None:
+        if e.message:
+            if output == "human":
+                console.print(f"  {e.message}")
+            elif output == "json":
+                print(json_mod.dumps({"event": "progress", "message": e.message}), flush=True)
+
+    try:
+        transport = await create_transport(normalize_port_name(port))
+    except Exception as e:
+        if power is not None:
+            await power.close()
+        fail(f"Cannot open {port}: {e}")
+    if power is not None:
+        _attach_power_transport(power, transport)
+    try:
+        protocol = HiSiliconV500()
+        if power is not None:
+            def on_power_log(message: str) -> None:
+                on_progress(ProgressEvent(
+                    stage=Stage.POWER_CYCLE, bytes_sent=0, bytes_total=1, message=message,
+                ))
+
+            try:
+                hs = await _power_cycle_into_handshake(
+                    power, power_port, transport,
+                    lambda: protocol.handshake(transport, on_progress),
+                    on_power_log, proactive=True,
+                )
+            except PowerControllerError as e:
+                fail(f"Power cycle failed: {e}")
+            finally:
+                await power.close()
+        else:
+            # Without a power controller nobody retries for us; give the
+            # human a generous window, then report instead of hanging.
+            try:
+                hs = await asyncio.wait_for(
+                    protocol.handshake(transport, on_progress),
+                    timeout=MANUAL_HANDSHAKE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                fail(f"No bootrom response within {MANUAL_HANDSHAKE_TIMEOUT:.0f}s")
+        if not hs.success:
+            fail("Handshake failed")
+
+        # The donor's DDR init is per family member: a gk7205v500 image does
+        # not bring up a V510's DDR, and then the agent just never answers.
+        detected = V500_CHIP_IDS.get(hs.chip_id or 0)
+        if detected and not donor_path and detected != v500_member(chip):
+            fail(
+                f"The board answered as a {detected.upper()} (chip ID "
+                f"0x{hs.chip_id:08x}), not {chip}: its boot image carries the "
+                f"wrong DDR init. Re-run with -c gk7205{detected}."
+            )
+
+        result = await protocol.send_firmware(transport, wrapped, on_progress)
+        if not result.success:
+            fail(f"Upload failed: {result.error}")
+
+        if output == "human":
+            console.print("[green]Agent uploaded![/green] Waiting for READY...")
+
+        client = FlashAgentClient(transport, chip)
+        if not await client.connect(timeout=10.0):
+            fail(
+                "Agent not responding. The bootrom accepted the image, so the "
+                "donor's DDR init or the boot entry is the suspect: try "
+                "-f with the board's own U-Boot as the donor."
+            )
+        info = await client.get_info()
+        if output == "human":
+            console.print("[green bold]Agent ready![/green bold]")
+            console.print(f"  RAM: 0x{info.get('ram_base', 0):08x}")
+            console.print(f"  Flash: {int(info.get('flash_size', 0)) // 1024}KB")
+        elif output == "json":
+            print(json_mod.dumps({"event": "ready", **info}))
+    finally:
+        await transport.close()
 
 
 async def _agent_upload_cv6xx(

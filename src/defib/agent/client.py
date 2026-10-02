@@ -163,6 +163,9 @@ _CHIP_TO_AGENT = {
     "hi3516cv608": "hi3516cv610",  # cv6xx-family, same memory map
     "hi3518ev200": "hi3518ev200",
     "hi3520dv200": "hi3520dv200",  # V1-era, HISFC350 SPI controller
+    "gk7205v500": "gk7205v500",
+    "gk7205v510": "gk7205v500",    # V500 family, same memory map
+    "gk7205v530": "gk7205v500",
 }
 
 
