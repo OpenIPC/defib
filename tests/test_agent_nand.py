@@ -133,6 +133,9 @@ class FakeClient:
     def _clear_rx_buffers(self) -> None:
         pass
 
+    async def _restore_baud(self) -> None:
+        pass
+
     async def read_memory(self, addr: int, size: int, fast: bool = True) -> bytes:
         return self.agent.ram[addr][:size]
 

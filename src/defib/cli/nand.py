@@ -243,12 +243,14 @@ def nand_ecc_scan(
     _run(port, body)
 
 
-async def _read_batch(study: Any, page: int, count: int, xfer: Any, tries: int = 3) -> Any:
+async def _read_batch(study: Any, page: int, count: int, xfer: Any, tries: int = 4) -> Any:
     """read_pages with retries: a long UART stream occasionally drops a
-    frame, and one bad batch must not cost a half-hour dump."""
+    frame, and one bad batch must not cost a half-hour dump.  Retries move
+    the data at the fallback baud: when 921600 drops frames once, it
+    tends to keep doing so while whatever loads the host lasts."""
     for attempt in range(1, tries + 1):
         try:
-            return await study.read_pages(page, count, xfer)
+            return await study.read_pages(page, count, xfer, fast=attempt == 1)
         except Exception as e:  # noqa: BLE001 - transport and protocol errors alike
             if attempt == tries:
                 raise

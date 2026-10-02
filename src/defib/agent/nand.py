@@ -339,6 +339,7 @@ class NandStudy:
 
     async def read_pages(
         self, start: int, count: int, xfer: NandXfer, store: bool = True,
+        fast: bool = True,
     ) -> tuple[list[NandRecord], bytes]:
         """Read ``count`` pages from ``start``.
 
@@ -357,7 +358,11 @@ class NandStudy:
         ]
         data = b""
         if store and done:
-            data = await self._client.read_memory(info.dma_buf, done * info.stride)
+            if not fast:
+                await self._client._restore_baud()
+            data = await self._client.read_memory(
+                info.dma_buf, done * info.stride, fast=fast,
+            )
         return records, data
 
     async def read_page(self, page: int, xfer: NandXfer) -> PageRead:
