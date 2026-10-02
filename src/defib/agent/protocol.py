@@ -147,6 +147,13 @@ def _recv_packet_sync(port: object, timeout: float) -> tuple[int, bytes]:
             waiting = port.in_waiting  # type: ignore[attr-defined]
             if waiting > 0:
                 data = port.read(waiting)  # type: ignore[attr-defined]
+            elif getattr(port, "timeout", None) is None:
+                # A blocking port (SerialTransport opens with timeout=None):
+                # read(1) would wait for a byte forever, so a silent agent
+                # — wrong baud, crashed — would hang every caller past its
+                # timeout.  Poll instead.
+                time.sleep(0.002)
+                continue
             else:
                 # port.read() blocks up to the port's pre-set timeout
                 # (Rfc2217Transport._PYSERIAL_READ_QUANTUM = 10 ms).

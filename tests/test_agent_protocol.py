@@ -160,6 +160,21 @@ class TestRecvPacketSync:
         with pytest.raises(TransportTimeout):
             _recv_packet_sync(port, timeout=0.1)
 
+    def test_timeout_on_blocking_port_with_silent_agent(self):
+        """SerialTransport opens with timeout=None, so read() blocks until a
+        byte arrives; a silent agent must still time out, not hang."""
+        class BlockingPort(FakePort):
+            def read(self, size: int = 1) -> bytes:
+                if not self._rx and self.timeout is None:
+                    raise AssertionError("read() on an empty blocking port never returns")
+                return super().read(size)
+
+        import time
+        t0 = time.monotonic()
+        with pytest.raises(TransportTimeout):
+            _recv_packet_sync(BlockingPort(b""), timeout=0.2)
+        assert time.monotonic() - t0 < 1.0
+
     def test_oversized_frame_discarded(self):
         # Frame larger than MAX_PACKET_SIZE should be discarded
         huge = bytes(range(1, 256)) * 5  # >1100 bytes, no 0x00

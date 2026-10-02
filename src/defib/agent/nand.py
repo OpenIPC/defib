@@ -24,8 +24,8 @@ from defib.agent.protocol import (
     RSP_ACK,
     RSP_DATA,
     RSP_NAND,
+    RSP_READY,
     recv_packet,
-    recv_response,
     send_packet,
 )
 from defib.transport.base import TransportError, TransportTimeout
@@ -234,22 +234,31 @@ class NandStudy:
         deadline = time.monotonic() + timeout
         in_stale_stream = False
         while True:
+            if time.monotonic() > deadline:
+                raise NandError(f"no answer to CMD_NAND op 0x{op:02x} within {timeout:.0f}s")
+            # recv_packet, not recv_response: the latter restarts its timeout
+            # on every READY, so an idle agent that never got this request
+            # (lost to a baud mismatch, say) would keep it waiting forever.
             try:
-                cmd, data = await recv_response(
-                    transport, timeout=max(0.1, deadline - time.monotonic()),
+                cmd, data = await recv_packet(
+                    transport, max(0.1, deadline - time.monotonic()),
                 )
             except TransportTimeout:
                 raise NandError(f"no answer to CMD_NAND op 0x{op:02x} within {timeout:.0f}s")
-            # The tail of a read the host gave up on: the agent finishes the
-            # stream regardless, then closes it with an ACK.  An ACK with no
-            # data before it is a real answer (an agent without CMD_NAND).
+            if cmd == RSP_READY:
+                continue
+            if cmd == RSP_NAND and len(data) >= 2 and data[0] == op:
+                break
+            # Anything else is left over from an exchange the host gave up
+            # on — the tail of an abandoned read (RSP_DATA ... ACK) or a
+            # late answer to an earlier request.  Only an ACK with no data
+            # before it is a real answer: an agent without CMD_NAND.
             if cmd == RSP_DATA:
                 in_stale_stream = True
                 continue
-            if cmd == RSP_ACK and in_stale_stream:
-                in_stale_stream = False
-                continue
-            break
+            if cmd == RSP_ACK and not in_stale_stream:
+                break
+            in_stale_stream = False
         if cmd != RSP_NAND or len(data) < 2 or data[0] != op:
             raise NandError(
                 f"agent did not answer CMD_NAND op 0x{op:02x} "
@@ -273,12 +282,37 @@ class NandStudy:
         """
         transport = self._client._transport
         end = time.monotonic() + limit
-        while time.monotonic() < end:
+        quiet_since = time.monotonic()
+        while time.monotonic() < end and time.monotonic() - quiet_since < quiet:
             try:
-                await recv_packet(transport, quiet)
+                cmd, _ = await recv_packet(transport, quiet)
             except (TransportTimeout, TransportError):
                 break
+            # An idle agent's periodic READY is not part of a stale stream.
+            if cmd != RSP_READY:
+                quiet_since = time.monotonic()
         self._client._clear_rx_buffers()
+        # The link may have lost its fast baud along the way (on both DUTs a
+        # read that broke at 921600 left the agent answering only after it
+        # had idled back to 115200).  If it does not answer where we are,
+        # go to the fallback rate and wait for its READY.
+        try:
+            await self._call(NAND_OP_INFO, timeout=3.0)
+            # It answered at whatever rate the port is at now; make the
+            # client agree, so the next fast read renegotiates if needed.
+            port = getattr(transport, "_port", None)
+            if port is not None and getattr(port, "baudrate", None):
+                self._client._current_baud = int(port.baudrate)
+            return
+        except (NandError, TransportError):
+            pass
+        from defib.agent.client import FALLBACK_BAUD
+        from defib.agent.protocol import wait_for_ready
+        await transport.set_baudrate(FALLBACK_BAUD)
+        self._client._current_baud = FALLBACK_BAUD
+        self._client._clear_rx_buffers()
+        if not await wait_for_ready(transport, 45.0):
+            raise NandError("agent lost after a failed transfer; no READY at the fallback baud")
 
     async def info(self) -> NandInfo:
         raw = await self._call(NAND_OP_INFO)

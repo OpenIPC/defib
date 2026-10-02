@@ -279,6 +279,7 @@ async def test_stale_read_tail_is_skipped(agent: FakeNandAgent) -> None:
                 self.first = False
                 self.enqueue_rx(build_packet(0x82, b"\x05\x00" + b"\xaa" * 64))
                 self.enqueue_rx(build_packet(0x83, b"\x00"))
+                self.enqueue_rx(build_packet(0x81, b"\x00" * 28))  # late INFO answer
             FakeNandAgent._handle(self, payload)
 
     study = NandStudy(FakeClient(Stale()))  # type: ignore[arg-type]
