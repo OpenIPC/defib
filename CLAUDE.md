@@ -82,7 +82,7 @@ five CI jobs in `.github/workflows/ci.yml` run (`test`, `fuzz`, `lint`,
    `BootProtocol`, registered via the `@register` decorator and exposed as entry
    points in pyproject.toml:
    - `HiSiliconStandard` — matches **any chip that has a profile JSON**, i.e. all
-     112; classic init_bootmode handshake
+     113; classic init_bootmode handshake
    - `HiSiliconV500` — `gk7205v500/510/530`, `xm7205v500/510/530`; different handshake
    - `HiSiliconCV6xx` — `hi3516cv608/610/613`, `hi3516dv500`, `hi3519dv500`; multi-stage
 
