@@ -52,6 +52,87 @@ class TestV500Handshake:
         assert result.chip_id == 0xAABBCCDD
 
 
+class _ScriptedRx(MockTransport):
+    """Delivers one scripted RX chunk after each write, like a live UART."""
+
+    def __init__(self, *chunks: bytes) -> None:
+        super().__init__(flush_clears_buffer=True)
+        self._script = list(chunks)
+
+    async def write(self, data: bytes) -> None:
+        await super().write(data)
+        if self._script:
+            self.enqueue_rx(self._script.pop(0))
+
+
+class TestV500HandshakeCatch:
+    REPLY = b"\xbd\x00" + b"\x00" * 6 + struct.pack(">I", 0x72050500) + b"\x00\x00"
+
+    @pytest.mark.asyncio
+    async def test_reply_after_boot_noise(self):
+        transport = _ScriptedRx(b"", b"Starting kernel ...\r\n" + self.REPLY)
+        result = await HiSiliconV500().handshake(transport)
+        assert result.success
+        assert result.chip_id == 0x72050500
+
+    @pytest.mark.asyncio
+    async def test_reply_split_across_reads(self):
+        transport = _ScriptedRx(b"\x00\x01", self.REPLY[:1], self.REPLY[1:9], self.REPLY[9:])
+        result = await HiSiliconV500().handshake(transport)
+        assert result.chip_id == 0x72050500
+
+    @pytest.mark.asyncio
+    async def test_line_never_idles_between_polls(self):
+        """Every write is a multi-frame burst, so the bootrom's short listen
+        window cannot fall into a gap between frames."""
+        transport = _ScriptedRx(b"", b"", self.REPLY)
+        await HiSiliconV500().handshake(transport)
+        assert len(transport.tx_log) == 3
+        for burst in transport.tx_log:
+            assert len(burst) >= 8 * 14
+            assert burst[:4] == b"\xbd\x00\xff\x01"
+
+    @pytest.mark.asyncio
+    async def test_stale_replies_flushed(self):
+        """Replies to the rest of the burst must not linger as fake ACKs."""
+        transport = _ScriptedRx(self.REPLY * 3)
+        await HiSiliconV500().handshake(transport)
+        assert await transport.bytes_waiting() == 0
+
+
+class TestV500HandshakeOverSocket:
+    @pytest.mark.asyncio
+    async def test_reply_reaches_handshake_over_socket(self):
+        """tcp:// and socket:// transports only count already-received bytes
+        in bytes_waiting(), so the handshake must read, not poll."""
+        import asyncio
+        import socket
+
+        from defib.transport.socket import SocketTransport
+
+        ours, bootrom = socket.socketpair()
+        bootrom.setblocking(False)
+        reply = b"\xbd\x00" + b"\x00" * 6 + struct.pack(">I", 0x72050510) + b"\x00\x00"
+        loop = asyncio.get_running_loop()
+
+        async def fake_bootrom() -> None:
+            await loop.sock_recv(bootrom, 4096)  # first burst arrives
+            await loop.sock_sendall(bootrom, reply)
+            while True:  # keep swallowing the rest of the flood
+                if not await loop.sock_recv(bootrom, 4096):
+                    return
+
+        peer = asyncio.create_task(fake_bootrom())
+        transport = SocketTransport(ours)
+        try:
+            result = await asyncio.wait_for(HiSiliconV500().handshake(transport), 5)
+        finally:
+            await transport.close()
+            bootrom.close()
+            peer.cancel()
+        assert result.chip_id == 0x72050510
+
+
 class TestV500FirmwareTransfer:
     @pytest.mark.asyncio
     async def test_send_firmware_with_acks(self):

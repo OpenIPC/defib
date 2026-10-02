@@ -16,6 +16,10 @@ def power_controller_from_env() -> PowerController:
       configured via ``DEFIB_VECTIS_*``.
     - ``DEFIB_POWER_TYPE=rack``: rack pod HTTP API
       (``~/git/rack`` ESP32-S3 spinoff), configured via ``DEFIB_RACK_*``.
+    - ``DEFIB_POWER_TYPE=tasmota``: Tasmota smart plug ``/cm?cmnd=`` API,
+      configured via ``DEFIB_TASMOTA_*``.
+    - ``DEFIB_POWER_TYPE=http``: generic relay driven by two GET URLs,
+      configured via ``DEFIB_HTTP_POWER_*``.
 
     Raises:
         PowerControllerError: if the type is unknown or required env
@@ -31,7 +35,13 @@ def power_controller_from_env() -> PowerController:
     if kind == "rack":
         from defib.power.rack import RackController
         return RackController.from_env()
+    if kind == "tasmota":
+        from defib.power.tasmota import TasmotaController
+        return TasmotaController.from_env()
+    if kind == "http":
+        from defib.power.http import HttpRelayController
+        return HttpRelayController.from_env()
     raise PowerControllerError(
         f"Unknown DEFIB_POWER_TYPE: {kind!r} "
-        "(expected 'routeros', 'vectis', or 'rack')"
+        "(expected 'routeros', 'vectis', 'rack', 'tasmota', or 'http')"
     )

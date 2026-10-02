@@ -116,6 +116,18 @@ class SocketTransport(Transport):
         pass  # sendall already ensures data is sent
 
     async def bytes_waiting(self) -> int:
+        # read() goes straight to the socket, so _buf alone only ever holds
+        # bytes pulled in here or pushed back by unread().  Pull whatever the
+        # kernel already has (the socket is non-blocking) so callers that
+        # poll before reading see data that has actually arrived.
+        try:
+            data = self._sock.recv(65536)
+        except (BlockingIOError, InterruptedError):
+            data = None
+        except OSError:
+            data = None  # let the next read() report the error
+        if data:
+            self._buf += data
         return len(self._buf)
 
     async def close(self) -> None:
