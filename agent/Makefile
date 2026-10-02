@@ -59,6 +59,16 @@ else ifeq ($(SOC),gk7205v300)
   WDT_BASE       = 0x12030000
   CRG_BASE       = 0x12010000
   SYSCTRL_REBOOT = 0x12020004
+else ifeq ($(SOC),gk7605v100)
+  UART_BASE      = 0x12040000
+  UART_CLOCK     = 24000000
+  LOAD_ADDR      = 0x41000000
+  FLASH_MEM      = 0x14000000
+  FMC_BASE       = 0x10000000
+  RAM_BASE       = 0x40000000
+  WDT_BASE       = 0x12030000
+  CRG_BASE       = 0x12010000
+  SYSCTRL_REBOOT = 0x12020004
 else ifeq ($(SOC),hi3516cv300)
   # V3 generation: ARM926EJ-S (ARMv5TEJ), not Cortex-A7.
   # UART is PL011 (same as ev300 family) at a different base.
@@ -178,7 +188,7 @@ else ifeq ($(SOC),hi3520dv200)
   SYSCTRL_REBOOT = 0x20050004
   SPI_DRIVER     = hisfc350
 else
-  $(error Unknown SOC: $(SOC). Supported: hi3516ev300 hi3516ev200 gk7205v200 gk7205v300 hi3516cv300 hi3516cv500 hi3518ev200 hi3516cv610 hi3519v101 hi3520dv200)
+  $(error Unknown SOC: $(SOC). Supported: hi3516ev300 hi3516ev200 gk7205v200 gk7205v300 gk7605v100 hi3516cv300 hi3516cv500 hi3518ev200 hi3516cv610 hi3519v101 hi3520dv200)
 endif
 
 # Per-SoC CPU. V3 chips (cv300) are ARM926EJ-S (ARMv5TEJ);

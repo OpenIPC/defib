@@ -57,7 +57,7 @@ node --test web/protocol.test.js web/profile-parity.test.js
 # Cross-compile flash agent (ARM32; needs arm-none-eabi-gcc + newlib)
 make -C agent                   # default: SOC=hi3516ev300
 make -C agent SOC=hi3516cv300   # specific SoC
-make -C agent all-socs          # only 4 representative SoCs, not all 10
+make -C agent all-socs          # only 4 representative SoCs, not all 11
 ```
 
 Apart from the single-test and cross-compile lines, those are exactly what the
@@ -82,7 +82,7 @@ five CI jobs in `.github/workflows/ci.yml` run (`test`, `fuzz`, `lint`,
    `BootProtocol`, registered via the `@register` decorator and exposed as entry
    points in pyproject.toml:
    - `HiSiliconStandard` — matches **any chip that has a profile JSON**, i.e. all
-     112; classic init_bootmode handshake
+     113; classic init_bootmode handshake
    - `HiSiliconV500` — `gk7205v500/510/530`, `xm7205v500/510/530`; different handshake
    - `HiSiliconCV6xx` — `hi3516cv608/610/613`, `hi3516dv500`, `hi3519dv500`; multi-stage
 
@@ -126,13 +126,13 @@ the handshake, reverting to 115200 after ~30 s idle. 13 commands: `INFO 0x01`,
 optional features through a capability bitmask (`client.py`).
 
 Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
-`emmc_himci.c`. Ten SoCs are supported; each has its own `ifeq` stanza in
+`emmc_himci.c`. Eleven SoCs are supported; each has its own `ifeq` stanza in
 `agent/Makefile` carrying `LOAD_ADDR` (and `SPI_DRIVER` where it differs).
 `link.ld` itself is generic — it just places `. = LOAD_ADDR`.
 
 ### Other key modules
 
-- **Profiles** (`src/defib/profiles/`) — 112 JSON SoC definitions in `data/`,
+- **Profiles** (`src/defib/profiles/`) — 113 JSON SoC definitions in `data/`,
   validated with Pydantic (`schema.py`). `defib list-chips` combines those
   profiles with hardcoded V500/CV6xx chips and exact registered vendor-U-Boot
   migration selectors.

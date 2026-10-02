@@ -152,6 +152,7 @@ _CHIP_TO_AGENT = {
     "gk7205v200": "gk7205v200",
     "gk7205v300": "gk7205v200",
     "gk7202v300": "gk7205v200",
+    "gk7605v100": "gk7205v200",
     "hi3516cv300": "hi3516cv300",
     "hi3516cv500": "hi3516cv500",
     "hi3516av300": "hi3516cv500",  # cv500-family, same memory map
