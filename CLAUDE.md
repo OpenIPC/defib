@@ -152,7 +152,8 @@ Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
   flash path. Keep installer-transient environment here; persistent board policy
   belongs to firmware/device profiles.
 - **Power** (`src/defib/power/`) — `routeros` (MikroTik PoE, default), `vectis`,
-  `rack`, chosen by `DEFIB_POWER_TYPE`.
+  `rack`, `tasmota` (smart plug `/cm?cmnd=` API), `http` (relay driven by two GET
+  URLs), chosen by `DEFIB_POWER_TYPE`.
 - **TUI** (`src/defib/tui/`) — Textual UI, including the Flash Doctor screen.
 - **Web** (`web/`) — WebSerial browser UI: standalone HTML/JS, no build step,
   deployed to GitHub Pages. `src/defib/web/` is an empty placeholder package —

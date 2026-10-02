@@ -206,8 +206,8 @@ Handles both `tftpboot` and `tftp` U-Boot commands transparently.
 ## Automated Power Cycling
 
 Defib can automatically power-cycle devices, eliminating manual intervention
-for recovery loops and research workflows.  Two backends are supported,
-selected via `DEFIB_POWER_TYPE`:
+for recovery loops and research workflows.  The backend is selected via
+`DEFIB_POWER_TYPE`:
 
 ### MikroTik RouterOS PoE switch (default)
 
@@ -266,6 +266,47 @@ socat -,raw,echo=0 TCP:172.17.32.17:35240
 > Over a high-RTT WAN link the bootrom's `0x20`-marker / `0xAA`-ack
 > window can close before the round-trip completes; running Vectis
 > on the same host as defib (or close to it on a LAN) is recommended.
+
+### Tasmota smart plug
+
+Any plug running [Tasmota](https://tasmota.github.io/) (or a firmware that
+speaks the same `/cm?cmnd=` HTTP API) in front of the camera's power supply.
+Power cycles run on the plug as a `Backlog`, so the off window is timed by
+the plug rather than by the network:
+
+```bash
+export DEFIB_POWER_TYPE=tasmota
+export DEFIB_TASMOTA_HOST=192.168.1.50
+export DEFIB_TASMOTA_RELAY=1               # optional, multi-relay devices only
+export DEFIB_TASMOTA_USER=admin            # optional, if a web password is set
+export DEFIB_TASMOTA_PASSWORD=secret
+
+defib burn -c gk7205v500 -f u-boot-gk7205v500-nand.bin -p /dev/ttyUSB0 --power-cycle -t
+```
+
+On a mains plug, leave the default 3 s off time alone: a camera brick can
+hold enough charge to ride through a shorter gap.
+
+### Generic HTTP relay
+
+Any relay that turns on and off with a plain GET request — for example a
+small local bridge in front of a cloud-only smart switch:
+
+```bash
+export DEFIB_POWER_TYPE=http
+export DEFIB_HTTP_POWER_ON_URL=http://127.0.0.1:8090/relay/on
+export DEFIB_HTTP_POWER_OFF_URL=http://127.0.0.1:8090/relay/off
+export DEFIB_HTTP_POWER_TIMEOUT=10         # optional, seconds per request
+
+defib agent upload -c hi3516ev300 -p /dev/ttyUSB0 --power-cycle
+```
+
+The cycle is timed on the host, so it inherits the relay's latency.
+`agent upload --power-cycle` copes with that by starting the handshake while
+the camera is still off and re-cycling once if the bootrom does not answer.
+
+Both are single-outlet controllers: `--poe-port` does not apply, and like
+Vectis they do not work with `defib restore`.
 
 The `-t` flag auto-detects the post-boot mode:
 - **Normal U-Boot shell** (e.g. hi3516ev300): a two-way serial terminal — your
