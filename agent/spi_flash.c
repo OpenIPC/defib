@@ -933,6 +933,15 @@ void nand_feature_set(uint8_t addr, uint8_t val) {
     nand_set_feature(addr, val);
 }
 
+/* REG mode means raw.  With the SPI NAND interface selected, a non-zero
+ * FMC_CFG ECC type also applies to register-path reads: the controller
+ * "corrects" READ_FROM_CACHE data, and with a mismatched ECC type it flips
+ * bits that were right (measured on GD5F1GM7: 1-6 bits on ~29% of pages).
+ * The caller's FMC_CFG is restored by handle_nand after the op. */
+static void nand_reg_raw(void) {
+    fmc_reg(FMC_CFG) = fmc_reg(FMC_CFG) & ~(7u << 5);
+}
+
 static int fmc_wait_dma_done(void) {
     for (uint32_t i = 0; i < 4000000; i++) {
         if (fmc_reg(FMC_INT) & FMC_INT_OP_DONE_BIT) return 0;
@@ -968,6 +977,7 @@ int nand_page_read(uint32_t page, const nand_xfer_t *x, uint8_t *dst,
     if (x->fmc_cfg) fmc_reg(FMC_CFG) = x->fmc_cfg;
 
     if (x->mode == NAND_XFER_REG) {
+        nand_reg_raw();
         uint8_t status = nand_read(page, 0, dst, total);
         rec->ecc_err = 0;
         nand_rec_finish(rec, status, (uint8_t)fmc_reg(FMC_INT), 0);
@@ -1007,6 +1017,7 @@ int nand_page_program(uint32_t page, const nand_xfer_t *x,
 
     uint8_t irq;
     if (x->mode == NAND_XFER_REG) {
+        nand_reg_raw();
         nand_program_page(page, 0, src, total);
         irq = (uint8_t)fmc_reg(FMC_INT);
     } else {
