@@ -323,6 +323,40 @@ def test_cli_dump_switches_ondie_ecc_off_and_back(
                for op, a in agent.calls if op == 0x03)
 
 
+def test_cli_dump_incomplete_is_an_error(
+    cli: CliRunner, agent: FakeNandAgent, tmp_path: Path,
+) -> None:
+    agent.timeout_at = 2
+    out = tmp_path / "nand.bin"
+    res = cli.invoke(_app(), ["agent", "nand", "dump", "-o", str(out), "--count", "5"])
+    assert res.exit_code == 1
+    assert "INCOMPLETE" in res.output
+    assert out.read_bytes() == b"\xff" * STRIDE * 2       # the failed page is not kept
+    sidecar = json.loads((tmp_path / "nand.bin.json").read_text())
+    assert sidecar["complete"] is False and sidecar["failed_page"] == 2
+    assert sidecar["pages"] == 2
+
+
+def test_cli_dump_refuses_when_ondie_ecc_stays_on(
+    cli: CliRunner, agent: FakeNandAgent, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = FakeNandAgent._handle
+
+    def sticky(self: FakeNandAgent, payload: bytes) -> None:
+        if payload[0] == 0x02:   # FEATURE_SET ignored by the chip
+            self.calls.append((0x02, payload[1:]))
+            self._reply(0x02, 0, bytes([self.features[payload[1]]]))
+            return
+        original(self, payload)
+
+    monkeypatch.setattr(FakeNandAgent, "_handle", sticky)
+    out = tmp_path / "nand.bin"
+    res = cli.invoke(_app(), ["agent", "nand", "dump", "-o", str(out), "--count", "2"])
+    assert res.exit_code == 1
+    assert "kept its on-die ECC on" in res.output
+    assert not any(op == 0x03 for op, _ in agent.calls)   # nothing was read
+
+
 def test_cli_write_page_kernel_oob(cli: CliRunner, agent: FakeNandAgent, tmp_path: Path) -> None:
     data = tmp_path / "page.bin"
     data.write_bytes(b"\x42" * PAGE)

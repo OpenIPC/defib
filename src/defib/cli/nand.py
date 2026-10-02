@@ -267,36 +267,54 @@ def nand_dump(
         x = _xfer(study, mode, ecc, fmc_cfg, "0x03", 0, 1)
         feats = await _features(study)
         b0 = feats["config_b0"]
-        if not keep_ondie and b0 & 0x10:
-            await study.feature_set(FEATURE_CONFIG, b0 & ~0x10)
+        toggled = not keep_ondie and bool(b0 & 0x10)
         batch = max(1, info.dma_size // info.stride)
         records: list[Any] = []
+        failed_page = None
         try:
+            if toggled:
+                got = await study.feature_set(FEATURE_CONFIG, b0 & ~0x10)
+                if got & 0x10:
+                    Console(stderr=True).print(
+                        f"[red]The chip kept its on-die ECC on (0xB0 reads 0x{got:02x}); "
+                        "a dump now would not be raw.[/red] Use --keep-ondie-ecc to dump "
+                        "corrected data anyway.")
+                    raise typer.Exit(1)
             with open(output, "wb") as f:
                 page = start
                 while page < start + n:
                     k = min(batch, start + n - page)
                     recs, data = await study.read_pages(page, k, x)
-                    f.write(data)
-                    records.extend(recs)
-                    page += len(recs)
+                    # The agent stops after a failed page and still returns it;
+                    # its bytes are whatever the buffer held, so keep them out.
+                    good = len(recs) - 1 if recs and recs[-1].failed else len(recs)
+                    f.write(data[:good * info.stride])
+                    records.extend(recs[:good])
+                    page += good
                     print(f"\r{page - start}/{n} pages", end="", file=sys.stderr, flush=True)
-                    if len(recs) < k:
-                        print(f"\n[controller timeout at page {page}]", file=sys.stderr)
+                    if good < k:
+                        failed_page = page
                         break
         finally:
-            if not keep_ondie and b0 & 0x10:
+            if toggled:
                 await study.feature_set(FEATURE_CONFIG, b0)
         print(file=sys.stderr)
         sidecar = Path(output + ".json")
         sidecar.write_text(json.dumps({
-            "start": start, "pages": len(records), "page_size": info.page_size,
+            "start": start, "pages": len(records), "requested": n,
+            "complete": failed_page is None, "failed_page": failed_page,
+            "page_size": info.page_size,
             "oob_size": info.oob_size, "pages_per_block": info.pages_per_block,
             "mode": mode, "fmc_cfg": x.fmc_cfg or info.fmc_cfg,
-            "features": feats, "ondie_ecc_during_dump": bool(keep_ondie and b0 & 0x10),
+            "features": feats, "ondie_ecc_during_dump": bool(b0 & 0x10) and not toggled,
             "records": [[r.ecc_err, r.ondie, r.fmc_int, r.flags] for r in records],
         }))
         print(f"{len(records)} pages x {info.stride} B -> {output} (+ {sidecar.name})")
+        if failed_page is not None:
+            Console(stderr=True).print(
+                f"[red]INCOMPLETE: page {failed_page} could not be read; "
+                f"{n - len(records)} of {n} pages are missing.[/red]")
+            raise typer.Exit(1)
     _run(port, body)
 
 

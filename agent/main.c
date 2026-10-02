@@ -190,6 +190,23 @@ static void handle_info(void) {
     proto_send(RSP_INFO, resp, 28);
 }
 
+/* I/O registers require 32-bit word-aligned access (ldr not ldrb).
+ * RAM and flash can use byte access. Covers the V3+/V4+/V5/V6 peripheral
+ * block (0x10000000..0x13000000) as well as the V1-era regions actually
+ * used by V1 SoCs (FMC, CRG, UART). */
+static int is_io_region(uint32_t addr) {
+    return (addr >= 0x10000000 && addr < 0x13000000)
+        || (addr >= FMC_BASE  && addr < FMC_BASE  + 0x1000)
+        || (addr >= CRG_BASE  && addr < CRG_BASE  + 0x1000)
+        || (addr >= UART_BASE && addr < UART_BASE + 0x1000);
+}
+
+/* Byte `addr` of an I/O region, fetched with a word load as CMD_READ does. */
+static uint8_t io_byte(uint32_t addr) {
+    uint32_t val = *(volatile uint32_t *)(addr & ~3u);
+    return (val >> ((addr & 3) * 8)) & 0xFF;
+}
+
 static void handle_read(const uint8_t *data, uint32_t len) {
     if (len < 8) { proto_send_ack(ACK_CRC_ERROR); return; }
 
@@ -206,10 +223,7 @@ static void handle_read(const uint8_t *data, uint32_t len) {
      * RAM and flash can use byte access. Cover the V3+/V4+/V5/V6
      * peripheral block (0x10000000..0x13000000) as well as the V1-era
      * regions actually used by V1 SoCs (FMC, CRG, UART). */
-    int io_region = (addr >= 0x10000000 && addr < 0x13000000)
-                 || (addr >= FMC_BASE  && addr < FMC_BASE  + 0x1000)
-                 || (addr >= CRG_BASE  && addr < CRG_BASE  + 0x1000)
-                 || (addr >= UART_BASE && addr < UART_BASE + 0x1000);
+    int io_region = is_io_region(addr);
 
     uint16_t seq = 0;
     uint32_t offset = 0;
@@ -300,15 +314,13 @@ static void handle_crc32_cmd(const uint8_t *data, uint32_t len) {
     if (flash_readable && addr >= FLASH_MEM &&
         (addr + size) <= (FLASH_MEM + flash_info.size)) {
         c = flash_crc32(addr - FLASH_MEM, size);
-    } else if (addr >= 0x10000000 && addr < 0x13000000) {
-        /* Peripheral registers: 32-bit reads only, as CMD_READ does them,
-         * or the CRC covers different bytes than a read returns. */
+    } else if (is_io_region(addr)) {
+        /* Registers: the same word loads and byte order CMD_READ uses, or
+         * the CRC covers different bytes than a read returns. */
         c = 0;
-        for (uint32_t off = 0; off < size; off += 4) {
-            uint32_t val = *(volatile uint32_t *)((addr + off) & ~3u);
-            uint8_t b[4] = { val & 0xff, (val >> 8) & 0xff,
-                             (val >> 16) & 0xff, val >> 24 };
-            c = crc32(c, b, size - off < 4 ? size - off : 4);
+        for (uint32_t off = 0; off < size; off++) {
+            uint8_t b = io_byte(addr + off);
+            c = crc32(c, &b, 1);
         }
     } else {
         const uint8_t *ptr = (const uint8_t *)addr;
@@ -1249,6 +1261,9 @@ static void nand_put_rec(uint8_t *p, const nand_rec_t *r) {
     p[7] = r->rsvd;
 }
 
+static void nand_study_op(uint8_t op, const uint8_t *arg, uint32_t alen,
+                          uint32_t stride, uint32_t pages);
+
 static void handle_nand(const uint8_t *data, uint32_t len) {
     if (len < 1) { proto_send_ack(ACK_CRC_ERROR); return; }
     uint8_t op = data[0];
@@ -1260,8 +1275,6 @@ static void handle_nand(const uint8_t *data, uint32_t len) {
     uint32_t stride = (uint32_t)g.page_size + g.oob_size;
     uint32_t pages = (uint32_t)g.pages_per_block * g.blocks;
     uint8_t out[36];
-    nand_rec_t rec;
-    nand_xfer_t x;
 
     if (op == NAND_OP_FMC_REG) {
         if (alen < 7) { nand_reply(op, NAND_ST_BADARG, 0, 0); return; }
@@ -1286,6 +1299,20 @@ static void handle_nand(const uint8_t *data, uint32_t len) {
         return;
     }
     if (!g.page_size) { nand_reply(op, NAND_ST_NOT_NAND, 0, 0); return; }
+
+    /* Page ops take FMC_CFG from the request; put it back afterwards so a
+     * DMA scan does not change how later CMD_READ, CRC32 or raw reads
+     * behave. */
+    uint32_t saved_cfg = fmc_reg(0x00);
+    nand_study_op(op, arg, alen, stride, pages);
+    fmc_reg(0x00) = saved_cfg;
+}
+
+static void nand_study_op(uint8_t op, const uint8_t *arg, uint32_t alen,
+                          uint32_t stride, uint32_t pages) {
+    uint8_t out[36];
+    nand_rec_t rec;
+    nand_xfer_t x;
 
     switch (op) {
     case NAND_OP_FEATURE_GET:

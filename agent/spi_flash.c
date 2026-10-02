@@ -149,7 +149,7 @@ static uint32_t detect_size(uint8_t id2) {
 }
 
 /* Forward declarations */
-static void fmc_wait_ready(void);
+static int fmc_wait_ready(void);
 static void spi_wait_wip(void);
 
 /* Mode switching: normal mode for register commands, boot mode for reads */
@@ -215,10 +215,13 @@ static void fmc_enter_boot(void) {
     fmc_reg(FMC_INT_CLR) = 0xFF;
 }
 
-static void fmc_wait_ready(void) {
+/* Returns 0 when the register op finished, -1 if it was still running
+ * when the poll gave up. */
+static int fmc_wait_ready(void) {
     volatile uint32_t timeout = 400000;
     while ((fmc_reg(FMC_OP) & FMC_OP_REG_OP_START) && timeout > 0)
         timeout--;
+    return timeout ? 0 : -1;
 }
 
 static void spi_wait_wip(void) {
@@ -591,6 +594,8 @@ static int nand_program_page(uint32_t row, uint32_t column,
 }
 
 /* Read up to NAND_PAGE_SIZE bytes from a NAND page (data area only).
+ * Returns the chip status after PAGE_READ, or 0xFF if the chip or an FMC
+ * register op never finished.
  * row = page index (0 .. flash_size/page_size - 1)
  * column = byte offset within the 2 KiB data area (0 .. NAND_PAGE_SIZE-1)
  * On-chip ECC is left at its power-on default (enabled on MX35LF*) so the
@@ -603,13 +608,15 @@ static int nand_program_page(uint32_t row, uint32_t column,
  * requesting `chunk + 1` bytes per fetch and copying iobuf[1..chunk]. */
 static uint8_t nand_read(uint32_t row, uint32_t column,
                          uint8_t *buf, uint32_t len) {
+    int stalled = 0;
+
     /* 1) PAGE_READ: load page from array into chip cache. */
     fmc_reg(FMC_INT_CLR) = 0xFF;
     fmc_reg(FMC_CMD) = SPI_CMD_NAND_PAGE_READ;
     fmc_reg(FMC_ADDRL) = row;
     fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(3);
     fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_REG_OP_START;
-    fmc_wait_ready();
+    stalled |= fmc_wait_ready();
 
     /* 2) Wait for OIP=0 — chip finishes ECC correction and signals ready.
      * The status carries the on-die ECC verdict (ECC_S, bits 5:4). */
@@ -632,12 +639,14 @@ static uint8_t nand_read(uint32_t row, uint32_t column,
                             | OP_CFG_ADDR_NUM(2)
                             | OP_CFG_DUMMY_NUM(0);   /* dummy is implicit in iobuf[0] */
         fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
-        fmc_wait_ready();
+        stalled |= fmc_wait_ready();
         for (uint32_t i = 0; i < chunk; i++)
             buf[off + i] = iobuf[i + 1];   /* skip iobuf[0] = dummy */
         off += chunk;
     }
-    return status;
+    /* A stalled register op means buf holds stale I/O-buffer bytes; report
+     * it the way nand_wait_oip() reports a chip that never finished. */
+    return stalled ? 0xFF : status;
 }
 
 void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
@@ -940,9 +949,12 @@ static void nand_dma_set_addr(uint32_t page) {
                        | ((in_block & DMA_ADDR_PAGE_MASK) << DMA_ADDR_PAGE_SHIFT);
 }
 
-static void nand_rec_finish(nand_rec_t *rec, uint8_t status, int timed_out) {
+/* `irq` is FMC_INT sampled right after the page op: the status read that
+ * follows clears it and runs a register op of its own. */
+static void nand_rec_finish(nand_rec_t *rec, uint8_t status, uint8_t irq,
+                            int timed_out) {
     rec->ondie = status;
-    rec->fmc_int = (uint8_t)fmc_reg(FMC_INT);
+    rec->fmc_int = irq;
     rec->flags = 0;
     if (timed_out || status == 0xFF) rec->flags |= NAND_REC_TIMEOUT;
     rec->rsvd = 0;
@@ -958,7 +970,7 @@ int nand_page_read(uint32_t page, const nand_xfer_t *x, uint8_t *dst,
     if (x->mode == NAND_XFER_REG) {
         uint8_t status = nand_read(page, 0, dst, total);
         rec->ecc_err = 0;
-        nand_rec_finish(rec, status, 0);
+        nand_rec_finish(rec, status, (uint8_t)fmc_reg(FMC_INT), 0);
         return (rec->flags & NAND_REC_TIMEOUT) ? -1 : 0;
     }
 
@@ -977,8 +989,9 @@ int nand_page_read(uint32_t page, const nand_xfer_t *x, uint8_t *dst,
                          | OP_CTRL_RW_OP(RW_OP_READ)
                          | OP_CTRL_DMA_OP_READY;
     int timed_out = fmc_wait_dma_done();
+    uint8_t irq = (uint8_t)fmc_reg(FMC_INT);
     rec->ecc_err = fmc_reg(FMC_ECC_ERR_NUM0_BUF0);
-    nand_rec_finish(rec, nand_get_feature(NAND_FEATURE_STATUS), timed_out);
+    nand_rec_finish(rec, nand_get_feature(NAND_FEATURE_STATUS), irq, timed_out);
     return (rec->flags & NAND_REC_TIMEOUT) ? -1 : 0;
 }
 
@@ -992,8 +1005,10 @@ int nand_page_program(uint32_t page, const nand_xfer_t *x,
     if (x->fmc_cfg) fmc_reg(FMC_CFG) = x->fmc_cfg;
     rec->ecc_err = 0;
 
+    uint8_t irq;
     if (x->mode == NAND_XFER_REG) {
         nand_program_page(page, 0, src, total);
+        irq = (uint8_t)fmc_reg(FMC_INT);
     } else {
         /* As hifmc100_send_cmd_write(). */
         nand_wait_oip();
@@ -1007,13 +1022,15 @@ int nand_page_program(uint32_t page, const nand_xfer_t *x,
                              | OP_CTRL_DMA_OP(OP_TYPE_DMA)
                              | OP_CTRL_RW_OP(RW_OP_WRITE)
                              | OP_CTRL_DMA_OP_READY;
-        if (fmc_wait_dma_done() != 0) {
-            nand_rec_finish(rec, nand_get_feature(NAND_FEATURE_STATUS), 1);
+        int timed_out = fmc_wait_dma_done();
+        irq = (uint8_t)fmc_reg(FMC_INT);
+        if (timed_out) {
+            nand_rec_finish(rec, nand_get_feature(NAND_FEATURE_STATUS), irq, 1);
             return -1;
         }
     }
     uint8_t status = nand_wait_oip();
-    nand_rec_finish(rec, status, 0);
+    nand_rec_finish(rec, status, irq, 0);
     if (status != 0xFF && (status & NAND_STATUS_P_FAIL)) rec->flags |= NAND_REC_FAIL;
     return rec->flags ? -1 : 0;
 }
@@ -1022,7 +1039,8 @@ int nand_block_erase(uint32_t page, nand_rec_t *rec) {
     if (!nand_geom.page_size) return -1;
     rec->ecc_err = 0;
     int rc = nand_erase_block(page);
-    nand_rec_finish(rec, nand_get_feature(NAND_FEATURE_STATUS), 0);
+    uint8_t irq = (uint8_t)fmc_reg(FMC_INT);
+    nand_rec_finish(rec, nand_get_feature(NAND_FEATURE_STATUS), irq, 0);
     if (rc) rec->flags |= NAND_REC_FAIL;
     return rc;
 }
