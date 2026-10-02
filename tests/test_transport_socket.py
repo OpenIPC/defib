@@ -95,3 +95,26 @@ class TestFlushInputDrainsStaleData:
             await transport.close()
             server.close()
             listener.close()
+
+
+async def test_bytes_waiting_sees_data_not_yet_read() -> None:
+    """Callers poll bytes_waiting() before read(); it must count bytes that
+    are sitting in the kernel, not only ones read() already buffered."""
+    import socket
+
+    from defib.transport.socket import SocketTransport
+
+    ours, peer = socket.socketpair()
+    transport = SocketTransport(ours)
+    try:
+        assert await transport.bytes_waiting() == 0
+        peer.sendall(b"\xbd\x00hello")
+        for _ in range(100):
+            if await transport.bytes_waiting():
+                break
+        assert await transport.bytes_waiting() == 7
+        assert await transport.read(7, timeout=1.0) == b"\xbd\x00hello"
+        assert await transport.bytes_waiting() == 0
+    finally:
+        await transport.close()
+        peer.close()

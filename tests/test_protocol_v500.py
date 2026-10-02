@@ -100,6 +100,39 @@ class TestV500HandshakeCatch:
         assert await transport.bytes_waiting() == 0
 
 
+class TestV500HandshakeOverSocket:
+    @pytest.mark.asyncio
+    async def test_reply_reaches_handshake_over_socket(self):
+        """tcp:// and socket:// transports only count already-received bytes
+        in bytes_waiting(), so the handshake must read, not poll."""
+        import asyncio
+        import socket
+
+        from defib.transport.socket import SocketTransport
+
+        ours, bootrom = socket.socketpair()
+        bootrom.setblocking(False)
+        reply = b"\xbd\x00" + b"\x00" * 6 + struct.pack(">I", 0x72050510) + b"\x00\x00"
+        loop = asyncio.get_running_loop()
+
+        async def fake_bootrom() -> None:
+            await loop.sock_recv(bootrom, 4096)  # first burst arrives
+            await loop.sock_sendall(bootrom, reply)
+            while True:  # keep swallowing the rest of the flood
+                if not await loop.sock_recv(bootrom, 4096):
+                    return
+
+        peer = asyncio.create_task(fake_bootrom())
+        transport = SocketTransport(ours)
+        try:
+            result = await asyncio.wait_for(HiSiliconV500().handshake(transport), 5)
+        finally:
+            await transport.close()
+            bootrom.close()
+            peer.cancel()
+        assert result.chip_id == 0x72050510
+
+
 class TestV500FirmwareTransfer:
     @pytest.mark.asyncio
     async def test_send_firmware_with_acks(self):

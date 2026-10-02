@@ -25,7 +25,7 @@ from defib.recovery.events import (
     RecoveryResult,
     Stage,
 )
-from defib.transport.base import Transport, TransportTimeout
+from defib.transport.base import Transport, TransportError, TransportTimeout
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +85,11 @@ class HiSiliconV500(BootProtocol):
         buffer = bytearray()
         while True:
             await transport.write(burst)
+            # Read only when something has arrived (bytes_waiting() is
+            # non-blocking on every transport).  An unconditional timed read
+            # would reprogram the serial port's timeout — a tcsetattr — on
+            # every pass.  The host TX queue paces the writes; whatever is
+            # still queued when the reply lands is drained below.
             try:
                 waiting = await transport.bytes_waiting()
                 if waiting > 0:
@@ -99,8 +104,13 @@ class HiSiliconV500(BootProtocol):
                 chip_id = struct.unpack(">I", buffer[idx + 8:idx + 12])[0]
                 self._chip_id = chip_id
                 # The rest of the burst is still in flight and the bootrom
-                # answers each frame; let that settle and drop it so the
-                # replies are not mistaken for ACKs during the HEAD stage.
+                # answers each frame: drain our TX queue, let the replies
+                # settle and drop them so they are not mistaken for ACKs
+                # during the HEAD stage.
+                try:
+                    await transport.flush_output()
+                except TransportError:
+                    pass  # best effort: the settle delay still covers it
                 await asyncio.sleep(0.1)
                 await transport.flush_input()
                 _emit(on_progress, ProgressEvent(
