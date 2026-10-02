@@ -268,6 +268,23 @@ async def test_unexpected_answer_raises(agent: FakeNandAgent) -> None:
         await study.info()
 
 
+async def test_stale_read_tail_is_skipped(agent: FakeNandAgent) -> None:
+    """A read the host abandoned keeps streaming; the next call must not
+    take its frames for the answer."""
+    class Stale(FakeNandAgent):
+        first = True
+
+        def _handle(self, payload: bytes) -> None:
+            if self.first:
+                self.first = False
+                self.enqueue_rx(build_packet(0x82, b"\x05\x00" + b"\xaa" * 64))
+                self.enqueue_rx(build_packet(0x83, b"\x00"))
+            FakeNandAgent._handle(self, payload)
+
+    study = NandStudy(FakeClient(Stale()))  # type: ignore[arg-type]
+    assert (await study.info()).page_size == PAGE
+
+
 # --- CLI ------------------------------------------------------------------------
 
 @pytest.fixture

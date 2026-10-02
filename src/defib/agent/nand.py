@@ -14,11 +14,21 @@ CMD_NAND itself only carries parameters and one-record answers.
 from __future__ import annotations
 
 import struct
+import time
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING
 
-from defib.agent.protocol import CMD_NAND, RSP_NAND, recv_response, send_packet
+from defib.agent.protocol import (
+    CMD_NAND,
+    RSP_ACK,
+    RSP_DATA,
+    RSP_NAND,
+    recv_packet,
+    recv_response,
+    send_packet,
+)
+from defib.transport.base import TransportError, TransportTimeout
 
 if TYPE_CHECKING:
     from defib.agent.client import FlashAgentClient
@@ -221,7 +231,25 @@ class NandStudy:
         transport = self._client._transport
         self._client._clear_rx_buffers()
         await send_packet(transport, CMD_NAND, bytes([op]) + args)
-        cmd, data = await recv_response(transport, timeout=timeout)
+        deadline = time.monotonic() + timeout
+        in_stale_stream = False
+        while True:
+            try:
+                cmd, data = await recv_response(
+                    transport, timeout=max(0.1, deadline - time.monotonic()),
+                )
+            except TransportTimeout:
+                raise NandError(f"no answer to CMD_NAND op 0x{op:02x} within {timeout:.0f}s")
+            # The tail of a read the host gave up on: the agent finishes the
+            # stream regardless, then closes it with an ACK.  An ACK with no
+            # data before it is a real answer (an agent without CMD_NAND).
+            if cmd == RSP_DATA:
+                in_stale_stream = True
+                continue
+            if cmd == RSP_ACK and in_stale_stream:
+                in_stale_stream = False
+                continue
+            break
         if cmd != RSP_NAND or len(data) < 2 or data[0] != op:
             raise NandError(
                 f"agent did not answer CMD_NAND op 0x{op:02x} "
@@ -236,6 +264,21 @@ class NandStudy:
             raise NandError(f"CMD_NAND op 0x{op:02x}: unknown status 0x{status:02x}")
         self.last_status = status
         return data[2:]
+
+    async def resync(self, quiet: float = 1.0, limit: float = 60.0) -> None:
+        """Drop whatever the agent is still sending until the line is quiet.
+
+        After the host abandons a read (a sequence gap, say), the agent
+        still streams the rest of it; this waits that out.
+        """
+        transport = self._client._transport
+        end = time.monotonic() + limit
+        while time.monotonic() < end:
+            try:
+                await recv_packet(transport, quiet)
+            except (TransportTimeout, TransportError):
+                break
+        self._client._clear_rx_buffers()
 
     async def info(self) -> NandInfo:
         raw = await self._call(NAND_OP_INFO)

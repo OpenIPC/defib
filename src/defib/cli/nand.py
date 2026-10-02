@@ -243,6 +243,20 @@ def nand_ecc_scan(
     _run(port, body)
 
 
+async def _read_batch(study: Any, page: int, count: int, xfer: Any, tries: int = 3) -> Any:
+    """read_pages with retries: a long UART stream occasionally drops a
+    frame, and one bad batch must not cost a half-hour dump."""
+    for attempt in range(1, tries + 1):
+        try:
+            return await study.read_pages(page, count, xfer)
+        except Exception as e:  # noqa: BLE001 - transport and protocol errors alike
+            if attempt == tries:
+                raise
+            print(f"\n[batch at page {page} failed ({e}); retrying]", file=sys.stderr)
+            await study.resync()
+    raise AssertionError("unreachable")
+
+
 @nand_app.command("dump")
 def nand_dump(
     output: str = typer.Option(..., "-o", "--output", help="Raw dump file (page + OOB per page)"),
@@ -284,7 +298,7 @@ def nand_dump(
                 page = start
                 while page < start + n:
                     k = min(batch, start + n - page)
-                    recs, data = await study.read_pages(page, k, x)
+                    recs, data = await _read_batch(study, page, k, x)
                     # The agent stops after a failed page and still returns it;
                     # its bytes are whatever the buffer held, so keep them out.
                     good = len(recs) - 1 if recs and recs[-1].failed else len(recs)
@@ -297,7 +311,11 @@ def nand_dump(
                         break
         finally:
             if toggled:
-                await study.feature_set(FEATURE_CONFIG, b0)
+                try:
+                    await study.feature_set(FEATURE_CONFIG, b0)
+                except Exception as e:  # noqa: BLE001 - must not mask the dump's own error
+                    Console(stderr=True).print(
+                        f"[yellow]Could not restore feature 0xB0 to 0x{b0:02x}: {e}[/yellow]")
         print(file=sys.stderr)
         sidecar = Path(output + ".json")
         sidecar.write_text(json.dumps({
