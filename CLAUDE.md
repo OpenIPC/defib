@@ -118,10 +118,12 @@ the loader blobs are vendor rkbin files the user supplies, not bundled.
 Bare-metal ARM32 C loaded onto the camera after SPL boot. COBS-framed binary
 protocol with CRC-32, 1024-byte max payload. It comes up at **115200** (the rate
 the boot ROM left the UART at) and is switched to 921600 by `CMD_SET_BAUD` after
-the handshake, reverting to 115200 after ~30 s idle. 13 commands: `INFO 0x01`,
+the handshake, reverting to 115200 after ~30 s idle. 14 commands: `INFO 0x01`,
 `READ 0x02`, `WRITE 0x03`, `ERASE 0x04`, `CRC32 0x05`, `REBOOT 0x06`,
 `SELFUPDATE 0x07`, `SET_BAUD 0x08`, `SCAN 0x09`, `FLASH_PROGRAM 0x0A`,
-`FLASH_STREAM 0x0B`, `MARK_BAD 0x0C`, `MEMBW 0x0D`. `agent/protocol.h` and
+`FLASH_STREAM 0x0B`, `MARK_BAD 0x0C`, `MEMBW 0x0D`, `NAND 0x0E` (SPI NAND study
+ops on FMC100 builds: raw/ECC page I/O, OOB, feature registers; pages move
+through agent RAM buffers, see `agent/nand_layout.h` and `defib.agent.nand`). `agent/protocol.h` and
 `src/defib/agent/protocol.py` must stay in lockstep; the client negotiates
 optional features through a capability bitmask (`client.py`).
 
@@ -144,7 +146,7 @@ Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
   orchestrated by `src/defib/install/`. Commands: `burn`, `install`, `restore`,
   `dump-flash`, `detect`, `capture`, `replay`, `network`, `ports`, `list-chips`,
   `list-interfaces`, `tui`, plus the `agent` sub-app (`upload`, `flash`, `info`,
-  `read`, `write`, `scan`, `membw`).
+  `read`, `write`, `scan`, `membw`, and `nand` — SPI NAND study ops in `cli/nand.py`).
 - **Vendor U-Boot bootstrap** (`src/defib/vendors/`) — migration from an
   already-running stock/vendor U-Boot into an OpenIPC U-Boot shell. This is a
   later recovery stage than `BootProtocol`: targets use exact `soc:variant`
@@ -197,8 +199,8 @@ speculatively, to see an error message, or to "check whether the board responds"
 | Safety | Commands |
 |---|---|
 | Host-only, never touches a device | `list-chips`, `ports`, `list-interfaces`, `replay` |
-| Talks to the device; RAM-only or read-only | `detect`, `capture`, `dump-flash`, `burn`, `agent upload\|info\|read\|scan\|membw`, `network` (serves a file; the *device* decides to write) |
-| **Irreversibly erases and writes flash** | `install`, `restore`, `agent flash`, `agent write`, TUI Flash Doctor write paths |
+| Talks to the device; RAM-only or read-only | `detect`, `capture`, `dump-flash`, `burn`, `agent upload\|info\|read\|scan\|membw`, `agent nand info\|read-page\|ecc-scan\|dump\|feature\|fmc-reg` (the last two can change volatile chip/controller state, never the array), `network` (serves a file; the *device* decides to write) |
+| **Irreversibly erases and writes flash** | `install`, `restore`, `agent flash`, `agent write`, `agent nand write-page\|erase-block`, TUI Flash Doctor write paths |
 
 `burn` only uploads into RAM, but it still power-cycles the board and can leave
 it parked in download mode — recoverable with another power cycle.

@@ -21,6 +21,7 @@
 #define CMD_FLASH_STREAM  0x0B
 #define CMD_MARK_BAD      0x0C  /* NAND only: write 0x00 to OOB[0] of page 0 of a block */
 #define CMD_MEMBW         0x0D  /* DDR bandwidth test (ARMv7 only): see handle_membw */
+#define CMD_NAND          0x0E  /* SPI NAND study ops (FMC100 only): see handle_nand */
 
 /* Responses (device → host) */
 #define RSP_INFO    0x81
@@ -30,6 +31,22 @@
 #define RSP_READY   0x85
 #define RSP_SCAN    0x86
 #define RSP_MEMBW   0x87
+#define RSP_NAND    0x88
+
+/* CMD_NAND sub-operations (first payload byte) */
+#define NAND_OP_INFO          0x00
+#define NAND_OP_FEATURE_GET   0x01
+#define NAND_OP_FEATURE_SET   0x02
+#define NAND_OP_READ_PAGES    0x03
+#define NAND_OP_PROGRAM_PAGE  0x04
+#define NAND_OP_ERASE_BLOCK   0x05
+#define NAND_OP_FMC_REG       0x06
+
+/* RSP_NAND status (second payload byte) */
+#define NAND_ST_OK        0x00
+#define NAND_ST_BADARG    0x01  /* malformed or out-of-range request */
+#define NAND_ST_NOT_NAND  0x02  /* no SPI NAND identified */
+#define NAND_ST_IO        0x03  /* the op ran but the hardware reported failure */
 
 /* ACK status codes */
 #define ACK_OK          0x00

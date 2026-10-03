@@ -1022,6 +1022,10 @@ def list_interfaces_cmd(
 agent_app = typer.Typer(help="Flash agent commands (fast binary protocol)")
 app.add_typer(agent_app, name="agent")
 
+from defib.cli.nand import nand_app  # noqa: E402 - sub-app registration
+
+agent_app.add_typer(nand_app, name="nand")
+
 
 def _agent_not_responding_message(chip: str, uboot_address: int | None = None) -> str:
     """Build the diagnostic shown when boot protocol uploads complete but the

@@ -10,6 +10,8 @@
  * but the layout (4096 × 1 MB sections, 16 KB-aligned) is identical.
  */
 
+#include "nand_layout.h"
+
     .section .text.start
     .global _start
     .arm
@@ -145,6 +147,17 @@ pt_fill_ddr_v5:
     subs    r7, r7, #1
     bne     pt_fill_ddr_v5
 
+#ifdef HAVE_NAND_STUDY
+    /* NAND study DMA buffer: uncached (B=0, C=0) so the FMC's DMA and the
+     * CPU see the same bytes without cache maintenance. */
+    ldr     r1, =NAND_DMA_BUF
+    lsr     r2, r1, #20
+    add     r0, r4, r2, lsl #2
+    ldr     r6, =0x00000C02
+    orr     r1, r6, r2, lsl #20
+    str     r1, [r0]
+#endif
+
     /* Drain write buffer so the page table writes are visible to the MMU
      * before TTBR points at it. */
     mov     r0, #0
@@ -265,6 +278,18 @@ pt_fill_ddr:
     add     r1, r1, #0x100000
     subs    r7, r7, #1
     bne     pt_fill_ddr
+
+#ifdef HAVE_NAND_STUDY
+    /* NAND study DMA buffer: Normal non-cacheable (TEX=001, C=0, B=0), so
+     * the FMC's DMA and the CPU see the same bytes without cache
+     * maintenance.  AP=11 -> (3<<10)|(1<<12)|0b10 = 0x00001C02. */
+    ldr     r1, =NAND_DMA_BUF
+    lsr     r2, r1, #20
+    add     r0, r4, r2, lsl #2
+    ldr     r6, =0x00001C02
+    orr     r1, r6, r2, lsl #20
+    str     r1, [r0]
+#endif
 
     /* ===== ENABLE MMU + CACHES ===== */
 

@@ -17,6 +17,7 @@ Commands (host → device):
   0x08  SET_BAUD   — Change baud rate: baud(4B LE)
   0x09  SCAN       — Scan flash health
   0x0D  MEMBW      — DDR bandwidth test (ARMv7 only): size(4B) + iters(4B) + addr(4B)
+  0x0E  NAND       — SPI NAND study op: subop(1B) + args (see defib.agent.nand)
 
 Responses (device → host):
   0x81  INFO_RSP — chip_id(4B) + flash_size(4B) + ram_base(4B) + sector_size(4B) + version(4B) + caps(4B)
@@ -28,6 +29,7 @@ Responses (device → host):
   0x87  MEMBW_RSP— base(4B) + size(4B) + iters(4B) + timer_hz(4B)
                  + memset_ticks(4B) + read_ticks(4B) + memcpy_ticks(4B)
                  + cpu_arch(4B)
+  0x88  NAND_RSP — subop(1B) + status(1B) + payload
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ CMD_FLASH_PROGRAM = 0x0A
 CMD_FLASH_STREAM = 0x0B
 CMD_MARK_BAD = 0x0C  # NAND only: synthesize a bad-block marker (OOB[0] = 0x00)
 CMD_MEMBW = 0x0D  # DDR bandwidth test (ARMv7 only)
+CMD_NAND = 0x0E  # SPI NAND study ops (FMC100 only), see defib.agent.nand
 
 # Responses
 RSP_INFO = 0x81
@@ -61,6 +64,7 @@ RSP_CRC32 = 0x84
 RSP_READY = 0x85
 RSP_SCAN = 0x86
 RSP_MEMBW = 0x87
+RSP_NAND = 0x88
 
 # ACK status (must match agent/protocol.h)
 ACK_OK = 0x00
@@ -143,6 +147,13 @@ def _recv_packet_sync(port: object, timeout: float) -> tuple[int, bytes]:
             waiting = port.in_waiting  # type: ignore[attr-defined]
             if waiting > 0:
                 data = port.read(waiting)  # type: ignore[attr-defined]
+            elif getattr(port, "timeout", None) is None:
+                # A blocking port (SerialTransport opens with timeout=None):
+                # read(1) would wait for a byte forever, so a silent agent
+                # — wrong baud, crashed — would hang every caller past its
+                # timeout.  Poll instead.
+                time.sleep(0.002)
+                continue
             else:
                 # port.read() blocks up to the port's pre-set timeout
                 # (Rfc2217Transport._PYSERIAL_READ_QUANTUM = 10 ms).

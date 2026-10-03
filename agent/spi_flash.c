@@ -29,6 +29,7 @@
 #define FMC_OP_CTRL         0x68
 #define FMC_STATUS          0xAC
 #define FMC_VERSION         0xBC
+#define FMC_ECC_ERR_NUM0_BUF0 0xC0
 
 /* FMC_CFG bits */
 #define FMC_CFG_OP_MODE_NORMAL  (1 << 0)
@@ -148,7 +149,7 @@ static uint32_t detect_size(uint8_t id2) {
 }
 
 /* Forward declarations */
-static void fmc_wait_ready(void);
+static int fmc_wait_ready(void);
 static void spi_wait_wip(void);
 
 /* Mode switching: normal mode for register commands, boot mode for reads */
@@ -214,10 +215,13 @@ static void fmc_enter_boot(void) {
     fmc_reg(FMC_INT_CLR) = 0xFF;
 }
 
-static void fmc_wait_ready(void) {
+/* Returns 0 when the register op finished, -1 if it was still running
+ * when the poll gave up. */
+static int fmc_wait_ready(void) {
     volatile uint32_t timeout = 400000;
     while ((fmc_reg(FMC_OP) & FMC_OP_REG_OP_START) && timeout > 0)
         timeout--;
+    return timeout ? 0 : -1;
 }
 
 static void spi_wait_wip(void) {
@@ -431,21 +435,28 @@ static void nand_write_enable(void) {
  * An unrecognised NAND falls through to the NOR path, which is not just
  * wrong but can hang: flash_global_unlock() polls a NOR status register a
  * NAND does not implement (GD5F1GM7 never clears "WIP"). */
-static const uint8_t nand_ids[][2] = {
-    { 0xC2, 0x12 },     /* Macronix MX35LF1GE4AB */
-    { 0xEF, 0xAA },     /* Winbond W25N01GV (EF AA 21) */
-    { 0xC8, 0x91 },     /* GigaDevice GD5F1GM7UE, 3.3 V */
-    { 0xC8, 0x81 },     /* GigaDevice GD5F1GM7RE, 1.8 V */
+static const struct {
+    uint8_t  id[2];
+    uint16_t oob_size;
+} nand_ids[] = {
+    { { 0xC2, 0x12 },  64 },    /* Macronix MX35LF1GE4AB */
+    { { 0xEF, 0xAA },  64 },    /* Winbond W25N01GV (EF AA 21) */
+    { { 0xC8, 0x91 }, 128 },    /* GigaDevice GD5F1GM7UE, 3.3 V */
+    { { 0xC8, 0x81 }, 128 },    /* GigaDevice GD5F1GM7RE, 1.8 V */
 };
 
-/* Returns 1 if id[] is a known SPI NAND, read either directly or shifted
- * by one dummy byte (id[0] = dummy). */
+/* Geometry of the identified SPI NAND; page_size 0 until one is found. */
+static nand_geom_t nand_geom;
+
+/* Returns the nand_ids[] index if id[] is a known SPI NAND, read either
+ * directly or shifted by one dummy byte (id[0] = dummy), else -1. */
 static int nand_identify(const uint8_t id[3]) {
     for (unsigned i = 0; i < sizeof(nand_ids) / sizeof(nand_ids[0]); i++) {
-        if (id[0] == nand_ids[i][0] && id[1] == nand_ids[i][1]) return 1;
-        if (id[1] == nand_ids[i][0] && id[2] == nand_ids[i][1]) return 1;
+        const uint8_t *want = nand_ids[i].id;
+        if (id[0] == want[0] && id[1] == want[1]) return (int)i;
+        if (id[1] == want[0] && id[2] == want[1]) return (int)i;
     }
-    return 0;
+    return -1;
 }
 
 int flash_init(flash_info_t *info) {
@@ -468,7 +479,8 @@ int flash_init(flash_info_t *info) {
     fmc_enter_normal();
     flash_read_id(info->jedec_id);
 
-    if (nand_identify(info->jedec_id)) {
+    int nand_idx = nand_identify(info->jedec_id);
+    if (nand_idx >= 0) {
         /* SPI NAND path. No flash_unlock / fmc_enter_boot — NAND has no
          * memory-mapped boot mode and uses different protection (BP bits
          * via SET_FEATURE 0xA0 instead of write-status-register). */
@@ -477,6 +489,10 @@ int flash_init(flash_info_t *info) {
         info->sector_size = NAND_BLOCK_SIZE;    /* 128 KiB erase block */
         info->page_size = NAND_PAGE_SIZE;       /* 2 KiB read/program page */
         current_flash_type = FLASH_TYPE_NAND;
+        nand_geom.page_size = NAND_PAGE_SIZE;
+        nand_geom.oob_size = nand_ids[nand_idx].oob_size;
+        nand_geom.pages_per_block = NAND_BLOCK_SIZE / NAND_PAGE_SIZE;
+        nand_geom.blocks = info->size / NAND_BLOCK_SIZE;
 
         /* Clear block-protection bits (BP0..BP3 + BRWD) in feature 0xA0 so
          * subsequent erase/program commands aren't rejected.  Most SPI
@@ -578,6 +594,8 @@ static int nand_program_page(uint32_t row, uint32_t column,
 }
 
 /* Read up to NAND_PAGE_SIZE bytes from a NAND page (data area only).
+ * Returns the chip status after PAGE_READ, or 0xFF if the chip or an FMC
+ * register op never finished.
  * row = page index (0 .. flash_size/page_size - 1)
  * column = byte offset within the 2 KiB data area (0 .. NAND_PAGE_SIZE-1)
  * On-chip ECC is left at its power-on default (enabled on MX35LF*) so the
@@ -588,18 +606,21 @@ static int nand_program_page(uint32_t row, uint32_t column,
  * byte 0 of its I/O buffer (always 0x00 since the chip drives the dummy
  * line low), so real chip data starts at iobuf[1].  We compensate by
  * requesting `chunk + 1` bytes per fetch and copying iobuf[1..chunk]. */
-static void nand_read(uint32_t row, uint32_t column,
-                      uint8_t *buf, uint32_t len) {
+static uint8_t nand_read(uint32_t row, uint32_t column,
+                         uint8_t *buf, uint32_t len) {
+    int stalled = 0;
+
     /* 1) PAGE_READ: load page from array into chip cache. */
     fmc_reg(FMC_INT_CLR) = 0xFF;
     fmc_reg(FMC_CMD) = SPI_CMD_NAND_PAGE_READ;
     fmc_reg(FMC_ADDRL) = row;
     fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(3);
     fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_REG_OP_START;
-    fmc_wait_ready();
+    stalled |= fmc_wait_ready();
 
-    /* 2) Wait for OIP=0 — chip finishes ECC correction and signals ready. */
-    nand_wait_oip();
+    /* 2) Wait for OIP=0 — chip finishes ECC correction and signals ready.
+     * The status carries the on-die ECC verdict (ECC_S, bits 5:4). */
+    uint8_t status = nand_wait_oip();
 
     /* 3) READ_FROM_CACHE: pull data from cache via column addressing.
      * FMC stores the post-address dummy byte as iobuf[0] (always 0x00),
@@ -618,11 +639,14 @@ static void nand_read(uint32_t row, uint32_t column,
                             | OP_CFG_ADDR_NUM(2)
                             | OP_CFG_DUMMY_NUM(0);   /* dummy is implicit in iobuf[0] */
         fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
-        fmc_wait_ready();
+        stalled |= fmc_wait_ready();
         for (uint32_t i = 0; i < chunk; i++)
             buf[off + i] = iobuf[i + 1];   /* skip iobuf[0] = dummy */
         off += chunk;
     }
+    /* A stalled register op means buf holds stale I/O-buffer bytes; report
+     * it the way nand_wait_oip() reports a chip that never finished. */
+    return stalled ? 0xFF : status;
 }
 
 void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
@@ -834,6 +858,24 @@ int flash_read_oob(uint32_t block, uint8_t *buf, uint32_t len) {
 }
 
 uint32_t flash_crc32(uint32_t addr, uint32_t len) {
+    if (current_flash_type == FLASH_TYPE_NAND) {
+        /* Page by page through the same path CMD_READ uses; the NOR
+         * register read below would send NOR opcodes to a NAND. */
+        uint8_t page[NAND_PAGE_SIZE];
+        uint32_t c = 0;
+        while (len > 0) {
+            uint32_t col = addr % NAND_PAGE_SIZE;
+            uint32_t chunk = NAND_PAGE_SIZE - col;
+            if (chunk > len) chunk = len;
+            flash_read(addr, page, chunk);
+            c = crc32(c, page, chunk);
+            addr += chunk;
+            len -= chunk;
+            proto_drain_fifo();
+        }
+        return c;
+    }
+
     /* Use register-based reads to compute CRC32 over flash region.
      * Boot mode memory window wraps at 1MB on some SoCs. */
     fmc_enter_normal();
@@ -861,4 +903,155 @@ uint32_t flash_crc32(uint32_t addr, uint32_t len) {
 
     fmc_enter_boot();
     return c;
+}
+
+/* ---- SPI NAND study interface ----------------------------------------- */
+
+/* FMC_OP_CFG / FMC_ADDR encodings for the controller's page engine, from
+ * the Linux hifmc100 driver (hifmc100.c, hifmc100.h, hisi_fmc.h). */
+#define FMC_INT_OP_DONE_BIT     (1u << 0)
+#define DMA_ADDR_BLOCK_SHIFT    22      /* REG_CNT_BLOCK_NUM_SHIFT */
+#define DMA_ADDR_BLOCK_MASK     0x3ffu
+#define DMA_ADDR_BLOCK_H_SHIFT  10      /* REG_CNT_HIGH_BLOCK_NUM_SHIFT */
+#define DMA_ADDR_PAGE_SHIFT     16      /* REG_CNT_PAGE_NUM_SHIFT */
+#define DMA_ADDR_PAGE_MASK      0x3fu
+
+void nand_get_geometry(nand_geom_t *geom) {
+    /* Field by field: a struct copy becomes a memcpy() call, and the
+     * agent links without libc. */
+    geom->page_size = nand_geom.page_size;
+    geom->oob_size = nand_geom.oob_size;
+    geom->pages_per_block = nand_geom.pages_per_block;
+    geom->blocks = nand_geom.blocks;
+}
+
+uint8_t nand_feature_get(uint8_t addr) {
+    return nand_get_feature(addr);
+}
+
+void nand_feature_set(uint8_t addr, uint8_t val) {
+    nand_set_feature(addr, val);
+}
+
+/* REG mode means raw.  With the SPI NAND interface selected, a non-zero
+ * FMC_CFG ECC type also applies to register-path reads: the controller
+ * "corrects" READ_FROM_CACHE data, and with a mismatched ECC type it flips
+ * bits that were right (measured on GD5F1GM7: 1-6 bits on ~29% of pages).
+ * The caller's FMC_CFG is restored by handle_nand after the op. */
+static void nand_reg_raw(void) {
+    fmc_reg(FMC_CFG) = fmc_reg(FMC_CFG) & ~(7u << 5);
+}
+
+static int fmc_wait_dma_done(void) {
+    for (uint32_t i = 0; i < 4000000; i++) {
+        if (fmc_reg(FMC_INT) & FMC_INT_OP_DONE_BIT) return 0;
+    }
+    return -1;
+}
+
+/* Block/page address as the page engine wants it (64-page blocks). */
+static void nand_dma_set_addr(uint32_t page) {
+    uint32_t block = page / nand_geom.pages_per_block;
+    uint32_t in_block = page % nand_geom.pages_per_block;
+    fmc_reg(FMC_ADDRH) = (block >> DMA_ADDR_BLOCK_H_SHIFT) & 0xff;
+    fmc_reg(FMC_ADDRL) = ((block & DMA_ADDR_BLOCK_MASK) << DMA_ADDR_BLOCK_SHIFT)
+                       | ((in_block & DMA_ADDR_PAGE_MASK) << DMA_ADDR_PAGE_SHIFT);
+}
+
+/* `irq` is FMC_INT sampled right after the page op: the status read that
+ * follows clears it and runs a register op of its own. */
+static void nand_rec_finish(nand_rec_t *rec, uint8_t status, uint8_t irq,
+                            int timed_out) {
+    rec->ondie = status;
+    rec->fmc_int = irq;
+    rec->flags = 0;
+    if (timed_out || status == 0xFF) rec->flags |= NAND_REC_TIMEOUT;
+    rec->rsvd = 0;
+}
+
+/* Read page + full OOB into dst (page_size + oob_size bytes). */
+int nand_page_read(uint32_t page, const nand_xfer_t *x, uint8_t *dst,
+                   nand_rec_t *rec) {
+    uint32_t total = (uint32_t)nand_geom.page_size + nand_geom.oob_size;
+    if (!nand_geom.page_size) return -1;
+    if (x->fmc_cfg) fmc_reg(FMC_CFG) = x->fmc_cfg;
+
+    if (x->mode == NAND_XFER_REG) {
+        nand_reg_raw();
+        uint8_t status = nand_read(page, 0, dst, total);
+        rec->ecc_err = 0;
+        nand_rec_finish(rec, status, (uint8_t)fmc_reg(FMC_INT), 0);
+        return (rec->flags & NAND_REC_TIMEOUT) ? -1 : 0;
+    }
+
+    /* As hifmc100_send_cmd_read(): wait for the chip, then hand the whole
+     * PAGE_READ + READ_FROM_CACHE sequence to the controller. */
+    nand_wait_oip();
+    fmc_reg(FMC_INT_CLR) = 0xFF;
+    fmc_reg(FMC_OP_CFG) = OP_CFG_FM_CS(0) | OP_CFG_MEM_IF_TYPE(x->iftype)
+                        | OP_CFG_DUMMY_NUM(x->dummy);
+    nand_dma_set_addr(page);
+    fmc_reg(FMC_DMA_SADDR_D0) = (uint32_t)(uintptr_t)dst;
+    fmc_reg(FMC_DMA_SADDR_OOB) = (uint32_t)(uintptr_t)dst + nand_geom.page_size;
+    fmc_reg(FMC_OP_CTRL) = OP_CTRL_RD_OPCODE(x->opcode)
+                         | OP_CTRL_RD_OP_SEL(RD_OP_READ_ALL_PAGE)
+                         | OP_CTRL_DMA_OP(OP_TYPE_DMA)
+                         | OP_CTRL_RW_OP(RW_OP_READ)
+                         | OP_CTRL_DMA_OP_READY;
+    int timed_out = fmc_wait_dma_done();
+    uint8_t irq = (uint8_t)fmc_reg(FMC_INT);
+    rec->ecc_err = fmc_reg(FMC_ECC_ERR_NUM0_BUF0);
+    nand_rec_finish(rec, nand_get_feature(NAND_FEATURE_STATUS), irq, timed_out);
+    return (rec->flags & NAND_REC_TIMEOUT) ? -1 : 0;
+}
+
+/* Program page + full OOB from src (page_size + oob_size bytes).  No
+ * empty-page-mark or other OOB fix-ups: the caller lays out the OOB,
+ * exactly as it should land in the controller's buffer. */
+int nand_page_program(uint32_t page, const nand_xfer_t *x,
+                      const uint8_t *src, nand_rec_t *rec) {
+    uint32_t total = (uint32_t)nand_geom.page_size + nand_geom.oob_size;
+    if (!nand_geom.page_size) return -1;
+    if (x->fmc_cfg) fmc_reg(FMC_CFG) = x->fmc_cfg;
+    rec->ecc_err = 0;
+
+    uint8_t irq;
+    if (x->mode == NAND_XFER_REG) {
+        nand_reg_raw();
+        nand_program_page(page, 0, src, total);
+        irq = (uint8_t)fmc_reg(FMC_INT);
+    } else {
+        /* As hifmc100_send_cmd_write(). */
+        nand_wait_oip();
+        nand_write_enable();
+        fmc_reg(FMC_INT_CLR) = 0xFF;
+        fmc_reg(FMC_OP_CFG) = OP_CFG_FM_CS(0) | OP_CFG_MEM_IF_TYPE(x->iftype);
+        nand_dma_set_addr(page);
+        fmc_reg(FMC_DMA_SADDR_D0) = (uint32_t)(uintptr_t)src;
+        fmc_reg(FMC_DMA_SADDR_OOB) = (uint32_t)(uintptr_t)src + nand_geom.page_size;
+        fmc_reg(FMC_OP_CTRL) = OP_CTRL_WR_OPCODE(x->opcode)
+                             | OP_CTRL_DMA_OP(OP_TYPE_DMA)
+                             | OP_CTRL_RW_OP(RW_OP_WRITE)
+                             | OP_CTRL_DMA_OP_READY;
+        int timed_out = fmc_wait_dma_done();
+        irq = (uint8_t)fmc_reg(FMC_INT);
+        if (timed_out) {
+            nand_rec_finish(rec, nand_get_feature(NAND_FEATURE_STATUS), irq, 1);
+            return -1;
+        }
+    }
+    uint8_t status = nand_wait_oip();
+    nand_rec_finish(rec, status, irq, 0);
+    if (status != 0xFF && (status & NAND_STATUS_P_FAIL)) rec->flags |= NAND_REC_FAIL;
+    return rec->flags ? -1 : 0;
+}
+
+int nand_block_erase(uint32_t page, nand_rec_t *rec) {
+    if (!nand_geom.page_size) return -1;
+    rec->ecc_err = 0;
+    int rc = nand_erase_block(page);
+    uint8_t irq = (uint8_t)fmc_reg(FMC_INT);
+    nand_rec_finish(rec, nand_get_feature(NAND_FEATURE_STATUS), irq, 0);
+    if (rc) rec->flags |= NAND_REC_FAIL;
+    return rc;
 }

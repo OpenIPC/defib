@@ -3,8 +3,8 @@
  *
  * NOR: register-based reads via FMC normal mode (faster than memory
  * window when window wraps at 1MB on some SoCs).
- * NAND: PAGE_READ → READ_FROM_CACHE flow with on-chip ECC enabled.
- *       Currently read-only (erase/write are NOR-only).
+ * NAND: PAGE_READ → READ_FROM_CACHE flow, erase and program, plus the
+ *       CMD_NAND study interface below (controller page engine, raw OOB).
  */
 
 #ifndef SPI_FLASH_H
@@ -82,5 +82,59 @@ int flash_read_oob(uint32_t block, uint8_t *buf, uint32_t len);
  * which sits in the user OOB area before the ECC region.  Returns 0
  * on success, -1 if NOR or program fails. */
 int flash_program_oob(uint32_t block, const uint8_t *buf, uint32_t len);
+
+/* ---- SPI NAND study interface (CMD_NAND) -------------------------------
+ *
+ * Page I/O at the level the Linux hifmc100 / xmedia_fmc100 drivers work
+ * at, so their behaviour can be reproduced or varied one knob at a time:
+ *
+ *   NAND_XFER_REG  PAGE_READ/READ_FROM_CACHE or PROGRAM_LOAD/EXECUTE
+ *                  through FMC register ops, page + full OOB, no
+ *                  controller ECC.  With the chip's on-die ECC off this
+ *                  is the raw array content.
+ *   NAND_XFER_DMA  the controller's own page engine (FMC_OP_CTRL + DMA),
+ *                  as the kernel drives it.  ECC type, page and block
+ *                  size come from the FMC_CFG value passed in.
+ */
+#define NAND_XFER_REG   0
+#define NAND_XFER_DMA   1
+
+typedef struct {
+    uint32_t fmc_cfg;   /* written to FMC_CFG before the op; 0 = leave as is */
+    uint8_t  mode;      /* NAND_XFER_REG or NAND_XFER_DMA */
+    uint8_t  opcode;    /* DMA: SPI read/program opcode (0x03, 0x6B, 0x02, 0x32 ...) */
+    uint8_t  iftype;    /* DMA: FMC MEM_IF_TYPE (0 std, 1 dual, 2 dio, 3 quad, 4 qio) */
+    uint8_t  dummy;     /* DMA read: dummy bytes after the column address */
+} nand_xfer_t;
+
+/* What the hardware said about one page operation. */
+typedef struct {
+    uint32_t ecc_err;   /* FMC ECC_ERR_NUM0_BUF0: one byte per ECC step,
+                         * 0xff = uncorrectable (DMA reads only) */
+    uint8_t  ondie;     /* chip status, feature 0xC0, after the op */
+    uint8_t  fmc_int;   /* FMC_INT after the op */
+    uint8_t  flags;     /* NAND_REC_* */
+    uint8_t  rsvd;
+} nand_rec_t;
+
+#define NAND_REC_TIMEOUT    (1 << 0)    /* controller or chip never finished */
+#define NAND_REC_FAIL       (1 << 1)    /* chip reported P_FAIL / E_FAIL */
+
+/* Geometry of the identified chip; page_size 0 if it is not a SPI NAND. */
+typedef struct {
+    uint16_t page_size;
+    uint16_t oob_size;          /* physical spare area */
+    uint16_t pages_per_block;
+    uint16_t blocks;
+} nand_geom_t;
+
+void    nand_get_geometry(nand_geom_t *geom);
+uint8_t nand_feature_get(uint8_t addr);
+void    nand_feature_set(uint8_t addr, uint8_t val);
+int     nand_page_read(uint32_t page, const nand_xfer_t *x, uint8_t *dst,
+                       nand_rec_t *rec);
+int     nand_page_program(uint32_t page, const nand_xfer_t *x,
+                          const uint8_t *src, nand_rec_t *rec);
+int     nand_block_erase(uint32_t page, nand_rec_t *rec);
 
 #endif /* SPI_FLASH_H */

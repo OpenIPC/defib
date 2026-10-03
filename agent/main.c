@@ -8,6 +8,7 @@
 #include "emmc_himci.h"
 #include "protocol.h"
 #include "spi_flash.h"
+#include "nand_layout.h"
 
 static flash_info_t flash_info;
 
@@ -145,8 +146,9 @@ static int addr_readable(uint32_t addr, uint32_t size) {
  *   SoCs where it isn't 0x14000000 — e.g. hi3520dv200 has it at
  *   0x58000000).
  *   v4 added: CMD_MEMBW for bare-metal DDR bandwidth measurement
- *   (ARMv7 only; ACK_FLASH_ERROR on ARMv5). */
-#define AGENT_VERSION       4
+ *   (ARMv7 only; ACK_FLASH_ERROR on ARMv5).
+ *   v5 added: CMD_NAND, SPI NAND study ops on FMC100 (CAP_NAND). */
+#define AGENT_VERSION       5
 
 /* Capability flags — advertise supported features */
 #define CAP_FLASH_STREAM    (1 << 0)  /* CMD_FLASH_STREAM with double-buffer */
@@ -162,9 +164,15 @@ static int addr_readable(uint32_t addr, uint32_t size) {
 #define CAP_MEMBW           0
 #endif
 
+#ifdef HAVE_NAND_STUDY
+#define CAP_NAND            (1 << 8)  /* CMD_NAND */
+#else
+#define CAP_NAND            0
+#endif
+
 #define AGENT_CAPS (CAP_FLASH_STREAM | CAP_SECTOR_BITMAP | CAP_PAGE_SKIP | \
                     CAP_SET_BAUD | CAP_REBOOT | CAP_SELFUPDATE | CAP_SCAN | \
-                    CAP_MEMBW)
+                    CAP_MEMBW | CAP_NAND)
 
 static void handle_info(void) {
     uint8_t resp[28];
@@ -180,6 +188,23 @@ static void handle_info(void) {
     write_le32(&resp[20], AGENT_CAPS);
     write_le32(&resp[24], FLASH_MEM);
     proto_send(RSP_INFO, resp, 28);
+}
+
+/* I/O registers require 32-bit word-aligned access (ldr not ldrb).
+ * RAM and flash can use byte access. Covers the V3+/V4+/V5/V6 peripheral
+ * block (0x10000000..0x13000000) as well as the V1-era regions actually
+ * used by V1 SoCs (FMC, CRG, UART). */
+static int is_io_region(uint32_t addr) {
+    return (addr >= 0x10000000 && addr < 0x13000000)
+        || (addr >= FMC_BASE  && addr < FMC_BASE  + 0x1000)
+        || (addr >= CRG_BASE  && addr < CRG_BASE  + 0x1000)
+        || (addr >= UART_BASE && addr < UART_BASE + 0x1000);
+}
+
+/* Byte `addr` of an I/O region, fetched with a word load as CMD_READ does. */
+static uint8_t io_byte(uint32_t addr) {
+    uint32_t val = *(volatile uint32_t *)(addr & ~3u);
+    return (val >> ((addr & 3) * 8)) & 0xFF;
 }
 
 static void handle_read(const uint8_t *data, uint32_t len) {
@@ -198,10 +223,7 @@ static void handle_read(const uint8_t *data, uint32_t len) {
      * RAM and flash can use byte access. Cover the V3+/V4+/V5/V6
      * peripheral block (0x10000000..0x13000000) as well as the V1-era
      * regions actually used by V1 SoCs (FMC, CRG, UART). */
-    int io_region = (addr >= 0x10000000 && addr < 0x13000000)
-                 || (addr >= FMC_BASE  && addr < FMC_BASE  + 0x1000)
-                 || (addr >= CRG_BASE  && addr < CRG_BASE  + 0x1000)
-                 || (addr >= UART_BASE && addr < UART_BASE + 0x1000);
+    int io_region = is_io_region(addr);
 
     uint16_t seq = 0;
     uint32_t offset = 0;
@@ -292,6 +314,14 @@ static void handle_crc32_cmd(const uint8_t *data, uint32_t len) {
     if (flash_readable && addr >= FLASH_MEM &&
         (addr + size) <= (FLASH_MEM + flash_info.size)) {
         c = flash_crc32(addr - FLASH_MEM, size);
+    } else if (is_io_region(addr)) {
+        /* Registers: the same word loads and byte order CMD_READ uses, or
+         * the CRC covers different bytes than a read returns. */
+        c = 0;
+        for (uint32_t off = 0; off < size; off++) {
+            uint8_t b = io_byte(addr + off);
+            c = crc32(c, &b, 1);
+        }
     } else {
         const uint8_t *ptr = (const uint8_t *)addr;
         c = crc32(0, ptr, size);
@@ -679,9 +709,10 @@ static void handle_flash_write(const uint8_t *data, uint32_t len) {
         offset += chunk;
     }
 
-    /* Verify written data by reading back from flash and comparing CRC */
-    const uint8_t *flash_ptr = (const uint8_t *)(FLASH_MEM + flash_addr);
-    uint32_t verify_crc = crc32(0, flash_ptr, size);
+    /* Verify written data by reading it back through the controller.
+     * Not through the FLASH_MEM window: NAND has none, and on NOR it wraps
+     * at 1 MiB on some SoCs. */
+    uint32_t verify_crc = flash_crc32(flash_addr, size);
     if (verify_crc != expected_crc) {
         uint8_t err[9];
         err[0] = ACK_CRC_ERROR;
@@ -1172,6 +1203,181 @@ static void handle_mark_bad(const uint8_t *data, uint32_t len) {
     proto_send_ack(rc == 0 ? ACK_OK : ACK_FLASH_ERROR);
 }
 
+#ifdef HAVE_NAND_STUDY
+/*
+ * CMD_NAND: SPI NAND study ops — page I/O the way the Linux FMC100 drivers
+ * do it, or deliberately not, for chasing ECC faults below the OS.
+ *   Host sends: CMD_NAND [subop:1] [args...]
+ *   Agent answers: RSP_NAND [subop:1] [status:1] [payload...]
+ *
+ * Bulk data does not travel in RSP_NAND.  Pages live in NAND_DMA_BUF and
+ * per-page results in NAND_STAT_BUF; the host moves them with CMD_READ /
+ * CMD_WRITE at the addresses NAND_OP_INFO reports.
+ *
+ * Transfer spec (8 bytes, "xfer" below):
+ *   [fmc_cfg:4LE] [mode:1] [opcode:1] [iftype:1] [dummy:1]   see nand_xfer_t
+ * Per-page record (8 bytes, "rec"):
+ *   [ecc_err:4LE] [ondie:1] [fmc_int:1] [flags:1] [0]        see nand_rec_t
+ *
+ *   INFO          ->  [page:2][oob:2][pages_per_block:2][blocks:2]
+ *                     [dma_buf:4][dma_size:4][stat_buf:4][stat_size:4]
+ *                     [fmc_cfg:4]
+ *   FEATURE_GET   [addr:1]            ->  [value:1]
+ *   FEATURE_SET   [addr:1][value:1]   ->  [read back:1]
+ *   READ_PAGES    [start:4][count:4][xfer:8][store:1]  ->  [done:4]
+ *                 rec i at NAND_STAT_BUF + 8*i; with store=1, page i at
+ *                 NAND_DMA_BUF + i*(page+oob), else data is discarded
+ *                 (an ECC scan).  Stops at the first timeout.
+ *   PROGRAM_PAGE  [page:4][xfer:8][src_off:4]  ->  rec
+ *                 page + OOB from NAND_DMA_BUF + src_off, OOB as given.
+ *   ERASE_BLOCK   [page:4]            ->  rec
+ *   FMC_REG       [write:1][off:2][value:4]  ->  [value:4]
+ *                 any 32-bit FMC register, offset < 0x1000, read after
+ *                 the optional write.
+ */
+static void nand_reply(uint8_t subop, uint8_t status,
+                       const uint8_t *payload, uint32_t n) {
+    uint8_t buf[40];
+    buf[0] = subop;
+    buf[1] = status;
+    for (uint32_t i = 0; i < n && i < sizeof(buf) - 2; i++)
+        buf[2 + i] = payload[i];
+    proto_send(RSP_NAND, buf, 2 + n);
+}
+
+static void nand_parse_xfer(const uint8_t *p, nand_xfer_t *x) {
+    x->fmc_cfg = read_le32(&p[0]);
+    x->mode = p[4];
+    x->opcode = p[5];
+    x->iftype = p[6];
+    x->dummy = p[7];
+}
+
+static void nand_put_rec(uint8_t *p, const nand_rec_t *r) {
+    write_le32(&p[0], r->ecc_err);
+    p[4] = r->ondie;
+    p[5] = r->fmc_int;
+    p[6] = r->flags;
+    p[7] = r->rsvd;
+}
+
+static void nand_study_op(uint8_t op, const uint8_t *arg, uint32_t alen,
+                          uint32_t stride, uint32_t pages);
+
+static void handle_nand(const uint8_t *data, uint32_t len) {
+    if (len < 1) { proto_send_ack(ACK_CRC_ERROR); return; }
+    uint8_t op = data[0];
+    const uint8_t *arg = &data[1];
+    uint32_t alen = len - 1;
+
+    nand_geom_t g;
+    nand_get_geometry(&g);
+    uint32_t stride = (uint32_t)g.page_size + g.oob_size;
+    uint32_t pages = (uint32_t)g.pages_per_block * g.blocks;
+    uint8_t out[36];
+
+    if (op == NAND_OP_FMC_REG) {
+        if (alen < 7) { nand_reply(op, NAND_ST_BADARG, 0, 0); return; }
+        uint32_t off = arg[1] | ((uint32_t)arg[2] << 8);
+        if (off >= 0x1000 || (off & 3)) { nand_reply(op, NAND_ST_BADARG, 0, 0); return; }
+        if (arg[0]) fmc_reg(off) = read_le32(&arg[3]);
+        write_le32(out, fmc_reg(off));
+        nand_reply(op, NAND_ST_OK, out, 4);
+        return;
+    }
+    if (op == NAND_OP_INFO) {
+        out[0] = g.page_size & 0xff;        out[1] = g.page_size >> 8;
+        out[2] = g.oob_size & 0xff;         out[3] = g.oob_size >> 8;
+        out[4] = g.pages_per_block & 0xff;  out[5] = g.pages_per_block >> 8;
+        out[6] = g.blocks & 0xff;           out[7] = g.blocks >> 8;
+        write_le32(&out[8], NAND_DMA_BUF);
+        write_le32(&out[12], NAND_DMA_BUF_SIZE);
+        write_le32(&out[16], NAND_STAT_BUF);
+        write_le32(&out[20], NAND_STAT_BUF_SIZE);
+        write_le32(&out[24], fmc_reg(0x00));
+        nand_reply(op, g.page_size ? NAND_ST_OK : NAND_ST_NOT_NAND, out, 28);
+        return;
+    }
+    if (!g.page_size) { nand_reply(op, NAND_ST_NOT_NAND, 0, 0); return; }
+
+    /* Page ops take FMC_CFG from the request; put it back afterwards so a
+     * DMA scan does not change how later CMD_READ, CRC32 or raw reads
+     * behave. */
+    uint32_t saved_cfg = fmc_reg(0x00);
+    nand_study_op(op, arg, alen, stride, pages);
+    fmc_reg(0x00) = saved_cfg;
+}
+
+static void nand_study_op(uint8_t op, const uint8_t *arg, uint32_t alen,
+                          uint32_t stride, uint32_t pages) {
+    uint8_t out[36];
+    nand_rec_t rec;
+    nand_xfer_t x;
+
+    switch (op) {
+    case NAND_OP_FEATURE_GET:
+        if (alen < 1) break;
+        out[0] = nand_feature_get(arg[0]);
+        nand_reply(op, NAND_ST_OK, out, 1);
+        return;
+    case NAND_OP_FEATURE_SET:
+        if (alen < 2) break;
+        nand_feature_set(arg[0], arg[1]);
+        out[0] = nand_feature_get(arg[0]);
+        nand_reply(op, NAND_ST_OK, out, 1);
+        return;
+    case NAND_OP_READ_PAGES: {
+        if (alen < 17) break;
+        uint32_t start = read_le32(&arg[0]);
+        uint32_t count = read_le32(&arg[4]);
+        uint8_t store = arg[16];
+        nand_parse_xfer(&arg[8], &x);
+        if (count == 0 || start >= pages || count > pages - start
+            || count > NAND_STAT_BUF_SIZE / 8
+            || (store && count > NAND_DMA_BUF_SIZE / stride))
+            break;
+        uint8_t *recs = (uint8_t *)NAND_STAT_BUF;
+        uint32_t done = 0;
+        while (done < count) {
+            uint8_t *dst = (uint8_t *)(NAND_DMA_BUF + (store ? done * stride : 0));
+            int rc = nand_page_read(start + done, &x, dst, &rec);
+            nand_put_rec(&recs[done * 8], &rec);
+            done++;
+            proto_drain_fifo();
+            if (rc) break;
+        }
+        write_le32(out, done);
+        nand_reply(op, done == count ? NAND_ST_OK : NAND_ST_IO, out, 4);
+        return;
+    }
+    case NAND_OP_PROGRAM_PAGE: {
+        if (alen < 16) break;
+        uint32_t page = read_le32(&arg[0]);
+        uint32_t src_off = read_le32(&arg[12]);
+        nand_parse_xfer(&arg[4], &x);
+        if (page >= pages || src_off > NAND_DMA_BUF_SIZE - stride) break;
+        int rc = nand_page_program(page, &x,
+                                   (const uint8_t *)(NAND_DMA_BUF + src_off), &rec);
+        nand_put_rec(out, &rec);
+        nand_reply(op, rc ? NAND_ST_IO : NAND_ST_OK, out, 8);
+        return;
+    }
+    case NAND_OP_ERASE_BLOCK: {
+        if (alen < 4) break;
+        uint32_t page = read_le32(&arg[0]);
+        if (page >= pages) break;
+        int rc = nand_block_erase(page, &rec);
+        nand_put_rec(out, &rec);
+        nand_reply(op, rc ? NAND_ST_IO : NAND_ST_OK, out, 8);
+        return;
+    }
+    default:
+        break;
+    }
+    nand_reply(op, NAND_ST_BADARG, 0, 0);
+}
+#endif /* HAVE_NAND_STUDY */
+
 static void handle_scan(const uint8_t *data __attribute__((unused)),
                         uint32_t len __attribute__((unused))) {
     if (!flash_readable) {
@@ -1423,6 +1629,11 @@ int main(void) {
             case CMD_MEMBW:
                 handle_membw(cmd_buf, data_len);
                 break;
+#ifdef HAVE_NAND_STUDY
+            case CMD_NAND:
+                handle_nand(cmd_buf, data_len);
+                break;
+#endif
             case CMD_SET_BAUD:
                 handle_set_baud(cmd_buf, data_len);
                 break;
