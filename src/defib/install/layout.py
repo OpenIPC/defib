@@ -35,12 +35,85 @@ NOR32M_LAYOUT = {
     "rootfs": (0x350000, 0x1800000),
 }
 
+# Legacy split NAND layout (boot, env, raw kernel, UBI) of the retired
+# u-boot-hi3516ev200 build. OpenIPC no longer ships it for the SoCs in
+# defib.firmware.PER_FLASH_TYPE_UBOOT, which use NAND_UBI_LAYOUT instead. It is
+# kept only for `install --nand` on other chips, whose U-Boot defines no layout.
 NAND_LAYOUT = {
     "boot": (0x000000, 0x100000),
     "env": (0x100000, 0x100000),
     "kernel": (0x200000, 0x800000),
     "rootfs": (0xA00000, 0x7600000),
 }
+
+# UBI-only NAND layout of the u-boot-xmedia NAND builds:
+#   <hinand|nand>:768k(boot),256k(env),-(ubi)
+# The ubi partition runs to the end of the chip and holds one UBI image with
+# the rootfs volume (UBIFS, kernel inside as /boot/fitImage) and rootfs_data.
+# U-Boot's default environment carries mtdids/mtdparts/bootcmd/bootargs for it.
+NAND_UBI_LAYOUT = {
+    "boot": (0x000000, 0x0C0000),
+    "env": (0x0C0000, 0x040000),
+}
+NAND_UBI_OFFSET = 0x100000
+
+_MTDPART_RE = re.compile(
+    r"^(?P<size>-|(?:0x[0-9a-f]+|\d+)[kmg]?)"
+    r"(?:@(?P<offset>(?:0x[0-9a-f]+|\d+)[kmg]?))?"
+    r"\((?P<name>[^)]*)\)",
+    re.IGNORECASE,
+)
+
+
+def _mtd_size(text: str) -> int:
+    multiplier = {"k": 1024, "m": 1024**2, "g": 1024**3}.get(text[-1].lower(), 1)
+    digits = text[:-1] if multiplier != 1 else text
+    return int(digits, 0) * multiplier
+
+
+def mtdparts_partition_offset(mtdparts: str, name: str) -> int | None:
+    """Offset of partition ``name`` in a U-Boot/Linux mtdparts string.
+
+    Accepts the value with or without the ``mtdparts=`` prefix and with several
+    ``;``-separated devices. Returns None if the partition is not listed or the
+    string cannot be parsed up to it.
+    """
+    value = mtdparts.strip().removeprefix("mtdparts=")
+    for device in value.split(";"):
+        _, sep, parts = device.partition(":")
+        if not sep:
+            continue
+        offset = 0
+        for part in parts.split(","):
+            match = _MTDPART_RE.match(part.strip())
+            if match is None:
+                break
+            if match.group("offset"):
+                offset = _mtd_size(match.group("offset"))
+            if match.group("name") == name:
+                return offset
+            size = match.group("size")
+            if size == "-":
+                break
+            offset += _mtd_size(size)
+    return None
+
+
+def parse_nand_erase_range(response: str) -> tuple[int, int] | None:
+    """Return ``(offset, size)`` from U-Boot's ``nand erase`` banner."""
+    match = re.search(
+        r"offset\s+0x([0-9a-f]+),\s*size\s+0x([0-9a-f]+)",
+        response,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return int(match.group(1), 16), int(match.group(2), 16)
+
+
+def uboot_reports_ok(response: str) -> bool:
+    """True when a U-Boot nand erase/write printed its final ``OK``."""
+    return re.search(r"(?:^|[\s:])OK\s*$", response, re.MULTILINE) is not None
 
 
 def align_up(value: int, alignment: int) -> int:

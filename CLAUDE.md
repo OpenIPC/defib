@@ -164,7 +164,14 @@ Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
   filename-based partition routing, plus temporary static-IP management and
   U-Boot device discovery.
 - **Firmware** (`src/defib/firmware.py`) — downloads OpenIPC releases from
-  GitHub, caches under `XDG_CACHE_HOME`.
+  GitHub, caches under `XDG_CACHE_HOME`. Most chips use one
+  `u-boot-<chip>-universal.bin`; the u-boot-xmedia SoCs in
+  `PER_FLASH_TYPE_UBOOT` (hi3516ev200/ev300, hi3518ev300, hi3516dv200,
+  gk7205v500/v510/v530) publish `u-boot-<chip>-nor.bin` and `-nand.bin`
+  instead, so callers pass `flash_type` (NOR when unknown). On NAND those SoCs
+  install the UBI-only layout (`NAND_UBI_LAYOUT` in `install/layout.py`: 768k
+  boot, 256k env, rest ubi), whose mtdparts/bootcmd/bootargs come from the
+  U-Boot default env; `NAND_LAYOUT` is the legacy split layout for other chips.
 - **Capture** (`src/defib/capture/`) — record/replay UART sessions in `.dcap`.
 - Loose modules worth knowing: `flashdump.py` (dump flash through a U-Boot
   console), `ubi.py` (extract UBIFS volumes from raw UBI), `uboot_env.py`,

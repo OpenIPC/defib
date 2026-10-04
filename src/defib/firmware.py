@@ -5,6 +5,9 @@ Two asset families are published, and which one applies depends on the SoC:
 
 - Classic SoCs: ``u-boot-{chip}-universal.bin`` — a bare U-Boot image.
 - Selected classic board variants may publish a dedicated U-Boot release asset.
+- u-boot-xmedia SoCs (hi3516ev200/ev300, hi3518ev300, hi3516dv200,
+  gk7205v500/v510/v530): ``u-boot-{chip}-{nor|nand}.bin`` — one bare U-Boot per
+  flash type, because each build carries that flash type's partition layout.
 - CV6xx SoCs: ``boot-{chip}[-{variant}]-nor.bin`` — a composite image
   (GSL + DDR tables + U-Boot) that the bootrom expects as a single blob.
 
@@ -32,12 +35,27 @@ AVAILABLE_FIRMWARE: set[str] = {
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
     "hi3516av100", "hi3516av200", "hi3516av300",
     "hi3516cv100", "hi3516cv200", "hi3516cv300", "hi3516cv500",
-    "hi3516dv100", "hi3516dv200", "hi3516dv300",
-    "hi3516ev100", "hi3516ev200", "hi3516ev300",
-    "hi3518av100", "hi3518cv100", "hi3518ev100", "hi3518ev200", "hi3518ev300",
+    "hi3516dv100", "hi3516dv300",
+    "hi3516ev100",
+    "hi3518av100", "hi3518cv100", "hi3518ev100", "hi3518ev200",
     "hi3519v101", "hi3520dv200", "hi3536cv100", "hi3536dv100",
     "t40a", "t40n", "t40xp",
 }
+
+# SoCs whose OpenIPC U-Boot is built from OpenIPC/u-boot-xmedia and published
+# once per flash type as u-boot-{chip}-nor.bin / u-boot-{chip}-nand.bin. The
+# NAND build owns the UBI-only layout (768k boot, 256k env, rest ubi) in its
+# default environment, so a NOR image must never be installed on NAND or vice
+# versa. The old u-boot-{chip}-universal.bin of the HiSilicon members was the
+# retired u-boot-hi3516ev200 build with the split NAND layout; it is never
+# downloaded for these SoCs again.
+PER_FLASH_TYPE_UBOOT: frozenset[str] = frozenset({
+    "hi3516ev200", "hi3516ev300", "hi3518ev300", "hi3516dv200",
+    "gk7205v500", "gk7205v510", "gk7205v530",
+})
+
+FLASH_TYPES: tuple[str, ...] = ("nor", "nand")
+DEFAULT_FLASH_TYPE = "nor"
 
 # CV6xx SoCs publish a composite boot image, not a bare U-Boot, and no
 # u-boot-{chip}-universal.bin exists for any of them — the URL assumed by
@@ -68,8 +86,7 @@ CLASSIC_UBOOT_VARIANTS: dict[str, dict[str, str]] = {
 }
 
 # Chip aliases: map chip names to the firmware download name
-# e.g. hi3516ev300 profile resolves to hi3516ev200 internally,
-# but the firmware binary is named u-boot-hi3516ev300-universal.bin
+# e.g. hi3518ev201 has its own profile but boots the hi3518ev200 U-Boot.
 CHIP_TO_FIRMWARE: dict[str, str] = {
     "hi3518ev201": "hi3518ev200",
     "hi3516dv100": "hi3516dv100",
@@ -109,14 +126,42 @@ def _strip_variant(chip: str) -> str:
     return _split_variant(chip)[0]
 
 
-def asset_name(chip: str) -> str | None:
+def normalize_flash_type(flash_type: str | None) -> str:
+    """Normalize an optional flash type; NOR when the caller does not know."""
+    if flash_type is None:
+        return DEFAULT_FLASH_TYPE
+    normalized = flash_type.strip().lower()
+    if normalized not in FLASH_TYPES:
+        raise ValueError(
+            f"unknown flash type {flash_type!r}; expected one of: "
+            + ", ".join(FLASH_TYPES)
+        )
+    return normalized
+
+
+def uses_per_flash_type_uboot(chip: str) -> bool:
+    """True for SoCs whose U-Boot is published per flash type (nor/nand)."""
+    base = _strip_variant(chip).lower()
+    return CHIP_TO_FIRMWARE.get(base, base) in PER_FLASH_TYPE_UBOOT
+
+
+def asset_name(chip: str, flash_type: str | None = None) -> str | None:
     """Published release filename for a chip, or None if there isn't one.
 
     Returns None both for chips OpenIPC doesn't build and for a CV6xx chip
     named without the variant needed to pick between several board images.
+
+    ``flash_type`` (``"nor"``/``"nand"``) picks the build for SoCs listed in
+    PER_FLASH_TYPE_UBOOT and defaults to NOR there. Every other chip publishes
+    one image whatever its flash, so the argument does not change its name.
     """
+    kind = normalize_flash_type(flash_type)
     base, variant = _split_variant(chip)
-    name = CHIP_TO_FIRMWARE.get(base, base)
+    name = CHIP_TO_FIRMWARE.get(base.lower(), base.lower())
+
+    if name in PER_FLASH_TYPE_UBOOT:
+        # Board variants (e.g. ``:emmc``) do not change the per-flash build.
+        return f"u-boot-{name}-{kind}.bin"
 
     if name in CV6XX_BOOT_VARIANTS:
         variants = CV6XX_BOOT_VARIANTS[name]
@@ -136,19 +181,22 @@ def asset_name(chip: str) -> str | None:
     return None
 
 
-def firmware_url(chip: str) -> str | None:
+def firmware_url(chip: str, flash_type: str | None = None) -> str | None:
     """Get the OpenIPC download URL for a chip, or None if unavailable."""
-    name = asset_name(chip)
+    name = asset_name(chip, flash_type)
     return f"{OPENIPC_BASE_URL}/{name}" if name else None
 
 
-def has_firmware(chip: str) -> bool:
+def has_firmware(chip: str, flash_type: str | None = None) -> bool:
     """Check if firmware can be obtained for this chip.
 
     True when OpenIPC publishes an image *or* one is already cached — the
     latter keeps hand-seeded blobs working for chips with no published build.
     """
-    return firmware_url(chip) is not None or get_cached_path(chip) is not None
+    return (
+        firmware_url(chip, flash_type) is not None
+        or get_cached_path(chip, flash_type) is not None
+    )
 
 
 def _legacy_cache_name(chip: str) -> str:
@@ -159,23 +207,36 @@ def _legacy_cache_name(chip: str) -> str:
     return f"u-boot-{CHIP_TO_FIRMWARE.get(base, base)}-universal.bin"
 
 
-def get_cached_path(chip: str) -> Path | None:
+def _cached_file(name: str) -> Path | None:
+    path = get_cache_dir() / name
+    if path.exists() and path.stat().st_size > 0:
+        return path
+    return None
+
+
+def get_cached_path(chip: str, flash_type: str | None = None) -> Path | None:
     """Get the path to cached firmware, or None if not cached.
 
     A registered classic board variant must never fall back to the chip-wide
     universal cache entry: doing so could select incompatible DDR init data.
+
+    Per-flash-type SoCs report only their exact ``-nor``/``-nand`` entry, so a
+    universal image cached from the retired build cannot shadow the published
+    one. download_firmware() still reads that universal entry for NOR, as a
+    last resort when the download itself fails.
     """
-    cache_dir = get_cache_dir()
     base, variant = _split_variant(chip)
     name = CHIP_TO_FIRMWARE.get(base, base)
-    candidates: list[str | None] = [asset_name(chip)]
-    if not (variant is not None and name in CLASSIC_UBOOT_VARIANTS):
+    candidates: list[str | None] = [asset_name(chip, flash_type)]
+    if not uses_per_flash_type_uboot(chip) and not (
+        variant is not None and name in CLASSIC_UBOOT_VARIANTS
+    ):
         candidates.append(_legacy_cache_name(chip))
     for candidate in candidates:
         if not candidate:
             continue
-        path = cache_dir / candidate
-        if path.exists() and path.stat().st_size > 0:
+        path = _cached_file(candidate)
+        if path is not None:
             return path
     return None
 
@@ -224,12 +285,15 @@ def _unavailable_message(chip: str) -> str:
 def download_firmware(
     chip: str,
     on_progress: Callable[[int, int], None] | None = None,
+    flash_type: str | None = None,
 ) -> Path:
     """Download U-Boot firmware from OpenIPC, with caching.
 
     Args:
         chip: Chip name (e.g., "hi3516ev300").
         on_progress: Optional callback(bytes_downloaded, total_bytes).
+        flash_type: "nor" or "nand" for SoCs that publish one U-Boot per
+            flash type (NOR when omitted); other chips ignore it.
 
     Returns:
         Path to the downloaded (or cached) firmware file.
@@ -238,26 +302,43 @@ def download_firmware(
         ValueError: If no firmware is available for this chip.
         ConnectionError: If download fails.
     """
-    url = firmware_url(chip)
+    url = firmware_url(chip, flash_type)
     if url is None:
         # Check the cache before giving up: a chip with no published build may
         # still have a hand-seeded blob.
-        cached = get_cached_path(chip)
+        cached = get_cached_path(chip, flash_type)
         if cached is not None:
             logger.info("Using cached firmware: %s", cached)
             return cached
         raise ValueError(_unavailable_message(chip))
 
     # Check cache
-    cached = get_cached_path(chip)
+    cached = get_cached_path(chip, flash_type)
     if cached is not None:
         logger.info("Using cached firmware: %s", cached)
         return cached
 
     # Download
-    name = asset_name(chip)
+    name = asset_name(chip, flash_type)
     assert name is not None  # firmware_url() is None otherwise
-    return _download(url, get_cache_dir() / name, on_progress)
+    try:
+        return _download(url, get_cache_dir() / name, on_progress)
+    except ConnectionError:
+        # A universal image cached before the per-flash-type split still boots
+        # a NOR board, so keep it usable offline. It is never downloaded, and
+        # never used for NAND, whose split layout it carries is retired.
+        if (
+            uses_per_flash_type_uboot(chip)
+            and normalize_flash_type(flash_type) == "nor"
+        ):
+            legacy = _cached_file(_legacy_cache_name(chip))
+            if legacy is not None:
+                logger.warning(
+                    "Download of %s failed; using cached legacy %s",
+                    name, legacy.name,
+                )
+                return legacy
+        raise
 
 
 def _download(

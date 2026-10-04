@@ -7,6 +7,7 @@ import pytest
 from defib.firmware import (
     AVAILABLE_FIRMWARE,
     CLASSIC_UBOOT_VARIANTS,
+    PER_FLASH_TYPE_UBOOT,
     CV6XX_BOOT_VARIANTS,
     asset_name,
     download_firmware,
@@ -57,8 +58,11 @@ class TestAvailableFirmware:
         assert len(AVAILABLE_FIRMWARE) >= 20
 
     def test_common_chips_included(self):
-        for chip in ["hi3516ev200", "hi3516ev300", "gk7205v200", "hi3518ev200"]:
+        for chip in ["gk7205v200", "hi3518ev200"]:
             assert chip in AVAILABLE_FIRMWARE
+
+    def test_per_flash_type_socs_are_not_universal(self):
+        assert not AVAILABLE_FIRMWARE & PER_FLASH_TYPE_UBOOT
 
 
 class TestCacheDir:
@@ -181,7 +185,10 @@ class TestLegacyCacheSeeding:
 
 class TestClassicChipsUnchanged:
     def test_universal_naming_preserved(self):
-        assert asset_name("hi3516ev300") == "u-boot-hi3516ev300-universal.bin"
+        assert asset_name("hi3516cv300") == "u-boot-hi3516cv300-universal.bin"
+
+    def test_flash_type_does_not_rename_universal_images(self):
+        assert asset_name("hi3516cv300", "nand") == "u-boot-hi3516cv300-universal.bin"
 
     def test_variant_still_ignored_for_classic_socs(self):
         assert asset_name("hi3516ev300:emmc") == asset_name("hi3516ev300")
@@ -255,3 +262,100 @@ class TestV500Donor:
             "https://github.com/OpenIPC/u-boot-xmedia/releases/download/latest/"
             "u-boot-gk7205v510-nor.bin"
         ]
+
+
+class TestPerFlashTypeUBoot:
+    """u-boot-xmedia SoCs publish u-boot-<soc>-{nor,nand}.bin, not -universal."""
+
+    SOCS = (
+        "hi3516ev200", "hi3516ev300", "hi3518ev300", "hi3516dv200",
+        "gk7205v500", "gk7205v510", "gk7205v530",
+    )
+
+    def test_set_matches_the_published_socs(self):
+        assert set(self.SOCS) == PER_FLASH_TYPE_UBOOT
+
+    @pytest.mark.parametrize("soc", SOCS)
+    def test_name_per_flash_type(self, soc):
+        assert asset_name(soc, "nor") == f"u-boot-{soc}-nor.bin"
+        assert asset_name(soc, "nand") == f"u-boot-{soc}-nand.bin"
+        assert firmware_url(soc, "nand") == (
+            "https://github.com/OpenIPC/firmware/releases/download/latest/"
+            f"u-boot-{soc}-nand.bin"
+        )
+
+    @pytest.mark.parametrize("soc", SOCS)
+    def test_nor_is_the_default(self, soc):
+        assert asset_name(soc) == f"u-boot-{soc}-nor.bin"
+        assert has_firmware(soc)
+
+    def test_flash_type_is_case_insensitive_and_validated(self):
+        assert asset_name("hi3516ev300", "NAND") == "u-boot-hi3516ev300-nand.bin"
+        with pytest.raises(ValueError):
+            asset_name("hi3516ev300", "emmc")
+
+    def test_variant_suffix_is_ignored(self):
+        assert asset_name("hi3516ev300:emmc", "nand") == "u-boot-hi3516ev300-nand.bin"
+
+    def test_legacy_universal_cache_is_not_reported(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        cache = get_cache_dir()
+        (cache / "u-boot-hi3516ev300-universal.bin").write_bytes(b"U" * 4096)
+        assert get_cached_path("hi3516ev300") is None
+        assert get_cached_path("hi3516ev300", "nand") is None
+
+        nand = cache / "u-boot-hi3516ev300-nand.bin"
+        nand.write_bytes(b"N" * 4096)
+        assert get_cached_path("hi3516ev300", "nand") == nand
+        assert get_cached_path("hi3516ev300", "nor") is None
+
+    def test_downloads_the_flash_type_build_never_universal(self, tmp_path, monkeypatch):
+        from defib import firmware
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        urls: list[str] = []
+
+        def fake_download(url, dest, on_progress=None):
+            urls.append(url)
+            dest.write_bytes(b"X" * 4096)
+            return dest
+
+        monkeypatch.setattr(firmware, "_download", fake_download)
+        path = download_firmware("hi3516ev300", flash_type="nand")
+        assert path.name == "u-boot-hi3516ev300-nand.bin"
+        path = download_firmware("hi3516ev300")
+        assert path.name == "u-boot-hi3516ev300-nor.bin"
+        assert all("universal" not in url for url in urls)
+        assert [u.rsplit("/", 1)[1] for u in urls] == [
+            "u-boot-hi3516ev300-nand.bin",
+            "u-boot-hi3516ev300-nor.bin",
+        ]
+
+    def test_cached_universal_is_an_offline_nor_fallback_only(self, tmp_path, monkeypatch):
+        from defib import firmware
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        legacy = get_cache_dir() / "u-boot-hi3516ev300-universal.bin"
+        legacy.write_bytes(b"U" * 4096)
+
+        def offline(url, dest, on_progress=None):
+            raise ConnectionError("offline")
+
+        monkeypatch.setattr(firmware, "_download", offline)
+        assert download_firmware("hi3516ev300") == legacy
+        with pytest.raises(ConnectionError):
+            download_firmware("hi3516ev300", flash_type="nand")
+
+    def test_gk7205v5xx_shares_the_v500_donor_cache_entry(self, tmp_path, monkeypatch):
+        # download_v500_donor() caches u-boot-xmedia's NOR build under the
+        # same name the OpenIPC/firmware release uses, so either source
+        # satisfies the other.
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        donor = get_cache_dir() / "u-boot-gk7205v510-nor.bin"
+        donor.write_bytes(b"D" * 4096)
+        assert get_cached_path("gk7205v510") == donor
+        assert get_cached_path("gk7205v510", "nand") is None
