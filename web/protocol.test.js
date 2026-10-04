@@ -594,3 +594,49 @@ describe('fwSourceUrls with the OpenIPC worker', () => {
     assert.equal(sources.length, 1 + FW_PROXIES.length);
   });
 });
+
+describe('detectSplSize', () => {
+  const { detectSplSize } = require('./protocol.js');
+  it('stops the SPL where a gzip payload starts, rounded down to 1K', () => {
+    const fw = new Uint8Array(0x8000);
+    fw.set([0x1f, 0x8b, 0x08], 0x4412);
+    assert.equal(detectSplSize(fw, 0x6000), 0x4400);
+  });
+  it('recognises an LZMA header by its dictionary size', () => {
+    const fw = new Uint8Array(0x8000);
+    fw.set([0x5d, 0x00, 0x00, 0x80, 0x00], 0x4800); // 8 MiB dictionary
+    assert.equal(detectSplSize(fw, 0x6000), 0x4800);
+    const notLzma = new Uint8Array(0x8000);
+    notLzma.set([0x5d, 0x01, 0x02, 0x03, 0x04], 0x4800);
+    assert.equal(detectSplSize(notLzma, 0x6000), 0x6000);
+  });
+  it('keeps the profile length when there is no payload header', () => {
+    assert.equal(detectSplSize(new Uint8Array(0x8000), 0x6000), 0x6000);
+  });
+  it('caps the boundary at the SRAM limit', () => {
+    const fw = new Uint8Array(0x8000);
+    fw.set([0x1f, 0x8b, 0x08], 0x4400);
+    assert.equal(detectSplSize(fw, 0x6000, 0x3b00), 0x3b00);
+  });
+});
+
+describe('fwAssetName', () => {
+  const { fwAssetName, parseReleaseAssets } = require('./protocol.js');
+  it('names the -nor build for u-boot-xmedia SoCs, -universal otherwise', () => {
+    assert.equal(fwAssetName('hi3516ev300'), 'u-boot-hi3516ev300-nor.bin');
+    assert.equal(fwAssetName('gk7205v510'), 'u-boot-gk7205v510-nor.bin');
+    assert.equal(fwAssetName('gk7205v300'), 'u-boot-gk7205v300-universal.bin');
+  });
+  it('takes each chip\'s own asset and ignores a stale -universal one', () => {
+    const idx = parseReleaseAssets({ assets: [
+      { name: 'u-boot-hi3516ev300-universal.bin', size: 1, digest: null },
+      { name: 'u-boot-hi3516ev300-nor.bin', size: 2, digest: null },
+      { name: 'u-boot-hi3516ev300-nand.bin', size: 3, digest: null },
+      { name: 'u-boot-gk7205v300-universal.bin', size: 4, digest: null },
+      { name: 'u-boot-gk7205v300-nor.bin', size: 5, digest: null },
+    ] });
+    assert.equal(idx.get('hi3516ev300').name, 'u-boot-hi3516ev300-nor.bin');
+    assert.equal(idx.get('gk7205v300').name, 'u-boot-gk7205v300-universal.bin');
+    assert.equal(idx.size, 2);
+  });
+});

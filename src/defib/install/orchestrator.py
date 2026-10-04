@@ -16,17 +16,23 @@ import typer
 from defib.install.firmware import load_firmware_bundle
 from defib.install.layout import (
     NAND_LAYOUT,
+    NAND_UBI_LAYOUT,
+    NAND_UBI_OFFSET,
     NOR8M_LAYOUT,
     align_up,
     detect_nor_size_mb,
     erased_region_crc,
+    mtdparts_partition_offset,
     nand_bootargs,
     nor_layout,
     nor_mtdparts,
+    parse_nand_erase_range,
     parse_uboot_crc32,
+    ubi_nand_boards,
     select_nor_size_mb,
     set_uboot_env_verified,
     uboot_flash_command_error,
+    uboot_reports_ok,
     uboot_sf_lock_unsupported,
     verify_spi_environment_crc,
 )
@@ -52,6 +58,7 @@ async def run_install(request: InstallRequest) -> None:
         get_cached_path,
         has_firmware,
         pad_to_size,
+        uses_per_flash_type_uboot,
     )
     from defib.flashdump import get_ram_staging_addr, send_command
     from defib.network.ip_manager import list_interfaces_async, temporary_ip
@@ -143,7 +150,13 @@ async def run_install(request: InstallRequest) -> None:
         fail("--wipe-rootfs-data is only supported for NOR installs", exit_code=2)
 
     stage_set = set(stages)
-    needs_tftp = bool(stage_set & {"uboot", "kernel", "rootfs"})
+    # u-boot-xmedia SoCs on NAND use the UBI-only layout: no kernel partition,
+    # one UBI image from 0x100000 to the end of the chip, and a U-Boot whose
+    # default environment already describes all of it.
+    ubi_layout = nand and uses_per_flash_type_uboot(chip)
+    uboot_flash_type = "nand" if nand else "nor"
+    tftp_stages = {"uboot", "rootfs"} if ubi_layout else {"uboot", "kernel", "rootfs"}
+    needs_tftp = bool(stage_set & tftp_stages)
 
     if debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -176,10 +189,17 @@ async def run_install(request: InstallRequest) -> None:
     # The NOR boot and env partitions are fixed across the standard OpenIPC
     # 8/16/32 MiB layouts. Kernel/rootfs sizing is selected after ``sf probe``
     # reports the actual flash capacity.
-    if nand:
+    layout: dict[str, tuple[int, int]] | None
+    if ubi_layout:
+        layout = None
+        flash_cmd = "nand"
+        flash_label = "NAND (UBI layout: 768k boot, 256k env, ubi)"
+        b_off, b_sz = NAND_UBI_LAYOUT["boot"]
+        _, env_sz = NAND_UBI_LAYOUT["env"]
+    elif nand:
         layout = NAND_LAYOUT
         flash_cmd = "nand"
-        flash_label = "NAND"
+        flash_label = "NAND (legacy split layout)"
         b_off, b_sz = layout["boot"]
         _, env_sz = layout["env"]
     else:
@@ -205,7 +225,11 @@ async def run_install(request: InstallRequest) -> None:
             console.print(f"  Stages:  [cyan]{', '.join(stages)}[/cyan]")
 
     try:
-        firmware = load_firmware_bundle(firmware_path)
+        firmware = load_firmware_bundle(
+            firmware_path,
+            ubi_only=ubi_layout,
+            boards=ubi_nand_boards(chip) if ubi_layout else None,
+        )
     except ValueError as exc:
         fail(str(exc))
 
@@ -214,7 +238,7 @@ async def run_install(request: InstallRequest) -> None:
     rootfs_name = firmware.rootfs_name
     rootfs_data = firmware.rootfs
 
-    if nand:
+    if nand and not ubi_layout:
         assert layout is not None
         k_off, k_sz = layout["kernel"]
         r_off, r_sz = layout["rootfs"]
@@ -226,8 +250,12 @@ async def run_install(request: InstallRequest) -> None:
             raise typer.Exit(1)
 
     if output == "human":
-        console.print(f"  Kernel: [cyan]{kernel_name}[/cyan] ({len(kernel_data)} bytes)")
-        console.print(f"  Rootfs: [cyan]{rootfs_name}[/cyan] ({len(rootfs_data)} bytes)")
+        if ubi_layout:
+            console.print("  Kernel: [cyan]inside the UBI image (/boot/fitImage)[/cyan]")
+            console.print(f"  UBI:    [cyan]{rootfs_name}[/cyan] ({len(rootfs_data)} bytes)")
+        else:
+            console.print(f"  Kernel: [cyan]{kernel_name}[/cyan] ({len(kernel_data)} bytes)")
+            console.print(f"  Rootfs: [cyan]{rootfs_name}[/cyan] ({len(rootfs_data)} bytes)")
 
     # --- Step 2: Resolve U-Boot artifact ---
     if uboot_path:
@@ -237,13 +265,13 @@ async def run_install(request: InstallRequest) -> None:
         uboot_raw = source_path.read_bytes()
         uboot_source_name = source_path.name
     else:
-        if not has_firmware(chip):
+        if not has_firmware(chip, uboot_flash_type):
             fail(f"No OpenIPC U-Boot for '{chip}'")
-        cached = get_cached_path(chip)
+        cached = get_cached_path(chip, uboot_flash_type)
         if cached is None:
             if output == "human":
                 console.print(f"  Downloading U-Boot for [cyan]{chip}[/cyan]...")
-            cached = download_firmware(chip)
+            cached = download_firmware(chip, flash_type=uboot_flash_type)
         uboot_raw = cached.read_bytes()
         uboot_source_name = cached.name
 
@@ -326,9 +354,11 @@ async def run_install(request: InstallRequest) -> None:
     if not has_stock_uboot:
         # Boot-ROM recovery needs a filesystem path for RecoverySession. Registered
         # vendor-U-Boot migration targets use their bootstrap path instead.
-        cached = get_cached_path(chip) if not uboot_path else Path(uboot_path)
+        cached = (
+            get_cached_path(chip, uboot_flash_type) if not uboot_path else Path(uboot_path)
+        )
         if cached is None:
-            cached = download_firmware(chip)
+            cached = download_firmware(chip, flash_type=uboot_flash_type)
         session = RecoverySession(
             chip=chip, firmware_path=str(cached),
             power_controller=power_controller, poe_port=poe_port,
@@ -819,9 +849,15 @@ async def run_install(request: InstallRequest) -> None:
                 f"erase block 0x{nor_erase_block:X}"
             )
 
-    assert layout is not None
-    k_off, k_sz = layout["kernel"]
-    r_off, r_sz = layout["rootfs"]
+    if ubi_layout:
+        # No raw kernel/rootfs partitions; the UBI image runs to the chip end
+        # and its size is checked against what `nand erase` reports.
+        k_off, k_sz = 0, 0
+        r_off, r_sz = NAND_UBI_OFFSET, 0
+    else:
+        assert layout is not None
+        k_off, k_sz = layout["kernel"]
+        r_off, r_sz = layout["rootfs"]
 
     # --- Step 5: Pick a TFTP backend, stage / start, then drive U-Boot ---
     #
@@ -854,7 +890,7 @@ async def run_install(request: InstallRequest) -> None:
     tftp_files: dict[str, bytes] = {}
     if "uboot" in stage_set:
         tftp_files[tftp_alias["uboot"]] = uboot_data
-    if "kernel" in stage_set:
+    if "kernel" in stage_set and not ubi_layout:
         tftp_files[tftp_alias["kernel"]] = kernel_data
     if "rootfs" in stage_set:
         tftp_files[tftp_alias["rootfs"]] = rootfs_data
@@ -1239,16 +1275,167 @@ async def run_install(request: InstallRequest) -> None:
                 await tftp_and_flash(
                     "U-Boot", tftp_alias["uboot"], uboot_data, b_off, uboot_flash_size
                 )
-            if "kernel" in stage_set:
+            if "kernel" in stage_set and ubi_layout:
+                if output == "human":
+                    console.print(
+                        "\n  [bold]kernel[/bold]: no separate partition on the UBI "
+                        "layout; the kernel ships inside the UBI image as "
+                        "/boot/fitImage (written by the rootfs stage). Nothing to do."
+                    )
+            elif "kernel" in stage_set:
                 await tftp_and_flash(
                     "kernel", tftp_alias["kernel"], kernel_data, k_off, k_sz
                 )
 
-            # For NAND, raw UBI images must be written through UBI rather than
-            # ``nand write`` because bad-block skipping would shift UBIFS data.
+            async def flash_ubi_image() -> None:
+                """Write the whole UBI image to the ubi partition (UBI layout).
+
+                UBI tolerates bad blocks being skipped (it identifies PEBs by
+                their EC/VID headers, not position), so the image goes in raw.
+                ``write.trimffs`` is mandatory: a plain ``nand write`` would
+                program the image's 0xFF padding pages, and UBIFS programming
+                them again later breaks their ECC (OpenIPC/firmware#2519).
+                """
+                if output == "human":
+                    console.print(
+                        f"\n  [bold]Flashing UBI image[/bold] → 0x{NAND_UBI_OFFSET:X}"
+                        f" ({len(rootfs_data)} bytes)"
+                    )
+                ram_crc = await _verify_tftp_ram(
+                    "rootfs (UBI)", tftp_alias["rootfs"], rootfs_data,
+                )
+                if output == "human":
+                    if ram_crc is None:
+                        console.print(
+                            "    TFTP transfer accepted; U-Boot CRC32 unavailable"
+                        )
+                    else:
+                        console.print(f"    TFTP CRC verified: {ram_crc:08X}")
+
+                # Erase the whole ubi partition, so chips larger than 128 MiB
+                # lose every stale block. `nand erase.part ubi` is preferred but
+                # only when the live mtdparts provably puts ubi at 0x100000;
+                # otherwise erase from 0x100000 to the end of the chip (U-Boot's
+                # `nand erase <off>` with no size runs to the chip end).
+                mtd_resp = await _optional_printenv("mtdparts", timeout=5.0)
+                mtd_value = parse_printenv_value(mtd_resp, "mtdparts")
+                ubi_off = (
+                    mtdparts_partition_offset(mtd_value, "ubi", nand_only=True)
+                    if mtd_value is not None
+                    else None
+                )
+                if ubi_off is not None and ubi_off != NAND_UBI_OFFSET:
+                    raise RuntimeError(
+                        f"U-Boot mtdparts places ubi at 0x{ubi_off:X}, not "
+                        f"0x{NAND_UBI_OFFSET:X} ({mtd_value!r}); refusing to erase. "
+                        "Is this the u-boot-<soc>-nand.bin build?"
+                    )
+
+                erase_resp = ""
+                erased = False
+                if ubi_off == NAND_UBI_OFFSET:
+                    _, erase_resp = await _cmd_result(
+                        "nand erase.part ubi", timeout=600.0, allow_failure=True,
+                    )
+                    if "erasing at" in erase_resp.lower():
+                        if not uboot_reports_ok(erase_resp) or uboot_flash_command_error(
+                            erase_resp
+                        ):
+                            raise RuntimeError(
+                                "nand erase.part ubi failed: "
+                                f"{erase_resp.strip()[-200:]}"
+                            )
+                        erased = True
+                    else:
+                        warn(
+                            "`nand erase.part ubi` is unavailable in this U-Boot "
+                            f"({erase_resp.strip()[-80:]!r}); erasing from "
+                            f"0x{NAND_UBI_OFFSET:X} to the end of the chip instead."
+                        )
+                if not erased:
+                    erase_resp = await _cmd(
+                        f"nand erase 0x{NAND_UBI_OFFSET:x}", timeout=600.0,
+                    )
+                    erase_error = uboot_flash_command_error(erase_resp)
+                    if erase_error or not uboot_reports_ok(erase_resp):
+                        raise RuntimeError(
+                            f"nand erase 0x{NAND_UBI_OFFSET:x} (to chip end) failed: "
+                            f"{(erase_error or erase_resp.strip())[-200:]}"
+                        )
+
+                erase_range = parse_nand_erase_range(erase_resp)
+                if erase_range is not None:
+                    erase_off, erase_size = erase_range
+                    if erase_off != NAND_UBI_OFFSET:
+                        raise RuntimeError(
+                            f"nand erase reported offset 0x{erase_off:X}, expected "
+                            f"0x{NAND_UBI_OFFSET:X}"
+                        )
+                    if len(rootfs_data) > erase_size:
+                        raise RuntimeError(
+                            f"UBI image is {len(rootfs_data)} bytes, larger than the "
+                            f"0x{erase_size:X}-byte ubi partition"
+                        )
+                if output == "human":
+                    size_note = (
+                        f"0x{erase_range[1]:X} bytes" if erase_range else "to chip end"
+                    )
+                    console.print(
+                        f"    Erased ubi: 0x{NAND_UBI_OFFSET:X}, {size_note}"
+                    )
+
+                write_resp = await _cmd(
+                    f"nand write.trimffs 0x{ram_addr:x} 0x{NAND_UBI_OFFSET:x} "
+                    f"0x{len(rootfs_data):x}",
+                    timeout=600.0,
+                )
+                write_error = uboot_flash_command_error(write_resp)
+                if write_error or not uboot_reports_ok(write_resp):
+                    raise RuntimeError(
+                        "nand write.trimffs failed: "
+                        f"{(write_error or write_resp.strip())[-200:]}"
+                    )
+
+                # Read the image back through ECC and compare CRCs. Blocks
+                # skipped as bad on write are skipped identically on read, and
+                # pages trimffs left erased read back as 0xFF.
+                if crc32_available:
+                    read_resp = await _cmd(
+                        f"nand read 0x{ram_addr:x} 0x{NAND_UBI_OFFSET:x} "
+                        f"0x{len(rootfs_data):x}",
+                        timeout=600.0,
+                    )
+                    read_error = uboot_flash_command_error(read_resp)
+                    if read_error or not uboot_reports_ok(read_resp):
+                        raise RuntimeError(
+                            "UBI image readback failed: "
+                            f"{(read_error or read_resp.strip())[-200:]}"
+                        )
+                    crc_resp = await _cmd(
+                        f"crc32 0x{ram_addr:x} 0x{len(rootfs_data):x}",
+                        timeout=_crc_timeout_for_size(len(rootfs_data)),
+                    )
+                    flash_crc = parse_uboot_crc32(crc_resp)
+                    expected_crc = zlib.crc32(rootfs_data) & 0xFFFFFFFF
+                    if flash_crc != expected_crc:
+                        got = "none" if flash_crc is None else f"{flash_crc:08X}"
+                        raise RuntimeError(
+                            "UBI image flash verify failed: "
+                            f"expected={expected_crc:08X} got={got}"
+                        )
+                    if output == "human":
+                        console.print(f"    Flash verified: {flash_crc:08X}")
+                if output == "human":
+                    console.print("  [green]UBI image OK[/green]")
+
+            # Legacy split layout: raw UBI images must be written through UBI
+            # rather than ``nand write`` because bad-block skipping would shift
+            # UBIFS data.
             from defib.ubi import extract_ubifs, is_ubi_image
 
-            if "rootfs" in stage_set and nand and is_ubi_image(rootfs_data):
+            if "rootfs" in stage_set and ubi_layout:
+                await flash_ubi_image()
+            elif "rootfs" in stage_set and nand and is_ubi_image(rootfs_data):
                 if output == "human":
                     console.print(
                         f"\n  [bold]Flashing rootfs (UBI)[/bold] → 0x{r_off:X}"
@@ -1302,6 +1489,13 @@ async def run_install(request: InstallRequest) -> None:
                 await tftp_and_flash(
                     "rootfs", tftp_alias["rootfs"], rootfs_data, r_off, r_sz
                 )
+
+            if "rootfs-data" in stage_set and ubi_layout and output == "human":
+                if "rootfs" in stage_set:
+                    note = "the UBI image just written carries an empty rootfs_data volume"
+                else:
+                    note = "the existing rootfs_data UBI volume is left untouched"
+                console.print(f"\n  [bold]rootfs-data[/bold]: {note}. Nothing to do.")
 
             erase_rootfs_data = (
                 not nand
@@ -1440,7 +1634,29 @@ async def run_install(request: InstallRequest) -> None:
                     console.print("  [green]OpenIPC U-Boot defaults loaded[/green]")
 
             # Set up the persistent boot environment.
-            if "env" in stage_set and nand:
+            ubi_layout_eth: str | None = None
+            if "env" in stage_set and ubi_layout:
+                # The NAND U-Boot's default environment owns mtdids, mtdparts,
+                # bootcmd and bootargs for the UBI layout; never override them.
+                # A freshly written U-Boot starts from those defaults; only the
+                # camera's MAC is carried across.
+                if output == "human":
+                    console.print(
+                        "\n  [bold]Setting boot environment[/bold] (NAND UBI layout)"
+                    )
+                if "uboot" in stage_set:
+                    pre_default_resp = await _optional_printenv("ethaddr", timeout=5.0)
+                    ubi_layout_eth = parse_printenv_value(pre_default_resp, "ethaddr")
+                    default_resp = await _cmd("env default -a", timeout=5.0)
+                    default_error = uboot_flash_command_error(default_resp)
+                    if default_error:
+                        raise RuntimeError(
+                            f"env default -a failed ({default_error}): "
+                            f"{default_resp.strip()[-200:]}"
+                        )
+                    if output == "human":
+                        console.print("  U-Boot default environment loaded")
+            elif "env" in stage_set and nand:
                 if output == "human":
                     console.print("\n  [bold]Setting boot environment[/bold] (NAND)")
                 await _cmd(
@@ -1476,7 +1692,7 @@ async def run_install(request: InstallRequest) -> None:
                 # boot-ROM installs keep the existing generic rescue-MAC behavior.
                 eth_resp = await _optional_printenv("ethaddr", timeout=5.0)
                 current_eth = parse_printenv_value(eth_resp, "ethaddr")
-                preserved_eth = preserved_stock_env.get("ethaddr")
+                preserved_eth = preserved_stock_env.get("ethaddr") or ubi_layout_eth
                 selected_eth, eth_source = select_install_ethaddr(
                     current_eth,
                     preserved_eth,

@@ -293,11 +293,16 @@ async function standardHandshake() {
   }
 }
 
-async function standardSendFirmware(firmware, profile) {
+async function standardSendFirmware(firmware, profile, chip) {
   const ddrAddr = parseInt(profile.ADDRESS[0], 16);
   const splAddr = parseInt(profile.ADDRESS[1], 16);
   const ubootAddr = parseInt(profile.ADDRESS[2], 16);
-  const splMax = parseInt(profile.FILELEN[1], 16);
+  // Only the u-boot-xmedia images are cut at their payload: the profiles here
+  // carry no SRAMLIMIT, and on other chips the profile length is what the
+  // Web UI has always sent safely.
+  const profileMax = parseInt(profile.FILELEN[1], 16);
+  const splMax = XMEDIA_SOCS.has(fwNameForChip(chip))
+    ? detectSplSize(firmware, profileMax) : profileMax;
   const ddrStep = new Uint8Array(profile.DDRSTEP0);
 
   // DDR step
@@ -554,7 +559,7 @@ async function downloadFirmware() {
   } catch (e) {
     log(`Could not read release metadata (${e.message}) — downloading without checksum verification`, 'warn');
   }
-  const url = meta ? meta.url : `${FW_DIRECT_BASE}/u-boot-${name}-universal.bin`;
+  const url = meta ? meta.url : `${FW_DIRECT_BASE}/${fwAssetName(name)}`;
   if (meta && !meta.sha256) {
     log('Release metadata has no SHA-256 for this asset — falling back to a size check', 'warn');
   }
@@ -787,7 +792,7 @@ async function startRecovery() {
       if (!profile) { log('No profile for chip: ' + chip, 'error'); showResult(false, 'Unknown chip'); return; }
       if (!await standardHandshake()) { showResult(false, 'Handshake failed'); return; }
       completeStage('handshake');
-      success = await standardSendFirmware(firmwareData, profile);
+      success = await standardSendFirmware(firmwareData, profile, chip);
     }
 
     if (success && sendBreak) {

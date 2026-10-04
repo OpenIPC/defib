@@ -76,6 +76,34 @@ Requires root for TFTP port 69 and NIC IP assignment. Standard 8/16/32 MiB
 NOR layouts are selected from U-Boot flash detection; `--nor-size` remains an
 explicit override.
 
+hi3516ev200, hi3516ev300, hi3518ev300, hi3516dv200 and gk7205v500/v510/v530
+take their U-Boot from OpenIPC/u-boot-xmedia, published once per flash type as
+`u-boot-<chip>-nor.bin` and `u-boot-<chip>-nand.bin`. `install` picks the build
+from `--nand`; `burn` loads the NOR build unless `--nand` is given. On NAND
+these SoCs use a UBI-only layout:
+
+| Offset | Size | Contents |
+|--------|------|----------|
+| `0x000000` | 768K | boot: `u-boot-<chip>-nand.bin` |
+| `0x0C0000` | 256K | env |
+| `0x100000` | rest of chip | ubi: `rootfs.ubi.<board>` (volume `rootfs` with the kernel as `/boot/fitImage`, plus `rootfs_data`) |
+
+```bash
+defib install -c hi3516ev300 --nand \
+  --firmware openipc.hi3516ev300-nand-lite.tgz \
+  -p /dev/ttyUSB0 --power-cycle
+```
+
+The NAND U-Boot's default environment defines `mtdparts`, `bootcmd` and
+`bootargs` for this layout, so the installer leaves them alone: it writes U-Boot,
+erases the `ubi` partition (`nand erase.part ubi`) and writes the UBI image with
+`nand write.trimffs`, then resets the environment to the U-Boot defaults
+(`env default -a`), restores the camera's `ethaddr` and saves. The `kernel` and
+`rootfs-data` stages are no-ops on this layout: both live inside the UBI image.
+gk7205v510/v530 NAND packages are published under board `gk7205v500`.
+`install --nand` on any other chip still uses the older split layout (raw
+kernel partition, `mtdparts` and `bootcmd` set by the installer).
+
 Targets that must bootstrap through a stock U-Boot use an explicit U-Boot
 variant. For example, HiWatch DS-I203 uses:
 

@@ -33,6 +33,7 @@ def burn(
     chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
     file: str = typer.Option("", "-f", "--file", help="Firmware file (auto-downloads from OpenIPC if omitted)"),
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial device (/dev/ttyUSB0), tcp://host:port, rfc2217://host:port, or socket:///path"),
+    nand: bool = typer.Option(False, "--nand", help="Auto-download the NAND U-Boot build (u-boot-<chip>-nand.bin) for SoCs published per flash type; the NOR build is the default"),
     send_break: bool = typer.Option(False, "-b", "--break", help="Send Ctrl-C after upload"),
     terminal: bool = typer.Option(False, "-t", "--terminal", help="Open serial terminal after upload"),
     power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via the controller selected by DEFIB_POWER_TYPE (default routeros, needs DEFIB_POE_* env vars)"),
@@ -55,14 +56,14 @@ def burn(
     into MaskROM on its own at power-up, so --power-cycle is all it takes.
     """
     import asyncio
-    asyncio.run(_burn_async(chip, file, port, send_break, terminal, power_cycle, poe_port_override, output, debug, ddr, usbplug, loader, wait, usb_path))
+    asyncio.run(_burn_async(chip, file, port, send_break, terminal, power_cycle, poe_port_override, output, debug, ddr, usbplug, loader, wait, usb_path, flash_type="nand" if nand else "nor"))
 
 
 async def _burn_async(
     chip: str, file: str, port: str, send_break: bool, terminal: bool,
     power_cycle: bool, poe_port_override: str, output: str, debug: bool,
     ddr: str = "", usbplug: str = "", loader: str = "", wait: float = 30.0,
-    usb_path: str = "",
+    usb_path: str = "", flash_type: str = "nor",
 ) -> None:
     import json as json_mod
     import logging
@@ -92,7 +93,7 @@ async def _burn_async(
     if not firmware_path:
         from defib.firmware import has_firmware, download_firmware, get_cached_path
 
-        if not has_firmware(chip):
+        if not has_firmware(chip, flash_type):
             msg = (
                 f"No pre-built firmware for '{chip}' on OpenIPC. "
                 f"Specify a local file with -f/--file."
@@ -103,7 +104,7 @@ async def _burn_async(
                 console.print(f"[red]{msg}[/red]")
             raise typer.Exit(1)
 
-        cached = get_cached_path(chip)
+        cached = get_cached_path(chip, flash_type)
         if cached:
             firmware_path = str(cached)
             if output == "human":
@@ -121,7 +122,9 @@ async def _burn_async(
                     elif output == "json" and done == total:
                         print(json_mod.dumps({"event": "download_complete", "bytes": total}), flush=True)
 
-                path = download_firmware(chip, on_progress=_dl_progress)
+                path = download_firmware(
+                    chip, on_progress=_dl_progress, flash_type=flash_type,
+                )
                 firmware_path = str(path)
                 if output == "human":
                     console.print(f"\n  Saved: [cyan]{path.name}[/cyan] ({path.stat().st_size} bytes)")
@@ -2498,7 +2501,15 @@ def install(
         0, "--nor-size",
         help="NOR size override in MB; 0 auto-detects from U-Boot",
     ),
-    nand: bool = typer.Option(False, "--nand", help="Use NAND flash instead of NOR"),
+    nand: bool = typer.Option(
+        False, "--nand",
+        help=(
+            "Use NAND flash instead of NOR. hi3516ev200/ev300, hi3518ev300, "
+            "hi3516dv200 and gk7205v500/v510/v530 get the UBI layout (768k boot, "
+            "256k env, rest ubi): u-boot-<chip>-nand.bin plus the package's "
+            "rootfs.ubi.<board>, which carries the kernel."
+        ),
+    ),
     wipe_env: bool = typer.Option(
         False,
         "--wipe-env",
@@ -2729,12 +2740,25 @@ async def _restore_async(
     # --- Resolve U-Boot binary ---
     if not uboot_path:
         from defib.firmware import get_cached_path, download_firmware, has_firmware
-        if has_firmware(chip):
-            cached = get_cached_path(chip)
+        # SoCs with per-flash-type U-Boot builds need the NAND build to drive
+        # NAND; anything other than an explicit --flash-type nand gets NOR.
+        uboot_flash_type = "nand" if flash_type.lower() == "nand" else "nor"
+        from defib.firmware import uses_per_flash_type_uboot
+        if (
+            flash_type.lower() == "auto"
+            and uses_per_flash_type_uboot(chip)
+            and output == "human"
+        ):
+            console.print(
+                f"  [yellow]{chip} publishes separate NOR and NAND U-Boot builds; "
+                "using NOR. Pass --flash-type nand for a NAND camera.[/yellow]"
+            )
+        if has_firmware(chip, uboot_flash_type):
+            cached = get_cached_path(chip, uboot_flash_type)
             if not cached:
                 if output == "human":
                     console.print(f"  Downloading U-Boot for [cyan]{chip}[/cyan]...")
-                cached = download_firmware(chip)
+                cached = download_firmware(chip, flash_type=uboot_flash_type)
             uboot_path = str(cached)
         else:
             console.print(f"[red]No U-Boot for '{chip}'. Specify --uboot.[/red]")
