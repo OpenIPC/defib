@@ -297,7 +297,8 @@ async function standardSendFirmware(firmware, profile) {
   const ddrAddr = parseInt(profile.ADDRESS[0], 16);
   const splAddr = parseInt(profile.ADDRESS[1], 16);
   const ubootAddr = parseInt(profile.ADDRESS[2], 16);
-  const splMax = parseInt(profile.FILELEN[1], 16);
+  const splMax = detectSplSize(firmware, parseInt(profile.FILELEN[1], 16),
+    profile.SRAMLIMIT ? parseInt(profile.SRAMLIMIT, 16) : null);
   const ddrStep = new Uint8Array(profile.DDRSTEP0);
 
   // DDR step
@@ -554,7 +555,7 @@ async function downloadFirmware() {
   } catch (e) {
     log(`Could not read release metadata (${e.message}) — downloading without checksum verification`, 'warn');
   }
-  const url = meta ? meta.url : `${FW_DIRECT_BASE}/u-boot-${name}-universal.bin`;
+  const url = meta ? meta.url : `${FW_DIRECT_BASE}/${fwAssetName(name)}`;
   if (meta && !meta.sha256) {
     log('Release metadata has no SHA-256 for this asset — falling back to a size check', 'warn');
   }

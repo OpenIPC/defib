@@ -190,8 +190,20 @@ const FW_RELEASE_API =
 const FW_DIRECT_BASE =
   'https://github.com/OpenIPC/firmware/releases/download/latest';
 
-// Asset name → chip, e.g. u-boot-hi3516ev300-universal.bin → hi3516ev300
-const FW_ASSET_RE = /^u-boot-(.+)-universal\.bin$/;
+// Asset name → chip, e.g. u-boot-gk7205v300-universal.bin → gk7205v300.
+// The u-boot-xmedia SoCs publish per flash type instead (-nor.bin, -nand.bin);
+// a recovery loads U-Boot into RAM and needs no flash layout, so it takes the
+// -nor one, as `defib burn` does without --nand.
+const FW_ASSET_RE = /^u-boot-(.+)-(universal|nor)\.bin$/;
+const XMEDIA_SOCS = new Set([
+  'hi3516ev200', 'hi3516ev300', 'hi3518ev300', 'hi3516dv200',
+  'gk7205v500', 'gk7205v510', 'gk7205v530',
+]);
+
+/** The published U-Boot a firmware name resolves to. */
+function fwAssetName(name) {
+  return XMEDIA_SOCS.has(name) ? `u-boot-${name}-nor.bin` : `u-boot-${name}-universal.bin`;
+}
 
 // Chip aliases: chips whose U-Boot binary is published under another name.
 const CHIP_FW_ALIAS = {
@@ -209,7 +221,7 @@ function fwNameForChip(chip) {
 
 /**
  * Build chip → {name, url, size, sha256} from a GitHub release API response.
- * Only u-boot-*-universal.bin assets are considered. `digest` is present on
+ * Only each chip's own U-Boot asset is considered (fwAssetName). `digest` is present on
  * modern GitHub responses as "sha256:<hex>"; it may be missing on older ones,
  * in which case sha256 is null and the caller falls back to a size check.
  */
@@ -217,7 +229,9 @@ function parseReleaseAssets(release) {
   const out = new Map();
   for (const asset of (release && release.assets) || []) {
     const m = FW_ASSET_RE.exec(asset.name || '');
-    if (!m) continue;
+    // Only the asset this chip is meant to load: a stale -universal image of
+    // an xmedia SoC must not stand in for its -nor one.
+    if (!m || asset.name !== fwAssetName(m[1])) continue;
     out.set(m[1], {
       name: asset.name,
       url: `${FW_DIRECT_BASE}/${asset.name}`,
@@ -226,6 +240,36 @@ function parseReleaseAssets(release) {
     });
   }
   return out;
+}
+
+/**
+ * The SPL length to upload: the mini-boot's code, up to where its compressed
+ * U-Boot payload starts. Bytes past that boundary land in SRAM the bootrom
+ * uses for its own state, and writing them corrupts it, so a build smaller
+ * than the profile's reference SPL must not be padded to it. Same search as
+ * HiSiliconStandard._detect_spl_size in defib: an LZMA header (0x5D and a
+ * power-of-two dictionary of 64K..16M) or a gzip one (1f 8b 08) from 0x4000,
+ * rounded down to 1K, capped at sramLimit when the profile sets one. Without
+ * either, the profile's length stands.
+ */
+function detectSplSize(firmware, profileMax, sramLimit = null) {
+  const end = Math.min(firmware.length, 0x10000);
+  for (let i = 0x4000; i < end; i++) {
+    const b = firmware[i];
+    let found = false;
+    if (b === 0x5d && i + 4 < firmware.length) {
+      const ds = (firmware[i + 1] | (firmware[i + 2] << 8) | (firmware[i + 3] << 16)
+        | (firmware[i + 4] << 24)) >>> 0;
+      found = ds >= 0x10000 && ds <= 0x1000000 && (ds & (ds - 1)) === 0;
+    } else if (b === 0x1f && firmware[i + 1] === 0x8b && firmware[i + 2] === 0x08) {
+      found = true;
+    }
+    if (found) {
+      const at = i & ~0x3ff;
+      return sramLimit !== null && at > sramLimit ? sramLimit : at;
+    }
+  }
+  return profileMax;
 }
 
 /** "sha256:abc..." → "abc..." (lowercase hex), else null. */
@@ -343,6 +387,7 @@ if (typeof module !== 'undefined' && module.exports) {
     FRAME_BLAST_SOCS, needsFrameBlast,
     FW_RELEASE_API, FW_DIRECT_BASE, FW_ASSET_RE, FW_PROXIES,
     CHIP_FW_ALIAS, fwNameForChip, parseReleaseAssets, parseDigest,
+    XMEDIA_SOCS, fwAssetName, detectSplSize,
     fwSourceUrls, bytesToHex, verifyFirmwareBytes,
     PROXY_WINDOW_SECONDS, proxySignatureMessage, hmacSha256Hex,
     buildOpenIpcProxyUrl,
