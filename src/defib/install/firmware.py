@@ -30,7 +30,9 @@ def _is_ubi_member(name: str) -> bool:
     return name == "rootfs.ubi" or name.startswith("rootfs.ubi.")
 
 
-def load_firmware_bundle(path: str | Path, *, ubi_only: bool = False) -> FirmwareBundle:
+def load_firmware_bundle(
+    path: str | Path, *, ubi_only: bool = False, boards: set[str] | None = None
+) -> FirmwareBundle:
     """Read kernel/rootfs and verify any matching md5sum entries in one pass.
 
     ``ubi_only`` selects the UBI-only NAND package
@@ -82,6 +84,15 @@ def load_firmware_bundle(path: str | Path, *, ubi_only: bool = False) -> Firmwar
 
         if not is_ubi_image(rootfs):
             raise ValueError(f"{rootfs_name} is not a UBI image (no UBI# header)")
+        # The image carries its kernel, so one built for another board would
+        # put that board's kernel and rootfs on this camera's NAND.
+        board = rootfs_name.rsplit("/", 1)[-1].removeprefix("rootfs.ubi.")
+        if boards is not None and board not in boards:
+            raise ValueError(
+                f"{rootfs_name} is built for {board}, not "
+                + " or ".join(sorted(boards))
+                + "; refusing to write another board's NAND image"
+            )
         kernel = b""
     elif not kernel or not rootfs:
         raise ValueError("tarball missing uImage or rootfs (squashfs/ubi)")

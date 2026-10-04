@@ -24,6 +24,7 @@ from defib.install.layout import (
     NAND_UBI_LAYOUT,
     NAND_UBI_OFFSET,
     mtdparts_partition_offset,
+    ubi_nand_boards,
     parse_nand_erase_range,
     uboot_reports_ok,
 )
@@ -459,9 +460,20 @@ def test_nand_package_selects_rootfs_ubi_not_ubifs(tmp_path):
 
 def test_nand_package_for_gk7205v510_uses_gk7205v500_board(tmp_path):
     bundle = load_firmware_bundle(
-        _nand_package(tmp_path / "fw.tgz", board="gk7205v500"), ubi_only=True
+        _nand_package(tmp_path / "fw.tgz", board="gk7205v500"),
+        ubi_only=True,
+        boards=ubi_nand_boards("gk7205v510"),
     )
     assert bundle.rootfs_name == "rootfs.ubi.gk7205v500"
+
+
+def test_nand_package_for_another_board_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="built for hi3516ev200"):
+        load_firmware_bundle(
+            _nand_package(tmp_path / "fw.tgz", board="hi3516ev200"),
+            ubi_only=True,
+            boards=ubi_nand_boards("hi3516ev300"),
+        )
 
 
 def test_split_layout_package_is_rejected_for_ubi_layout(tmp_path):
@@ -505,6 +517,12 @@ class TestLayoutHelpers:
     def test_split_layout_ubi_offset(self):
         value = "hinand:1024k(boot),1024k(env),8192k(kernel),-(ubi)"
         assert mtdparts_partition_offset(value, "ubi") == 0xA00000
+
+    def test_ubi_on_a_spi_device_is_not_the_nand_one(self):
+        value = "sfc:256k(boot),-(ubi);hinand:768k(boot),256k(env),-(ubi)"
+        assert mtdparts_partition_offset(value, "ubi") == 0x40000
+        assert mtdparts_partition_offset(value, "ubi", nand_only=True) == 0x100000
+        assert mtdparts_partition_offset("sfc:256k(boot),-(ubi)", "ubi", nand_only=True) is None
 
     def test_missing_partition(self):
         assert mtdparts_partition_offset("hinand:768k(boot),-(rest)", "ubi") is None

@@ -28,6 +28,7 @@ from defib.install.layout import (
     nor_mtdparts,
     parse_nand_erase_range,
     parse_uboot_crc32,
+    ubi_nand_boards,
     select_nor_size_mb,
     set_uboot_env_verified,
     uboot_flash_command_error,
@@ -224,7 +225,11 @@ async def run_install(request: InstallRequest) -> None:
             console.print(f"  Stages:  [cyan]{', '.join(stages)}[/cyan]")
 
     try:
-        firmware = load_firmware_bundle(firmware_path, ubi_only=ubi_layout)
+        firmware = load_firmware_bundle(
+            firmware_path,
+            ubi_only=ubi_layout,
+            boards=ubi_nand_boards(chip) if ubi_layout else None,
+        )
     except ValueError as exc:
         fail(str(exc))
 
@@ -1315,7 +1320,7 @@ async def run_install(request: InstallRequest) -> None:
                 mtd_resp = await _optional_printenv("mtdparts", timeout=5.0)
                 mtd_value = parse_printenv_value(mtd_resp, "mtdparts")
                 ubi_off = (
-                    mtdparts_partition_offset(mtd_value, "ubi")
+                    mtdparts_partition_offset(mtd_value, "ubi", nand_only=True)
                     if mtd_value is not None
                     else None
                 )

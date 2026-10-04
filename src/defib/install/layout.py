@@ -57,6 +57,16 @@ NAND_UBI_LAYOUT = {
 }
 NAND_UBI_OFFSET = 0x100000
 
+# The build a SoC's NAND package is published under, where it is not the SoC
+# itself: the GK7205V500 family shares one NAND build.
+_UBI_NAND_BOARD = {"gk7205v510": "gk7205v500", "gk7205v530": "gk7205v500"}
+
+
+def ubi_nand_boards(chip: str) -> set[str]:
+    """The ``rootfs.ubi.<board>`` suffixes a NAND package for ``chip`` may carry."""
+    base = chip.partition(":")[0]
+    return {base, _UBI_NAND_BOARD.get(base, base)}
+
 _MTDPART_RE = re.compile(
     r"^(?P<size>-|(?:0x[0-9a-f]+|\d+)[kmg]?)"
     r"(?:@(?P<offset>(?:0x[0-9a-f]+|\d+)[kmg]?))?"
@@ -71,17 +81,23 @@ def _mtd_size(text: str) -> int:
     return int(digits, 0) * multiplier
 
 
-def mtdparts_partition_offset(mtdparts: str, name: str) -> int | None:
+def mtdparts_partition_offset(
+    mtdparts: str, name: str, *, nand_only: bool = False
+) -> int | None:
     """Offset of partition ``name`` in a U-Boot/Linux mtdparts string.
 
     Accepts the value with or without the ``mtdparts=`` prefix and with several
     ``;``-separated devices. Returns None if the partition is not listed or the
-    string cannot be parsed up to it.
+    string cannot be parsed up to it. ``nand_only`` looks only at NAND devices
+    (an mtd-id with ``nand`` in it: ``hinand``, ``nand``), so a partition of the
+    same name on a SPI NOR device cannot stand in for the NAND one.
     """
     value = mtdparts.strip().removeprefix("mtdparts=")
     for device in value.split(";"):
-        _, sep, parts = device.partition(":")
+        mtd_id, sep, parts = device.partition(":")
         if not sep:
+            continue
+        if nand_only and "nand" not in mtd_id.strip():
             continue
         offset = 0
         for part in parts.split(","):
