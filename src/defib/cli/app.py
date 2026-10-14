@@ -2650,7 +2650,7 @@ async def _restore_async(
 
     from rich.console import Console
 
-    from defib.flashdump import send_command
+    from defib.flashdump import get_ram_staging_addr, send_command
     from defib.recovery.events import LogEvent, ProgressEvent
     from defib.recovery.session import RecoverySession
     from defib.transport.serial_platform import create_transport, normalize_port_name
@@ -3117,7 +3117,9 @@ async def _restore_async(
             tftp_proto._files[name] = data
     try:
 
-        ram_addr = 0x82000000
+        # DRAM starts at 0x40000000 on ev200-era parts; a fixed 0x82000000
+        # there points the TFTP load and every flash write at no memory.
+        ram_addr = get_ram_staging_addr(chip)
         offset = 0
         ubi_partmap: dict[int, tuple[str, int, int]] | None = None
     
