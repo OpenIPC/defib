@@ -543,9 +543,13 @@ async def dump_flash(
 
     # Resolve RAM staging address
     if ram_addr is None:
+        # Only an exact table/profile hit is trusted: a mistyped -c must not
+        # reach get_ram_staging_addr()'s prefix or 0x82000000 fallbacks.
         if chip:
-            ram_addr = get_ram_staging_addr(chip)
-        else:
+            ram_addr = _exact_ram_staging_addr(chip)
+            if ram_addr is None and on_log:
+                on_log(f"Unknown chip {chip!r}; asking U-Boot where RAM is")
+        if ram_addr is None:
             ram_addr = await detect_ram_staging_addr(transport, on_log)
     if on_log:
         on_log(f"RAM staging address: 0x{ram_addr:08x}")

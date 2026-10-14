@@ -506,6 +506,27 @@ class TestDumpFlashRamDetection:
             await self._dump(transport)
 
     @pytest.mark.asyncio
+    async def test_mistyped_chip_falls_back_to_uboot(self):
+        transport = MockTransport(self._responses({
+            "bdinfo": "Unknown command 'bdinfo' - try 'help'\n# \n",
+            "printenv soc": "soc=gk7201v200\n# \n",
+        }))
+        await self._dump(transport, chip="gk7201v201")
+        sent = self._sent(transport)
+        assert "sf read 0x42000000 0x0 0x10" in sent
+        assert not any(cmd.startswith("sf read 0x82") for cmd in sent)
+
+    @pytest.mark.asyncio
+    async def test_mistyped_chip_on_unknown_board_refuses(self):
+        transport = MockTransport(self._responses({
+            "bdinfo": "Unknown command 'bdinfo' - try 'help'\n# \n",
+            "printenv soc": "## Error: \"soc\" not defined\n# \n",
+        }))
+        with pytest.raises(RuntimeError, match="-c"):
+            await self._dump(transport, chip="gk7201v201")
+        assert not any(cmd.startswith("sf read") for cmd in self._sent(transport))
+
+    @pytest.mark.asyncio
     async def test_chip_skips_detection(self):
         transport = MockTransport(self._responses({}))
         await self._dump(transport, chip="gk7201v200")
