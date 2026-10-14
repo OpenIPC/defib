@@ -731,7 +731,7 @@ def dump_flash_cmd(
     output_file: str = typer.Option("flash_dump.bin", "-o", "--output", help="Output binary file"),
     size: str = typer.Option("", "--size", help="Flash size (e.g., 8MB, 16MB) — auto-detect if empty"),
     output: str = typer.Option("human", "--output-mode", help="Output mode: human, json"),
-    chip: str = typer.Option("", "-c", "--chip", help="Chip model. Only needed for chips that dump over USB rather than a U-Boot console."),
+    chip: str = typer.Option("", "-c", "--chip", help="Chip model. Picks the RAM staging address (otherwise asked from U-Boot); required for chips that dump over USB."),
     partition: str = typer.Option("", "--partition", help="USB-recovery chips: dump one named partition instead of the whole flash"),
     ddr: str = typer.Option("", "--ddr", help="USB-recovery chips: DDR-init blob (rkbin rv1106_ddr_*.bin)"),
     usbplug: str = typer.Option("", "--usbplug", help="USB-recovery chips: usbplug blob (rkbin rv1106_usbplug_*.bin)"),
@@ -830,7 +830,7 @@ async def _dump_flash_async(
     try:
         bytes_dumped = await dump_flash(
             transport, output_file,
-            flash_size=flash_size,
+            flash_size=flash_size, chip=chip,
             on_progress=on_progress, on_log=on_log,
         )
         if output == "human":

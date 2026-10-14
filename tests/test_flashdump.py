@@ -425,3 +425,117 @@ class TestDumpFlashResume:
         finally:
             if os.path.exists(outpath):
                 os.unlink(outpath)
+
+
+class TestDumpFlashRamDetection:
+    """Regression: with no chip, dump-flash staged at 0x82000000 regardless of
+    the board. On a gk7201v200 (DRAM at 0x40000000) that sf read wedged U-Boot.
+    """
+
+    VALID_HEX = "15 05 00 ea fe ff ff ea fe ff ff ea fe ff ff ea"
+
+    def _responses(self, extra: dict[str, str]) -> dict[str, str]:
+        responses = {
+            "sf probe": "# \n",
+            "sf read": "SF: 16 bytes @ 0x0 Read: OK\n# \n",
+            "md.b 0x42000000 10": f"42000000: {self.VALID_HEX}    ................\n# \n",
+            "crc32": "Unknown command\n# \n",
+            "md.b 0x42000000 0x10": f"42000000: {self.VALID_HEX}    ................\n# \n",
+        }
+        responses.update(extra)
+        return responses
+
+    async def _dump(self, transport: "MockTransport", **kwargs: object) -> None:
+        from defib.flashdump import dump_flash
+
+        outpath = os.path.join(tempfile.gettempdir(), "test_ram_detect.bin")
+        try:
+            await dump_flash(transport, outpath, flash_size=16, **kwargs)  # type: ignore[arg-type]
+        finally:
+            if os.path.exists(outpath):
+                os.unlink(outpath)
+
+    @staticmethod
+    def _sent(transport: "MockTransport") -> list[str]:
+        return [d.decode("ascii", errors="replace").strip() for d in transport._tx_log]
+
+    @pytest.mark.asyncio
+    async def test_bdinfo_dram_start_picks_staging(self):
+        transport = MockTransport(self._responses({
+            "bdinfo": (
+                "arch_number = 0x00000000\n"
+                "DRAM bank   = 0x00000000\n"
+                "-> start    = 0x40000000\n"
+                "-> size     = 0x04000000\n"
+                "# \n"
+            ),
+        }))
+        await self._dump(transport)
+        assert "sf read 0x42000000 0x0 0x10" in self._sent(transport)
+
+    @pytest.mark.asyncio
+    async def test_xm_uboot_without_bdinfo_uses_env_soc(self):
+        # XM U-Boot 2020.01 (xm72010200) on gk7201v200: no bdinfo, soc= in env.
+        transport = MockTransport(self._responses({
+            "bdinfo": "Unknown command 'bdinfo' - try 'help'\n# \n",
+            "printenv soc": "soc=gk7201v200\n# \n",
+        }))
+        await self._dump(transport)
+        sent = self._sent(transport)
+        assert "sf read 0x42000000 0x0 0x10" in sent
+        assert not any(cmd.startswith("sf read 0x82") for cmd in sent)
+
+    @pytest.mark.asyncio
+    async def test_unknown_board_refuses_instead_of_guessing(self):
+        transport = MockTransport(self._responses({
+            "bdinfo": "Unknown command 'bdinfo' - try 'help'\n# \n",
+            "printenv soc": "## Error: \"soc\" not defined\n# \n",
+        }))
+        with pytest.raises(RuntimeError, match="-c"):
+            await self._dump(transport)
+        assert not any(cmd.startswith("sf read") for cmd in self._sent(transport))
+
+    @pytest.mark.asyncio
+    async def test_unrecognised_env_soc_refuses(self):
+        # A soc= the profiles do not know must not fall into the prefix guess.
+        transport = MockTransport(self._responses({
+            "bdinfo": "Unknown command 'bdinfo' - try 'help'\n# \n",
+            "printenv soc": "soc=hi3516zz900\n# \n",
+        }))
+        with pytest.raises(RuntimeError, match="-c"):
+            await self._dump(transport)
+
+    @pytest.mark.asyncio
+    async def test_chip_skips_detection(self):
+        transport = MockTransport(self._responses({}))
+        await self._dump(transport, chip="gk7201v200")
+        sent = self._sent(transport)
+        assert "sf read 0x42000000 0x0 0x10" in sent
+        assert "bdinfo" not in sent
+
+
+def test_cli_dump_flash_passes_chip_to_uart_dump(monkeypatch):
+    from typer.testing import CliRunner
+
+    import defib.flashdump
+    import defib.transport.serial_platform
+    from defib.cli.app import app
+
+    seen: dict[str, object] = {}
+
+    async def fake_create_transport(port: str) -> MockTransport:
+        return MockTransport()
+
+    async def fake_dump_flash(transport: object, output_path: str, **kwargs: object) -> int:
+        seen.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(defib.transport.serial_platform, "create_transport", fake_create_transport)
+    monkeypatch.setattr(defib.flashdump, "dump_flash", fake_dump_flash)
+
+    result = CliRunner().invoke(app, [
+        "dump-flash", "-p", "/dev/null", "-c", "gk7201v200", "--size", "8MB",
+        "-o", os.path.join(tempfile.gettempdir(), "test_cli_chip.bin"),
+    ])
+    assert result.exit_code == 0, result.output
+    assert seen["chip"] == "gk7201v200"

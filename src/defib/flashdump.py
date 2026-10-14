@@ -84,15 +84,11 @@ MD_LINE_RE = re.compile(
 )
 
 
-def get_ram_staging_addr(chip: str) -> int:
-    """Get safe RAM address for flash staging based on SoC type.
-
-    Looks up the chip's RAM base from the known table, falling back to
-    the profile's U-Boot load address if not found.
-    """
+def _exact_ram_staging_addr(chip: str) -> int | None:
+    """Staging address for a chip known to the RAM table or a profile, else None."""
     # Board/vendor selectors use ``soc:variant`` but RAM geometry belongs to
     # the SoC.  Strip the suffix before the exact table lookup so staging does
-    # not depend on the order of the broad legacy prefix fallbacks below.
+    # not depend on the order of the broad legacy prefix fallbacks.
     chip_lower = chip.lower().split(":", 1)[0]
     # Direct match
     if chip_lower in RAM_BASE:
@@ -102,14 +98,26 @@ def get_ram_staging_addr(chip: str) -> int:
         from defib.profiles.loader import load_profile
         profile = load_profile(chip_lower)
         # The property raises for USB-recovery chips, which have no load
-        # addresses at all — the except below then falls through to the
-        # prefix lookup, which is the right answer for them.
+        # addresses at all — the caller then falls back to the prefix
+        # lookup, which is the right answer for them.
         uboot_addr = profile.uboot_address
         # Derive RAM base from U-Boot address (aligned to 0x40000000 boundary)
         ram_base = uboot_addr & 0xF0000000
         return ram_base + RAM_STAGING_OFFSET
     except Exception:
-        pass
+        return None
+
+
+def get_ram_staging_addr(chip: str) -> int:
+    """Get safe RAM address for flash staging based on SoC type.
+
+    Looks up the chip's RAM base from the known table, falling back to
+    the profile's U-Boot load address if not found.
+    """
+    exact = _exact_ram_staging_addr(chip)
+    if exact is not None:
+        return exact
+    chip_lower = chip.lower().split(":", 1)[0]
     # Last resort: use profile name for lookup
     for prefix, base in RAM_BASE.items():
         if chip_lower.startswith(prefix[:8]):
@@ -467,6 +475,41 @@ async def _get_device_crc32(
     return None
 
 
+async def detect_ram_staging_addr(
+    transport: Transport,
+    on_log: Callable[[str], None] | None = None,
+) -> int:
+    """Ask the running U-Boot where DRAM is, for callers that know no chip.
+
+    There is no safe guess: DRAM starts at 0x40000000 on ev200-era parts and
+    at 0x80000000 on older ones, and an ``sf read`` aimed at the wrong half
+    wedges U-Boot.  Mainline ``bdinfo`` reports the bank start; vendor builds
+    without it (XM's xm720x0200 U-Boot) usually still carry ``soc=`` in the
+    env.  When neither answers, refuse rather than guess.
+    """
+    resp = await send_command(transport, "bdinfo", timeout=3.0, wait_for="# ")
+    m = re.search(r"(?:->\s*start|memstart)\s*=\s*(0x[0-9a-fA-F]+)", resp)
+    if m:
+        ram_base = int(m.group(1), 16)
+        if on_log:
+            on_log(f"DRAM start from bdinfo: 0x{ram_base:08x}")
+        return ram_base + RAM_STAGING_OFFSET
+
+    resp = await send_command(transport, "printenv soc", timeout=3.0, wait_for="# ")
+    m = re.search(r"(?m)^soc=([\w:.-]+)\s*$", resp)
+    if m:
+        addr = _exact_ram_staging_addr(m.group(1))
+        if addr is not None:
+            if on_log:
+                on_log(f"SoC from U-Boot env: {m.group(1)}")
+            return addr
+
+    raise RuntimeError(
+        "Could not tell where this board's RAM is (no bdinfo, no known soc= "
+        "in the U-Boot env). Pass the chip with -c, e.g. -c gk7205v200."
+    )
+
+
 async def dump_flash(
     transport: Transport,
     output_path: str,
@@ -486,6 +529,8 @@ async def dump_flash(
         output_path: Path to save the binary dump.
         flash_size: Flash size in bytes (auto-detected if None).
         ram_addr: RAM address to load flash contents into.
+        chip: SoC name that picks ``ram_addr`` when it is not given; with
+            neither, the address is asked from U-Boot itself.
         on_progress: Callback(bytes_done, bytes_total).
         on_log: Callback for log messages.
 
@@ -501,7 +546,7 @@ async def dump_flash(
         if chip:
             ram_addr = get_ram_staging_addr(chip)
         else:
-            ram_addr = 0x82000000  # Legacy default, may crash on 0x40000000 boards
+            ram_addr = await detect_ram_staging_addr(transport, on_log)
     if on_log:
         on_log(f"RAM staging address: 0x{ram_addr:08x}")
 
