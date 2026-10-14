@@ -731,7 +731,7 @@ def dump_flash_cmd(
     output_file: str = typer.Option("flash_dump.bin", "-o", "--output", help="Output binary file"),
     size: str = typer.Option("", "--size", help="Flash size (e.g., 8MB, 16MB) — auto-detect if empty"),
     output: str = typer.Option("human", "--output-mode", help="Output mode: human, json"),
-    chip: str = typer.Option("", "-c", "--chip", help="Chip model. Only needed for chips that dump over USB rather than a U-Boot console."),
+    chip: str = typer.Option("", "-c", "--chip", help="Chip model. Picks the RAM staging address (otherwise asked from U-Boot); required for chips that dump over USB."),
     partition: str = typer.Option("", "--partition", help="USB-recovery chips: dump one named partition instead of the whole flash"),
     ddr: str = typer.Option("", "--ddr", help="USB-recovery chips: DDR-init blob (rkbin rv1106_ddr_*.bin)"),
     usbplug: str = typer.Option("", "--usbplug", help="USB-recovery chips: usbplug blob (rkbin rv1106_usbplug_*.bin)"),
@@ -830,7 +830,7 @@ async def _dump_flash_async(
     try:
         bytes_dumped = await dump_flash(
             transport, output_file,
-            flash_size=flash_size,
+            flash_size=flash_size, chip=chip,
             on_progress=on_progress, on_log=on_log,
         )
         if output == "human":
@@ -2650,7 +2650,7 @@ async def _restore_async(
 
     from rich.console import Console
 
-    from defib.flashdump import send_command
+    from defib.flashdump import get_ram_staging_addr, send_command
     from defib.recovery.events import LogEvent, ProgressEvent
     from defib.recovery.session import RecoverySession
     from defib.transport.serial_platform import create_transport, normalize_port_name
@@ -3117,7 +3117,9 @@ async def _restore_async(
             tftp_proto._files[name] = data
     try:
 
-        ram_addr = 0x82000000
+        # DRAM starts at 0x40000000 on ev200-era parts; a fixed 0x82000000
+        # there points the TFTP load and every flash write at no memory.
+        ram_addr = get_ram_staging_addr(chip)
         offset = 0
         ubi_partmap: dict[int, tuple[str, int, int]] | None = None
     
