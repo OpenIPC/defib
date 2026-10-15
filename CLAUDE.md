@@ -128,7 +128,7 @@ through agent RAM buffers, see `agent/nand_layout.h` and `defib.agent.nand`). `a
 optional features through a capability bitmask (`client.py`).
 
 Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
-`emmc_himci.c`. Twelve SoCs are supported; each has its own `ifeq` stanza in
+`emmc_himci.c`. Thirteen SoCs are supported; each has its own `ifeq` stanza in
 `agent/Makefile` carrying `LOAD_ADDR` (and `SPI_DRIVER` where it differs).
 `link.ld` itself is generic — it just places `. = LOAD_ADDR`.
 

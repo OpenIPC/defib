@@ -512,6 +512,12 @@ class HiSiliconStandard(BootProtocol):
         spl_size = self._detect_spl_size(
             scan_buf, profile.spl_max_size, sram_limit=profile.spl_sram_limit,
         )
+        # A board SPL_BLOB has no compressed payload to mark its end, so the
+        # scan falls back to profile_max — on hi3516av300:emmc that is 0x6000
+        # against a 0x5000 blob. Padding it out writes zeros past the SPL into
+        # SRAM the bootrom still uses; send only the bytes the blob holds.
+        if spl_override is not None and len(spl_override) < spl_size:
+            spl_size = len(spl_override)
         logger.debug(
             "=== SPL === address=0x%08X size=%d chunks=%d",
             profile.spl_address, spl_size,

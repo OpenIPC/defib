@@ -168,7 +168,10 @@ static void fmc_enter_normal(void) {
      * 0x10260000 and uses different register offsets + values; the
      * dimerr/u-boot-hi3516cv610 driver fmc_hi3516cv610.c is the source
      * of truth for the CV6xx values. */
-#ifdef SPI_PINS_CV6XX
+#if defined(SPI_PINS_SKIP)
+    /* The bootrom's pad setup is final on this SoC (hi3536dv100):
+     * vendor U-Boot leaves the SPI pads alone too. */
+#elif defined(SPI_PINS_CV6XX)
     /* CV6xx layout (per drivers/mtd/fmc_hi3516cv610.c, 3.3V single-CS):
      * 0x0C MOSI_IO0, 0x10 CLK, 0x14 HOLD_IO3, 0x18 CS0,
      * 0x1C MISO_IO1, 0x20 WP_IO2. */

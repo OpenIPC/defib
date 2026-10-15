@@ -87,10 +87,15 @@ class RecoverySession:
 
         protocol = self._protocol_cls()
 
-        # For standard protocol, load and attach the SoC profile
+        # For standard protocol, load and attach the SoC profile. A board
+        # variant's SPL_BLOB replaces the SPL carved from the U-Boot image:
+        # that SPL carries one board's DDR table, and on a board with other
+        # DDR the bootrom jump into U-Boot lands in dead memory.
+        spl_override: bytes | None = None
         if isinstance(protocol, HiSiliconStandard):
             profile = load_profile(self.chip)
             protocol.set_profile(profile)
+            spl_override = profile.spl_data
             if self._power:
                 protocol.set_continuous_ack(True)
             if on_log:
@@ -247,9 +252,14 @@ class RecoverySession:
                     level="info",
                     message=f"Sending {len(firmware)} bytes of firmware...",
                 ))
-            send_result = await protocol.send_firmware(
-                transport, firmware, on_progress,
-            )
+            if spl_override is not None and isinstance(protocol, HiSiliconStandard):
+                send_result = await protocol.send_firmware(
+                    transport, firmware, on_progress, spl_override=spl_override,
+                )
+            else:
+                send_result = await protocol.send_firmware(
+                    transport, firmware, on_progress,
+                )
             if send_result.success:
                 # Mutate handshake variable so post-loop code sees success.
                 handshake_succeeded_result = send_result

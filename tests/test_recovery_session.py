@@ -54,3 +54,37 @@ class TestRecoverySession:
         assert result.elapsed_ms > 0
         assert len(log_events) > 0
         assert len(progress_events) > 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("chip, spl_len", [
+        ("hi3536dv100:nbd8010s", 0x5840),
+        # 0x5000 blob under an inherited FILELEN of 0x6000: must not be
+        # padded out to the profile maximum.
+        ("hi3516av300:emmc", 0x5000),
+    ])
+    async def test_variant_spl_blob_replaces_the_firmware_spl(self, chip, spl_len):
+        """`burn -c <chip>:<variant>` must send the board's SPL_BLOB, exactly
+        as long as the blob, as the SPL stage."""
+        import struct
+
+        from defib.profiles.loader import load_profile
+
+        profile = load_profile(chip, PROFILES_DIR)
+        blob = profile.spl_data
+        assert blob is not None and len(blob) == spl_len
+
+        transport = MockTransport(flush_clears_buffer=False)
+        transport.enqueue_rx(b"\x20" * 5)
+        transport.enqueue_rx(ACK_BYTE * 1000)
+        firmware = b"\x5a" * 0x8000
+
+        session = RecoverySession(chip=chip, firmware_data=firmware)
+        result = await session.run(transport)
+
+        assert result.success
+        sent = b"".join(transport.tx_log)
+        # SPL DATA frames carry the blob in 1024-byte chunks after a 3-byte
+        # frame header; the first chunk is enough to tell whose SPL went out.
+        assert blob[:1024] in sent
+        head = b"\xfe\x00\xff\x01" + struct.pack(">II", spl_len, profile.spl_address)
+        assert head in sent

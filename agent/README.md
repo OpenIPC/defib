@@ -82,11 +82,18 @@ Requires `arm-none-eabi-gcc` (Arch: `pacman -S arm-none-eabi-gcc arm-none-eabi-n
 | hi3516cv610 | 0x11040000 | 0x14000000 | 0x40000000 | 0x41000000 |
 | hi3519v101 | 0x12100000 | 0x14000000 | 0x80000000 | 0x81000000 |
 | hi3520dv200 | 0x20080000 | 0x58000000 | 0x80000000 | 0x81000000 |
+| hi3536dv100 | 0x12080000 | 0x14000000 | 0x80000000 | 0x81000000 |
 
 gk7205v500 also serves gk7205v510/v530. The V500 bootrom has no SPL stage:
 `defib agent upload` puts the agent in the boot-code slot of an OpenIPC
 u-boot-xmedia image (downloaded, or `-f` for your own), whose DDR-init code
 runs first; the bootrom then executes the slot in place at `0x41007000`.
+
+hi3536dv100 is the DVR/NVR part Xiongmai sells as "Hi3536E". Its UART runs
+off a fixed 24 MHz clock, so `SET_BAUD` reaches 921600 with no clock
+switching. The OpenIPC SPL for it doesn't bring up DDR on the Xiongmai
+NBD8010S-KL-V2 board; use `-c hi3536dv100:nbd8010s` there, which uploads the
+board's own SPL instead.
 
 Addresses from [qemu-hisilicon](https://github.com/OpenIPC/LoTool) hardware definitions.
 
