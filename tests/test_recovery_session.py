@@ -57,7 +57,6 @@ class TestRecoverySession:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("chip, spl_len", [
-        ("hi3536dv100:nbd8010s", 0x5840),
         # 0x5000 blob under an inherited FILELEN of 0x6000: must not be
         # padded out to the profile maximum.
         ("hi3516av300:emmc", 0x5000),

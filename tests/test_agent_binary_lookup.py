@@ -43,9 +43,6 @@ class TestSearchPath:
         (tmp_path / "agent-hi3516cv500.bin").write_bytes(b"\x00" * 16)
         assert get_agent_binary("hi3516av300:emmc") is not None
 
-    def test_a_board_variant_uses_the_chip_build(self):
-        assert agent_binary_for("hi3536dv100:nbd8010s") == "hi3536dv100"
-
     def test_every_path_is_absolute(self):
         assert all(Path(p).is_absolute() for p in _agent_search_path("hi3516cv300"))
 

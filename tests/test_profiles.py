@@ -220,19 +220,6 @@ class TestBoardVariants:
         # SPL extracted at 0x5000 (above the gzip boundary at ~0x5220)
         assert len(p.spl_data) == 0x5000
 
-    def test_real_hi3536dv100_nbd8010s_variant_loads_spl_blob(self):
-        """The Xiongmai NBD8010S-KL-V2 NVR's DDR differs from the board the
-        OpenIPC hi3536dv100 SPL was built for, so its variant ships the SPL
-        from the board's own U-Boot. The blob runs right up to the LZMA
-        payload at 0x5840, and FILELEN grows to match so none of it is cut."""
-        p = load_profile("hi3536dv100:nbd8010s", PROFILES_DIR)
-        assert p.spl_blob == "hi3536dv100-nbd8010s-spl.bin"
-        assert p.spl_data is not None
-        assert p.spl_data[:4] == bytes.fromhex("170800ea")
-        assert len(p.spl_data) == 0x5840
-        assert p.spl_max_size == 0x5840
-        assert load_profile("hi3536dv100", PROFILES_DIR).spl_data is None
-
 
 class TestSplBlob:
     """SPL_BLOB lets a profile (typically a board variant) ship pre-built

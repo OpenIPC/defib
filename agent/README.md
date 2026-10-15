@@ -89,11 +89,11 @@ gk7205v500 also serves gk7205v510/v530. The V500 bootrom has no SPL stage:
 u-boot-xmedia image (downloaded, or `-f` for your own), whose DDR-init code
 runs first; the bootrom then executes the slot in place at `0x41007000`.
 
-hi3536dv100 is the DVR/NVR part Xiongmai sells as "Hi3536E". Its UART runs
-off a fixed 24 MHz clock, so `SET_BAUD` reaches 921600 with no clock
-switching. The OpenIPC SPL for it doesn't bring up DDR on the Xiongmai
-NBD8010S-KL-V2 board; use `-c hi3536dv100:nbd8010s` there, which uploads the
-board's own SPL instead.
+hi3536dv100 also covers the "Hi3536E" that Xiongmai puts in its NVRs, a
+variant of the same die. Its UART runs off a fixed 24 MHz clock, so
+`SET_BAUD` reaches 921600 with no clock switching. The E variant needs its
+own DDR settings; OpenIPC's u-boot-hi3536dv100 applies them when
+SYSCTRL+0xEE0 reads 0x02000000, so plain `-c hi3536dv100` works on both.
 
 Addresses from [qemu-hisilicon](https://github.com/OpenIPC/LoTool) hardware definitions.
 
