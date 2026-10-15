@@ -359,3 +359,52 @@ class TestPerFlashTypeUBoot:
         donor.write_bytes(b"D" * 4096)
         assert get_cached_path("gk7205v510") == donor
         assert get_cached_path("gk7205v510", "nand") is None
+
+
+class TestStaleCacheRefresh:
+    """A cached u-boot-hi3536dv100-universal.bin from before
+    OpenIPC/u-boot-hi3536dv100#1 resets a Hi3536E during DDR training, so
+    the cache must not keep serving it once the fixed build is published."""
+
+    FIXED = b"\x00" * 0x100 + (0x34421A12).to_bytes(4, "little") \
+        + (0x4144B48D).to_bytes(4, "little") + b"\x00" * 0x4000
+    OLD = b"\x00" * 0x4108
+
+    def _seed(self, tmp_path, monkeypatch, data):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        path = get_cache_dir() / "u-boot-hi3536dv100-universal.bin"
+        path.write_bytes(data)
+        return path
+
+    def test_a_fixed_build_is_used_from_cache(self, tmp_path, monkeypatch):
+        path = self._seed(tmp_path, monkeypatch, self.FIXED)
+        assert get_cached_path("hi3536dv100") == path
+
+    def test_an_old_build_is_downloaded_again(self, tmp_path, monkeypatch):
+        from defib import firmware
+
+        path = self._seed(tmp_path, monkeypatch, self.OLD)
+        assert get_cached_path("hi3536dv100") is None
+
+        def fake_download(url, dest, on_progress=None):
+            dest.write_bytes(self.FIXED)
+            return dest
+
+        monkeypatch.setattr(firmware, "_download", fake_download)
+        assert download_firmware("hi3536dv100") == path
+        assert path.read_bytes() == self.FIXED
+
+    def test_offline_the_old_build_is_still_used(self, tmp_path, monkeypatch):
+        from defib import firmware
+
+        path = self._seed(tmp_path, monkeypatch, self.OLD)
+
+        def offline(url, dest, on_progress=None):
+            if dest.exists():
+                dest.unlink()  # what _download() does on failure
+            raise ConnectionError("offline")
+
+        monkeypatch.setattr(firmware, "_download", offline)
+        assert download_firmware("hi3536dv100") == path
+        assert path.read_bytes() == self.OLD

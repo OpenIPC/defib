@@ -214,6 +214,28 @@ def _cached_file(name: str) -> Path | None:
     return None
 
 
+def _has_hi3536e_ddr_config(data: bytes) -> bool:
+    """Built after OpenIPC/u-boot-hi3536dv100#1, whose SPL programs the
+    Hi3536E's DDR. Its DMC timing values sit in the SPL's literal pool
+    whichever registers the compiler picks; older builds lack them, and on
+    a Hi3536E their DDR training resets the chip."""
+    spl = data[:0x5000]
+    return all(v.to_bytes(4, "little") in spl for v in (0x34421A12, 0x4144B48D))
+
+
+# Cache entries that a later published build fixed in a way recovery depends
+# on. One that fails its check is downloaded again; offline it is still used
+# (it works on the boards the fix is not about), with a warning.
+_CACHE_CHECKS: dict[str, Callable[[bytes], bool]] = {
+    "u-boot-hi3536dv100-universal.bin": _has_hi3536e_ddr_config,
+}
+
+
+def _is_stale(path: Path) -> bool:
+    check = _CACHE_CHECKS.get(path.name)
+    return check is not None and not check(path.read_bytes())
+
+
 def get_cached_path(chip: str, flash_type: str | None = None) -> Path | None:
     """Get the path to cached firmware, or None if not cached.
 
@@ -236,7 +258,7 @@ def get_cached_path(chip: str, flash_type: str | None = None) -> Path | None:
         if not candidate:
             continue
         path = _cached_file(candidate)
-        if path is not None:
+        if path is not None and not _is_stale(path):
             return path
     return None
 
@@ -321,9 +343,22 @@ def download_firmware(
     # Download
     name = asset_name(chip, flash_type)
     assert name is not None  # firmware_url() is None otherwise
+    dest = get_cache_dir() / name
+    # A stale entry is about to be replaced, and _download() deletes dest
+    # when it fails; keep its bytes to put back if we turn out to be offline.
+    stale = _cached_file(name)
+    stale_data = stale.read_bytes() if stale is not None else None
     try:
-        return _download(url, get_cache_dir() / name, on_progress)
+        return _download(url, dest, on_progress)
     except ConnectionError:
+        if stale_data is not None:
+            dest.write_bytes(stale_data)
+            logger.warning(
+                "Download of %s failed; using the cached copy, which predates "
+                "a fix this chip may need",
+                name,
+            )
+            return dest
         # A universal image cached before the per-flash-type split still boots
         # a NOR board, so keep it usable offline. It is never downloaded, and
         # never used for NAND, whose split layout it carries is retired.
