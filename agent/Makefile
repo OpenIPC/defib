@@ -203,8 +203,26 @@ else ifeq ($(SOC),hi3520dv200)
   CRG_BASE       = 0x20030000
   SYSCTRL_REBOOT = 0x20050004
   SPI_DRIVER     = hisfc350
+else ifeq ($(SOC),hi3536dv100)
+  # DVR/NVR generation, Cortex-A7, V4-style map per vendor
+  # arch-hi3536dv100/platform.h. Sold by Xiongmai as "Hi3536E"
+  # (NBD8010S-KL-V2 reads SCSYSID 0x3536D100). UART is PL011 on a fixed
+  # 24 MHz clock (CONFIG_PL011_CLOCK), so SET_BAUD needs no CRG work.
+  # FMC clock gate is CRG48 (+0xC0); the vendor driver never touches
+  # the SPI pads, and there is no pad block at 0x100C0000, so skip them.
+  UART_BASE      = 0x12080000
+  UART_CLOCK     = 24000000
+  LOAD_ADDR      = 0x81000000
+  FLASH_MEM      = 0x14000000
+  FMC_BASE       = 0x10000000
+  RAM_BASE       = 0x80000000
+  WDT_BASE       = 0x12070000
+  CRG_BASE       = 0x12040000
+  SYSCTRL_REBOOT = 0x12050004
+  FMC_CRG_OFFSET = 0x00C0
+  SPI_PINS_SKIP  = 1
 else
-  $(error Unknown SOC: $(SOC). Supported: hi3516ev300 hi3516ev200 gk7205v200 gk7205v300 gk7605v100 gk7205v500 hi3516cv300 hi3516cv500 hi3518ev200 hi3516cv610 hi3519v101 hi3520dv200)
+  $(error Unknown SOC: $(SOC). Supported: hi3516ev300 hi3516ev200 gk7205v200 gk7205v300 gk7605v100 gk7205v500 hi3516cv300 hi3516cv500 hi3518ev200 hi3516cv610 hi3519v101 hi3520dv200 hi3536dv100)
 endif
 
 # Per-SoC CPU. V3 chips (cv300) are ARM926EJ-S (ARMv5TEJ);
@@ -230,6 +248,7 @@ CFLAGS = -mcpu=$(CPU_TYPE) -marm -O2 -ffreestanding -nostdlib \
          $(if $(FMC_CRG_CLK_BIT),-DFMC_CRG_CLK_BIT=$(FMC_CRG_CLK_BIT)) \
          $(if $(SPI_PIN_BASE),-DSPI_PIN_BASE=$(SPI_PIN_BASE)) \
          $(if $(SPI_PINS_CV6XX),-DSPI_PINS_CV6XX=1) \
+         $(if $(SPI_PINS_SKIP),-DSPI_PINS_SKIP=1) \
          -mno-unaligned-access -Wall -Wextra
 
 LDFLAGS = -nostdlib -T link.ld -Ttext=$(LOAD_ADDR) --defsym=LOAD_ADDR=$(LOAD_ADDR)
