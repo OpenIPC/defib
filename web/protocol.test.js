@@ -10,7 +10,7 @@ const assert = require('node:assert/strict');
 const {
   CRC_TABLE, calcCrc, appendCrc, appendCrcLE, verifyCrc,
   buildHeadFrame, buildDataFrame, buildTailFrame, chunkData,
-  parseCv6xxBoot, V500_SOCS, CV6XX_SOCS,
+  parseCv6xxBoot, CV6XX_GSL_LOAD_ADDR, V500_SOCS, CV6XX_SOCS,
   FW_DIRECT_BASE, FW_PROXIES, fwNameForChip, parseReleaseAssets,
   parseDigest, fwSourceUrls, bytesToHex, verifyFirmwareBytes,
   PROXY_WINDOW_SECONDS, proxySignatureMessage, hmacSha256Hex,
@@ -283,76 +283,113 @@ describe('chunkData', () => {
 // CV6xx Boot File Parser Tests
 // ================================================================
 describe('parseCv6xxBoot', () => {
-  function buildTestFirmware(gslLen = 4096, tableCount = 2, tableSize = 1024, ubootLen = 8192) {
-    const gslSize = gslLen + 3072;
-    const paramsStart = gslSize + 1024;
-    const ubootOffset = paramsStart + 1024;
-    const totalSize = ubootOffset + ubootLen + 1024 + 40;
-    const buf = new ArrayBuffer(totalSize);
-    const data = new Uint8Array(buf);
-    const view = new DataView(buf);
+  function buildTestFirmware(options = {}) {
+    const layout = {
+      gslHeaderOffset: 0x800,
+      gslStructureLength: 0x400,
+      gslLength: 0x1000,
+      reeKeyLength: 0x400,
+      paramsStructureLength: 0x400,
+      paramsAreaOffset: 0,
+      tableCount: 2,
+      tableSize: 0x400,
+      ubootStructureLength: 0x400,
+      ubootLength: 0x2000,
+      ...options,
+    };
+    const gslEnd = layout.gslHeaderOffset + layout.gslStructureLength + layout.gslLength;
+    const paramsStart = gslEnd + layout.reeKeyLength;
+    const firstTable = paramsStart + layout.paramsStructureLength + layout.paramsAreaOffset;
+    const ubootOffset = firstTable + layout.tableCount * layout.tableSize;
+    const data = new Uint8Array(
+      ubootOffset + layout.ubootStructureLength + layout.ubootLength,
+    );
+    const view = new DataView(data.buffer);
 
-    // GSL magic at offset 2048
-    view.setUint32(2048, 0x4BB4D22D, true);
-    view.setUint32(2084, gslLen, true);
+    view.setUint32(layout.gslHeaderOffset, 0x4BB4D22D, true);
+    view.setUint32(layout.gslHeaderOffset + 4, 0x100, true);
+    view.setUint32(layout.gslHeaderOffset + 8, layout.gslStructureLength, true);
+    view.setUint32(layout.gslHeaderOffset + 12, 0x40, true);
+    view.setUint32(layout.gslHeaderOffset + 36, layout.gslLength, true);
 
-    // DDR params
     view.setUint32(paramsStart, 0x4B87A52D, true);
-    view.setUint32(paramsStart + 32, 0, true); // offset_32
-    view.setUint32(paramsStart + 36, tableSize, true);
-    view.setUint32(paramsStart + 40, tableCount, true);
-    for (let i = 0; i < 8; i++) data[paramsStart + 300 + i] = Math.min(i, tableCount - 1);
+    view.setUint32(paramsStart + 4, 0x100, true);
+    view.setUint32(paramsStart + 8, layout.paramsStructureLength, true);
+    view.setUint32(paramsStart + 12, 0x40, true);
+    view.setUint32(paramsStart + 32, layout.paramsAreaOffset, true);
+    view.setUint32(paramsStart + 36, layout.tableSize, true);
+    view.setUint32(paramsStart + 40, layout.tableCount, true);
+    for (let i = 0; i < 8; i++) {
+      data[paramsStart + 300 + i] = i < layout.tableCount ? i : 0xff;
+    }
+    for (let i = 0; i < layout.tableCount; i++) {
+      data.fill(i + 1, firstTable + i * layout.tableSize, firstTable + (i + 1) * layout.tableSize);
+    }
 
-    // U-Boot magic
     view.setUint32(ubootOffset, 0x4BF01E2D, true);
-    view.setUint32(ubootOffset + 36, ubootLen, true);
+    view.setUint32(ubootOffset + 4, 0x100, true);
+    view.setUint32(ubootOffset + 8, layout.ubootStructureLength, true);
+    view.setUint32(ubootOffset + 12, 0x40, true);
+    view.setUint32(ubootOffset + 36, layout.ubootLength, true);
 
-    return data;
+    return { data, layout, gslEnd, paramsStart, firstTable, ubootOffset };
   }
 
-  it('parses valid firmware', () => {
-    const fw = buildTestFirmware();
-    const parts = parseCv6xxBoot(fw);
-    assert.ok(parts.gslData.length > 0);
-    assert.equal(parts.tableCount, 2);
-    assert.equal(parts.tableSize, 1024);
-    assert.ok(parts.ubootData.length > 0);
-    assert.ok(parts.ddrTable.length > 0);
+  for (const [name, options] of [
+    ['0x800', {}],
+    ['0x1200', {
+      gslHeaderOffset: 0x1200,
+      gslStructureLength: 0x200,
+      reeKeyLength: 0x100,
+      paramsStructureLength: 0x200,
+      paramsAreaOffset: 0x100,
+      ubootStructureLength: 0x200,
+    }],
+  ]) {
+    it(`parses valid ${name} firmware layout`, () => {
+      const { data, layout, gslEnd } = buildTestFirmware(options);
+      const parts = parseCv6xxBoot(data);
+      assert.equal(parts.gslData.length, gslEnd);
+      assert.equal(parts.tableCount, layout.tableCount);
+      assert.equal(parts.tableSize, layout.tableSize);
+      assert.equal(parts.ubootData.length, layout.ubootStructureLength + layout.ubootLength);
+    });
+  }
+
+  it('exports the CP_STEP1 GSL load address', () => {
+    assert.equal(CV6XX_GSL_LOAD_ADDR, 0x04021A00);
   });
 
   it('rejects invalid GSL magic', () => {
-    const fw = buildTestFirmware();
-    const view = new DataView(fw.buffer);
-    view.setUint32(2048, 0xDEADBEEF, true);
-    assert.throws(() => parseCv6xxBoot(fw), /Invalid GSL magic/);
+    const { data, layout } = buildTestFirmware();
+    new DataView(data.buffer).setUint32(layout.gslHeaderOffset, 0xDEADBEEF, true);
+    assert.throws(() => parseCv6xxBoot(data), /No structurally valid/);
   });
 
-  it('rejects invalid DDR params magic', () => {
-    const fw = buildTestFirmware();
-    const gslLen = new DataView(fw.buffer).getUint32(2084, true);
-    const gslSize = gslLen + 3072;
-    const paramsStart = gslSize + 1024;
-    new DataView(fw.buffer).setUint32(paramsStart, 0xBADBAD, true);
-    assert.throws(() => parseCv6xxBoot(fw), /Invalid DDR params magic/);
+  it('ignores a plausible false GSL header before a valid layout', () => {
+    const { data, gslEnd } = buildTestFirmware({ gslHeaderOffset: 0x1200 });
+    const view = new DataView(data.buffer);
+    view.setUint32(0x800, 0x4BB4D22D, true);
+    view.setUint32(0x804, 0x100, true);
+    view.setUint32(0x808, 0x200, true);
+    view.setUint32(0x80c, 0x40, true);
+    view.setUint32(0x824, 0x200, true);
+
+    assert.equal(parseCv6xxBoot(data).gslSize, gslEnd);
   });
 
-  it('rejects missing U-Boot magic', () => {
-    // Create firmware with no U-Boot magic by zeroing it out
-    const fw = buildTestFirmware();
-    const gslLen = new DataView(fw.buffer).getUint32(2084, true);
-    const gslSize = gslLen + 3072;
-    const paramsStart = gslSize + 1024;
-    const ubootOffset = paramsStart + 1024;
-    new DataView(fw.buffer).setUint32(ubootOffset, 0x00000000, true);
-    assert.throws(() => parseCv6xxBoot(fw), /U-Boot magic not found/);
+  it('rejects truncated DDR tables', () => {
+    const { data, paramsStart } = buildTestFirmware();
+    new DataView(data.buffer).setUint32(paramsStart + 36, data.length, true);
+    assert.throws(() => parseCv6xxBoot(data), /No structurally valid/);
   });
 
   it('returns correct DDR table size', () => {
-    const fw = buildTestFirmware(4096, 3, 512, 8192);
-    const parts = parseCv6xxBoot(fw);
+    const { data } = buildTestFirmware({ tableCount: 3, tableSize: 0x200 });
+    const parts = parseCv6xxBoot(data);
     assert.equal(parts.tableCount, 3);
-    assert.equal(parts.tableSize, 512);
-    assert.equal(parts.ddrTable.length, 2048 + 512);
+    assert.equal(parts.tableSize, 0x200);
+    assert.equal(parts.ddrTable.length, 0x800 + 0x200);
   });
 });
 

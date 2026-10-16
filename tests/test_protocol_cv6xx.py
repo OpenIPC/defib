@@ -8,9 +8,10 @@ from defib.protocol.crc import ACK_BYTE
 from defib.protocol.frames import CV6XX_GSL_MAGIC, CV6XX_DDR_PARAMS_MAGIC, CV6XX_UBOOT_MAGIC
 from defib.protocol.hisilicon_cv6xx import (
     CV6XX_SOCS,
+    GSL_LOAD_ADDR,
     HiSiliconCV6xx,
-    parse_cv6xx_boot,
     build_ddr_table,
+    parse_cv6xx_boot,
 )
 from defib.protocol.base import ProtocolError
 from defib.recovery.events import Stage
@@ -30,74 +31,152 @@ class TestCV6xxMatches:
 
 
 def _build_cv6xx_firmware(
-    gsl_len: int = 4096,
+    gsl_header_offset: int = 0x800,
+    gsl_structure_length: int = 0x400,
+    gsl_len: int = 0x1000,
+    ree_key_length: int = 0x400,
+    params_structure_length: int = 0x400,
+    params_area_offset: int = 0,
     table_count: int = 2,
-    table_size: int = 1024,
-    uboot_len: int = 8192,
+    table_size: int = 0x400,
+    uboot_structure_length: int = 0x400,
+    uboot_len: int = 0x2000,
 ) -> bytes:
     """Build a synthetic CV6xx composite boot file for testing."""
-    # GSL section starts at offset 2048
-    gsl_size = gsl_len + 3072
-    data = bytearray(gsl_size + 4096 + table_count * table_size + uboot_len + 4096)
+    gsl_end = gsl_header_offset + gsl_structure_length + gsl_len
+    params_start = gsl_end + ree_key_length
+    first_table_offset = params_start + params_structure_length + params_area_offset
+    uboot_offset = first_table_offset + table_count * table_size
+    image_end = uboot_offset + uboot_structure_length + uboot_len
+    data = bytearray(image_end)
 
-    # GSL magic at offset 2048
-    struct.pack_into("<I", data, 2048, CV6XX_GSL_MAGIC)
-    # GSL length at offset 2084
-    struct.pack_into("<I", data, 2084, gsl_len)
+    struct.pack_into(
+        "<4I",
+        data,
+        gsl_header_offset,
+        CV6XX_GSL_MAGIC,
+        0x100,
+        gsl_structure_length,
+        0x40,
+    )
+    struct.pack_into("<I", data, gsl_header_offset + 36, gsl_len)
 
-    # DDR params section
-    params_start = gsl_size + 1024
-    struct.pack_into("<I", data, params_start, CV6XX_DDR_PARAMS_MAGIC)
-    # offset_32 at +32
-    struct.pack_into("<I", data, params_start + 32, 0)
-    # table_size at +36
-    struct.pack_into("<I", data, params_start + 36, table_size)
-    # table_count at +40
-    struct.pack_into("<I", data, params_start + 40, table_count)
-    # board_mapping at +300 (8 bytes)
+    struct.pack_into(
+        "<4I",
+        data,
+        params_start,
+        CV6XX_DDR_PARAMS_MAGIC,
+        0x100,
+        params_structure_length,
+        0x40,
+    )
+    struct.pack_into("<3I", data, params_start + 32, params_area_offset, table_size, table_count)
     for i in range(8):
-        data[params_start + 300 + i] = min(i, table_count - 1)
+        data[params_start + 300 + i] = i if i < table_count else 0xFF
+    for i in range(table_count):
+        table_offset = first_table_offset + i * table_size
+        data[table_offset:table_offset + table_size] = bytes([i + 1]) * table_size
 
-    # U-Boot section after params + header area + tables
-    uboot_offset = gsl_size + 2048 + 2048  # After header + some padding
-    # Make sure it's findable after params_start
-    if uboot_offset <= params_start:
-        uboot_offset = params_start + 1024
-
-    # Expand data if needed
-    needed = uboot_offset + uboot_len + 1024 + 40
-    if len(data) < needed:
-        data.extend(b"\x00" * (needed - len(data)))
-
-    struct.pack_into("<I", data, uboot_offset, CV6XX_UBOOT_MAGIC)
+    struct.pack_into(
+        "<4I",
+        data,
+        uboot_offset,
+        CV6XX_UBOOT_MAGIC,
+        0x100,
+        uboot_structure_length,
+        0x40,
+    )
     struct.pack_into("<I", data, uboot_offset + 36, uboot_len)
 
     return bytes(data)
 
 
 class TestParseCv6xxBoot:
-    def test_parse_valid_firmware(self):
-        firmware = _build_cv6xx_firmware()
+    @pytest.mark.parametrize(
+        ("gsl_header_offset", "layout"),
+        [
+            (0x800, {}),
+            (0x1200, {
+                "gsl_structure_length": 0x200,
+                "ree_key_length": 0x100,
+                "params_structure_length": 0x200,
+                "params_area_offset": 0x100,
+                "uboot_structure_length": 0x200,
+            }),
+        ],
+        ids=["0x800", "0x1200"],
+    )
+    def test_parse_valid_firmware(self, gsl_header_offset, layout):
+        firmware = _build_cv6xx_firmware(
+            gsl_header_offset=gsl_header_offset,
+            **layout,
+        )
         parts = parse_cv6xx_boot(firmware)
 
-        assert len(parts.gsl_data) > 0
+        assert len(parts.gsl_data) == gsl_header_offset + layout.get(
+            "gsl_structure_length", 0x400,
+        ) + 0x1000
         assert parts.table_count == 2
-        assert parts.table_size == 1024
-        assert len(parts.uboot_data) > 0
+        assert parts.table_size == 0x400
+        assert len(parts.uboot_data) == layout.get("uboot_structure_length", 0x400) + 0x2000
 
     def test_invalid_gsl_magic(self):
         firmware = bytearray(_build_cv6xx_firmware())
-        struct.pack_into("<I", firmware, 2048, 0xDEADBEEF)
+        struct.pack_into("<I", firmware, 0x800, 0xDEADBEEF)
 
-        with pytest.raises(ProtocolError, match="Invalid GSL magic"):
+        with pytest.raises(ProtocolError, match="No structurally valid"):
+            parse_cv6xx_boot(firmware)
+
+    def test_ignores_false_gsl_magic_before_valid_layout(self):
+        firmware = bytearray(_build_cv6xx_firmware(gsl_header_offset=0x1200))
+        struct.pack_into("<4I", firmware, 0x800, CV6XX_GSL_MAGIC, 0x100, 0x200, 0x40)
+        struct.pack_into("<I", firmware, 0x800 + 36, 0x200)
+
+        parts = parse_cv6xx_boot(firmware)
+
+        assert parts.gsl_size == 0x1200 + 0x400 + 0x1000
+
+    def test_rejects_false_magic_without_valid_layout(self):
+        firmware = bytearray(0x4000)
+        struct.pack_into("<4I", firmware, 0x800, CV6XX_GSL_MAGIC, 0x100, 0x200, 0x40)
+        struct.pack_into("<I", firmware, 0x800 + 36, 0x200)
+
+        with pytest.raises(ProtocolError, match="No structurally valid"):
+            parse_cv6xx_boot(firmware)
+
+    def test_rejects_truncated_ddr_tables(self):
+        firmware = bytearray(_build_cv6xx_firmware())
+        params_offset = firmware.find(struct.pack("<I", CV6XX_DDR_PARAMS_MAGIC))
+        struct.pack_into("<I", firmware, params_offset + 36, len(firmware))
+
+        with pytest.raises(ProtocolError, match="No structurally valid"):
             parse_cv6xx_boot(firmware)
 
     def test_build_ddr_table(self):
-        firmware = _build_cv6xx_firmware(table_count=3, table_size=512)
+        firmware = _build_cv6xx_firmware(table_count=3, table_size=0x200)
         parts = parse_cv6xx_boot(firmware)
-        ddr_table = build_ddr_table(parts, board_id=0)
+        ddr_table = build_ddr_table(parts, board_id=2)
         assert isinstance(ddr_table, bytes)
-        assert len(ddr_table) > 0
+        assert len(ddr_table) == 0x800 + 0x200
+        assert ddr_table[-0x200:] == b"\x03" * 0x200
+
+    def test_build_ddr_table_for_0x1200_layout(self):
+        firmware = _build_cv6xx_firmware(
+            gsl_header_offset=0x1200,
+            gsl_structure_length=0x200,
+            ree_key_length=0x100,
+            params_structure_length=0x200,
+            params_area_offset=0x100,
+            table_count=1,
+            table_size=0x3000,
+            uboot_structure_length=0x200,
+        )
+        parts = parse_cv6xx_boot(firmware)
+
+        ddr_table = build_ddr_table(parts, board_id=7)
+
+        assert len(ddr_table) == 0x400 + 0x3000
+        assert ddr_table[-0x3000:] == b"\x01" * 0x3000
 
 
 class TestCV6xxHandshake:
@@ -174,3 +253,4 @@ class TestCV6xxFirmwareTransfer:
 
         assert result.success
         assert Stage.GSL in result.stages_completed
+        assert struct.unpack(">I", transport.tx_log[0][8:12])[0] == GSL_LOAD_ADDR

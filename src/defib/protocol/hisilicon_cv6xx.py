@@ -4,7 +4,7 @@ Protocol flow:
 1. Handshake: Send DEADBEEF magic with baud rate, loop until "uart ddr"/"uart flash"
 2. Board ID query: Send CE frame with timestamps, get CPU/Board ID
 3. Parse composite boot file: GSL + DDR params (multiple tables) + U-Boot
-4. Transfer: GSL → 0x04020000, DDR table → 0x41000000, wait DDR training, U-Boot → 0x41000000
+4. Transfer: GSL → 0x04021A00, DDR table → 0x41000000, wait DDR training, U-Boot → 0x41000000
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import asyncio
 import logging
 import struct
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Callable
 
@@ -41,10 +42,20 @@ CV6XX_SOCS = frozenset([
     "hi3516dv500", "hi3519dv500",
 ])
 
-GSL_LOAD_ADDR = 0x04020000
+# The CV6xx GSL protocol downloads the composite image at CP_STEP1_ADDR,
+# after the BootROM/GSL stack and BSS reserved at the start of SRAM.
+GSL_LOAD_ADDR = 0x04021A00
 DDR_LOAD_ADDR = 0x41000000
 UBOOT_LOAD_ADDR = 0x41000000
 DDR_TRAINING_WAIT = 1.5  # seconds
+
+IMAGE_ALIGNMENT = 0x100
+CODE_ALIGNMENT = 0x200
+IMAGE_HEADER_FIELDS_SIZE = 40
+DDR_PARAMS_FIELDS_SIZE = 308
+MAX_GSL_HEADER_OFFSET = 0x10000
+MAX_SECTION_GAP = 0x1000
+MAX_DDR_TABLES = 8
 
 
 def _emit(callback: Callable[[ProgressEvent], None] | None, event: ProgressEvent) -> None:
@@ -66,60 +77,183 @@ class CV6xxBootParts:
     file_data: bytes
 
 
+@dataclass(frozen=True)
+class _CodeImage:
+    """Validated code-image header and payload bounds."""
+
+    offset: int
+    structure_length: int
+    payload_length: int
+
+    @property
+    def end(self) -> int:
+        return self.offset + self.structure_length + self.payload_length
+
+
+@dataclass(frozen=True)
+class _DdrParamsImage:
+    """Validated DDR parameter-image header and table bounds."""
+
+    offset: int
+    structure_length: int
+    table_offset: int
+    table_size: int
+    table_count: int
+    board_mapping: bytes
+
+    @property
+    def tables_end(self) -> int:
+        return self.table_offset + self.table_size * self.table_count
+
+
+def _magic_offsets(
+    file_data: bytes,
+    magic: int,
+    start: int = 0,
+    end: int | None = None,
+) -> Iterator[int]:
+    """Yield aligned occurrences of an image magic within the requested range."""
+    magic_bytes = struct.pack("<I", magic)
+    limit = len(file_data) if end is None else min(end, len(file_data))
+    offset = file_data.find(magic_bytes, start, limit)
+    while offset >= 0:
+        if offset % IMAGE_ALIGNMENT == 0:
+            yield offset
+        offset = file_data.find(magic_bytes, offset + 1, limit)
+
+
+def _parse_code_image(file_data: bytes, offset: int, magic: int, name: str) -> _CodeImage:
+    """Validate a GSL/U-Boot image header and return its payload bounds."""
+    if offset + IMAGE_HEADER_FIELDS_SIZE > len(file_data):
+        raise ProtocolError(f"Truncated {name} header at 0x{offset:X}")
+
+    image_magic, version, structure_length, signature_length = struct.unpack_from(
+        "<4I", file_data, offset,
+    )
+    payload_length = struct.unpack_from("<I", file_data, offset + 36)[0]
+
+    if image_magic != magic:
+        raise ProtocolError(f"Invalid {name} magic at 0x{offset:X}")
+    if version == 0:
+        raise ProtocolError(f"Invalid {name} structure version at 0x{offset:X}")
+    if (
+        structure_length < IMAGE_HEADER_FIELDS_SIZE
+        or structure_length % IMAGE_ALIGNMENT != 0
+        or signature_length == 0
+        or signature_length > structure_length
+    ):
+        raise ProtocolError(f"Invalid {name} structure bounds at 0x{offset:X}")
+    if payload_length == 0 or payload_length % CODE_ALIGNMENT != 0:
+        raise ProtocolError(f"Invalid {name} payload length at 0x{offset:X}")
+
+    image = _CodeImage(offset, structure_length, payload_length)
+    if image.end > len(file_data):
+        raise ProtocolError(f"Truncated {name} payload at 0x{offset:X}")
+    return image
+
+
+def _parse_ddr_params(file_data: bytes, offset: int) -> _DdrParamsImage:
+    """Validate a DDR parameter header, board map, and all declared tables."""
+    if offset + DDR_PARAMS_FIELDS_SIZE > len(file_data):
+        raise ProtocolError(f"Truncated DDR params header at 0x{offset:X}")
+
+    magic, version, structure_length, signature_length = struct.unpack_from(
+        "<4I", file_data, offset,
+    )
+    params_area_offset, table_size, table_count = struct.unpack_from(
+        "<3I", file_data, offset + 32,
+    )
+    board_mapping = file_data[offset + 300:offset + 308]
+
+    if magic != CV6XX_DDR_PARAMS_MAGIC:
+        raise ProtocolError(f"Invalid DDR params magic at 0x{offset:X}")
+    if version == 0:
+        raise ProtocolError(f"Invalid DDR params structure version at 0x{offset:X}")
+    if (
+        structure_length < DDR_PARAMS_FIELDS_SIZE
+        or structure_length % IMAGE_ALIGNMENT != 0
+        or signature_length == 0
+        or signature_length > structure_length
+        or params_area_offset % IMAGE_ALIGNMENT != 0
+    ):
+        raise ProtocolError(f"Invalid DDR params structure bounds at 0x{offset:X}")
+    if (
+        table_size == 0
+        or table_size % IMAGE_ALIGNMENT != 0
+        or not 1 <= table_count <= MAX_DDR_TABLES
+    ):
+        raise ProtocolError(f"Invalid DDR table dimensions at 0x{offset:X}")
+    if not any(index < table_count for index in board_mapping):
+        raise ProtocolError(f"DDR board mapping has no valid table at 0x{offset:X}")
+    if any(index != 0xFF and index >= table_count for index in board_mapping):
+        raise ProtocolError(f"DDR board mapping is out of range at 0x{offset:X}")
+
+    table_offset = offset + structure_length + params_area_offset
+    params = _DdrParamsImage(
+        offset,
+        structure_length,
+        table_offset,
+        table_size,
+        table_count,
+        board_mapping,
+    )
+    if params.tables_end > len(file_data):
+        raise ProtocolError(f"Truncated DDR tables at 0x{offset:X}")
+    return params
+
+
 def parse_cv6xx_boot(file_data: bytes) -> CV6xxBootParts:
     """Parse a CV6xx composite boot file into its constituent parts.
 
-    The file layout:
-    - Offset 2048: GSL (magic 0x4BB4D22D), length at offset 2084
-    - After GSL + 1024: DDR params (magic 0x4B87A52D)
-    - After DDR params: U-Boot (magic 0x4BF01E2D)
+    Image-tool generations use different key and image-header sizes, placing
+    the GSL header at offsets including 0x800 and 0x1200. Locate a candidate
+    header, then accept it only when its declared payload is followed by a
+    structurally valid DDR parameter image and U-Boot image.
     """
-    # 1. GSL
-    magic_gsl = struct.unpack("<I", file_data[2048:2052])[0]
-    if magic_gsl != CV6XX_GSL_MAGIC:
-        raise ProtocolError(
-            f"Invalid GSL magic: expected 0x{CV6XX_GSL_MAGIC:08X}, "
-            f"got 0x{magic_gsl:08X}"
-        )
-    gsl_len = struct.unpack("<I", file_data[2084:2088])[0]
-    gsl_size = gsl_len + 3072
-    gsl_data = file_data[:gsl_size]
+    layouts: list[CV6xxBootParts] = []
+    gsl_scan_end = min(len(file_data), MAX_GSL_HEADER_OFFSET + 4)
 
-    # 2. DDR Params
-    params_start = gsl_size + 1024
-    magic_params = struct.unpack("<I", file_data[params_start:params_start + 4])[0]
-    if magic_params != CV6XX_DDR_PARAMS_MAGIC:
-        raise ProtocolError(
-            f"Invalid DDR params magic: expected 0x{CV6XX_DDR_PARAMS_MAGIC:08X}, "
-            f"got 0x{magic_params:08X}"
-        )
+    for gsl_offset in _magic_offsets(file_data, CV6XX_GSL_MAGIC, end=gsl_scan_end):
+        try:
+            gsl = _parse_code_image(file_data, gsl_offset, CV6XX_GSL_MAGIC, "GSL")
+        except ProtocolError:
+            continue
 
-    offset_32 = struct.unpack("<I", file_data[params_start + 32:params_start + 36])[0]
-    table_size = struct.unpack("<I", file_data[params_start + 36:params_start + 40])[0]
-    table_count = struct.unpack("<I", file_data[params_start + 40:params_start + 44])[0]
-    board_mapping = file_data[params_start + 300:params_start + 308]
+        params_scan_end = min(len(file_data), gsl.end + MAX_SECTION_GAP + 4)
+        for params_offset in _magic_offsets(
+            file_data,
+            CV6XX_DDR_PARAMS_MAGIC,
+            start=gsl.end,
+            end=params_scan_end,
+        ):
+            try:
+                params = _parse_ddr_params(file_data, params_offset)
+                uboot = _parse_code_image(
+                    file_data,
+                    params.tables_end,
+                    CV6XX_UBOOT_MAGIC,
+                    "U-Boot",
+                )
+            except ProtocolError:
+                continue
 
-    # 3. U-Boot
-    uboot_magic_bytes = struct.pack("<I", CV6XX_UBOOT_MAGIC)
-    uboot_magic_offset = file_data.find(uboot_magic_bytes, params_start)
-    if uboot_magic_offset == -1:
-        raise ProtocolError(f"U-Boot magic 0x{CV6XX_UBOOT_MAGIC:08X} not found")
+            layouts.append(CV6xxBootParts(
+                gsl_data=file_data[:gsl.end],
+                gsl_size=gsl.end,
+                params_start=params.offset,
+                offset_32=params.table_offset - params.offset - params.structure_length,
+                table_count=params.table_count,
+                table_size=params.table_size,
+                board_mapping=params.board_mapping,
+                uboot_data=file_data[uboot.offset:uboot.end],
+                file_data=file_data,
+            ))
 
-    uboot_len = struct.unpack("<I", file_data[uboot_magic_offset + 36:uboot_magic_offset + 40])[0]
-    uboot_size = uboot_len + 1024
-    uboot_data = file_data[uboot_magic_offset:uboot_magic_offset + uboot_size]
-
-    return CV6xxBootParts(
-        gsl_data=gsl_data,
-        gsl_size=gsl_size,
-        params_start=params_start,
-        offset_32=offset_32,
-        table_count=table_count,
-        table_size=table_size,
-        board_mapping=board_mapping,
-        uboot_data=uboot_data,
-        file_data=file_data,
-    )
+    if not layouts:
+        raise ProtocolError("No structurally valid CV6xx GSL/DDR/U-Boot layout found")
+    if len(layouts) > 1:
+        raise ProtocolError("Ambiguous CV6xx boot image: multiple valid GSL layouts found")
+    return layouts[0]
 
 
 def wrap_cv6xx_payload(header_source: bytes, payload: bytes) -> bytes:
@@ -150,11 +284,17 @@ def build_ddr_table(parts: CV6xxBootParts, board_id: int = 0) -> bytes:
     if mapped_index >= parts.table_count:
         mapped_index = 0
 
+    params_structure_length = struct.unpack_from(
+        "<I", parts.file_data, parts.params_start + 8,
+    )[0]
+    first_table_offset = (
+        parts.params_start + params_structure_length + parts.offset_32
+    )
+
     ddr_buf = bytearray()
-    # Header portion from after GSL
-    ddr_buf.extend(parts.file_data[parts.gsl_size:parts.gsl_size + 2048])
-    # Selected DDR table
-    table_offset = parts.gsl_size + 2048 + parts.offset_32 + (mapped_index * parts.table_size)
+    # Preserve the REE key and DDR image headers, then append the selected table.
+    ddr_buf.extend(parts.file_data[parts.gsl_size:first_table_offset])
+    table_offset = first_table_offset + (mapped_index * parts.table_size)
     ddr_buf.extend(parts.file_data[table_offset:table_offset + parts.table_size])
 
     return bytes(ddr_buf)
