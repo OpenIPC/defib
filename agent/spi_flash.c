@@ -652,7 +652,8 @@ static uint8_t nand_read(uint32_t row, uint32_t column,
     return stalled ? 0xFF : status;
 }
 
-void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
+int flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
+    int stalled = 0;
     if (current_flash_type == FLASH_TYPE_NAND) {
         /* NAND: convert byte offset to (page, column) and read page-by-page
          * via PAGE_READ + READ_FROM_CACHE.  No mode-switching — NAND lives
@@ -662,12 +663,13 @@ void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
             uint32_t col = addr % NAND_PAGE_SIZE;
             uint32_t in_page = NAND_PAGE_SIZE - col;
             uint32_t chunk = (len < in_page) ? len : in_page;
-            nand_read(row, col, buf, chunk);
+            if (nand_read(row, col, buf, chunk) == 0xFF)
+                stalled = 1;   /* nand_read's "never finished" */
             buf += chunk;
             addr += chunk;
             len -= chunk;
         }
-        return;
+        return stalled ? -1 : 0;
     }
 
     /* NOR: register-based reads (normal mode) instead of memory window.
@@ -682,7 +684,8 @@ void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
         fmc_reg(FMC_DATA_NUM) = chunk;
         fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(3);
         fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
-        fmc_wait_ready();
+        if (fmc_wait_ready())
+            stalled = 1;
 
         for (uint32_t i = 0; i < chunk; i++)
             buf[i] = iobuf[i];
@@ -693,6 +696,7 @@ void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
     }
 
     fmc_enter_boot();
+    return stalled ? -1 : 0;
 }
 
 uint8_t flash_unlock_debug[3];

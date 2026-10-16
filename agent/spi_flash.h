@@ -48,7 +48,9 @@ typedef struct {
 int flash_init(flash_info_t *info);
 
 /* Read flash via memory-mapped window (fastest) */
-void flash_read(uint32_t addr, uint8_t *buf, uint32_t len);
+/* Returns 0, or -1 when a controller register op never finished: buf then
+ * holds stale I/O-buffer bytes, not flash contents. */
+int flash_read(uint32_t addr, uint8_t *buf, uint32_t len);
 
 /* Read flash JEDEC ID */
 void flash_read_id(uint8_t id[3]);
