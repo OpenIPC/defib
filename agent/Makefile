@@ -265,7 +265,7 @@ SPI_DRIVER ?= fmc100
 ifeq ($(SPI_DRIVER),fmc100)
   SPI_FLASH_SRC = spi_flash.c
   # CMD_NAND (SPI NAND study ops) drives the FMC100 page engine.
-  CFLAGS += -DHAVE_NAND_STUDY
+  CFLAGS += -DHAVE_NAND_STUDY -DSPI_DRIVER_FMC100
 else
   SPI_FLASH_SRC = spi_flash_$(SPI_DRIVER).c
 endif

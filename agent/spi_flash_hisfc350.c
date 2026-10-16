@@ -305,14 +305,16 @@ static void read_step(uint32_t off, const volatile uint8_t *p,
     for (uint32_t i = 0; i < n; i++) dst[i] = p[i];
 }
 
-void flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
+int flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
+    /* Memory-mapped (banked) reads: nothing here can stall. */
     if (!needs_bank_switch) {
         const volatile uint8_t *src = (const volatile uint8_t *)(FLASH_MEM + addr);
         for (uint32_t i = 0; i < len; i++) buf[i] = src[i];
-        return;
+        return 0;
     }
     struct read_ctx c = { buf, addr };
     flash_walk_banked(addr, len, read_step, &c);
+    return 0;
 }
 
 struct crc_ctx { uint32_t crc; };
