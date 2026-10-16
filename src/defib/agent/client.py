@@ -34,9 +34,7 @@ from defib.agent.protocol import (
     RSP_DATA,
     RSP_INFO,
     RSP_MEMBW,
-    RSP_READY,
     RSP_SCAN,
-    recv_packet,
     recv_response,
     send_packet,
     wait_for_ready,
@@ -414,10 +412,8 @@ class FlashAgentClient:
         # `agent-read-silent-packet-loss-on-long-uart-streams-2026-05-15`.
         expected_seq = 0
         while True:
-            cmd, data = await recv_packet(self._transport, timeout=60.0)
-            if cmd == RSP_READY:
-                continue
-            elif cmd == RSP_DATA and len(data) > 2:
+            cmd, data = await recv_response(self._transport, timeout=60.0)
+            if cmd == RSP_DATA and len(data) > 2:
                 seq = data[0] | (data[1] << 8)
                 if seq != expected_seq:
                     raise RuntimeError(
@@ -622,9 +618,7 @@ class FlashAgentClient:
 
         # Receive progress packets (RSP_DATA with sectors_done count)
         for _ in range(num_sectors):
-            cmd, data = await recv_packet(self._transport, timeout=30.0)
-            if cmd == RSP_READY:
-                continue
+            cmd, data = await recv_response(self._transport, timeout=30.0)
             if cmd == RSP_DATA and len(data) >= 2:
                 done = data[0] | (data[1] << 8)
                 if on_progress:
@@ -714,10 +708,8 @@ class FlashAgentClient:
             # Wait for progress — agent sends RSP_DATA for both data and
             # skipped sectors (immediately for skipped, after receive for data).
             while True:
-                cmd, data_pkt = await recv_packet(self._transport, timeout=120.0)
-                if cmd == RSP_READY:
-                    continue
-                elif cmd == RSP_DATA:
+                cmd, data_pkt = await recv_response(self._transport, timeout=120.0)
+                if cmd == RSP_DATA:
                     done = data_pkt[0] | (data_pkt[1] << 8)
                     total_steps = data_pkt[2] | (data_pkt[3] << 8)
                     if on_progress and total_steps > 0:
@@ -733,10 +725,8 @@ class FlashAgentClient:
 
         # Wait for final ACK (agent finishes programming last sector)
         while True:
-            cmd, data_pkt = await recv_packet(self._transport, timeout=120.0)
-            if cmd == RSP_READY:
-                continue
-            elif cmd == RSP_ACK:
+            cmd, data_pkt = await recv_response(self._transport, timeout=120.0)
+            if cmd == RSP_ACK:
                 return data_pkt[0] == ACK_OK
             elif cmd == RSP_DATA:
                 continue  # Late progress packet
@@ -873,9 +863,7 @@ class FlashAgentClient:
         sectors: list[SectorResult] = []
 
         while len(sectors) < num_sectors:
-            cmd, data = await recv_packet(self._transport, timeout=30.0)
-            if cmd == RSP_READY:
-                continue
+            cmd, data = await recv_response(self._transport, timeout=30.0)
             if cmd == RSP_ACK:
                 break
             if cmd != RSP_SCAN:

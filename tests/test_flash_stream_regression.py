@@ -4,7 +4,8 @@ These tests cover bugs that caused data corruption on real cameras:
 1. COBS trailing zero strip: ~1/256 packets lost trailing 0x00 from CRC32
 2. CRC32 high-byte UB: uint8_t << 24 is undefined when value >= 128
 3. _recv_packet_sync partial frame stashing: corrupted next call
-4. recv_response READY timeout: READY packets consumed timeout budget
+4. recv_response READY timeout: READY must neither crowd out a response nor
+   extend the wait (an idle agent's READYs once made it endless)
 5. FMC memory window 1MB wrap: reads repeated every 1MB (masking write bugs)
 6. Sector bitmap: host and agent must agree on bit ordering
 """
@@ -191,45 +192,52 @@ class TestPartialFrameStashing:
 
 
 # ---------------------------------------------------------------------------
-# Bug 3: recv_response timeout consumed by READY packets
-# Multiple READY packets consumed the timeout budget meant for the actual
-# response. Fix: reset deadline after each READY skip.
+# Bug 3: recv_response and READY packets
+# READYs queued before a response must not crowd it out (the original bug),
+# and READYs must never extend the wait either: the agent sends READY only
+# from its idle loop, so a READY after a command means the command was lost.
+# Resetting the deadline on each READY turned that into a wait with no end:
+# `defib agent flash` sat 12 minutes on hi3536dv100 with nothing written.
 # ---------------------------------------------------------------------------
 
+class _BeaconTransport:
+    """An agent that lost the command: idle, a READY every 20 ms, forever."""
+
+    def __init__(self, then: bytes = b"") -> None:
+        self._then = bytearray(then)
+
+    async def read(self, size: int, timeout: float | None = None) -> bytes:
+        import asyncio
+        if self._then:
+            out = bytes(self._then)
+            self._then.clear()
+            return out
+        await asyncio.sleep(0.02)
+        return make_device_packet(RSP_READY, b"DEFIB")
+
+    async def write(self, data: bytes) -> None:
+        pass
+
+
 class TestRecvResponseReadyTimeout:
-    def test_ready_does_not_consume_timeout(self):
-        """recv_response with many READYs followed by ACK must succeed.
+    @pytest.mark.asyncio
+    async def test_queued_readys_do_not_crowd_out_the_response(self):
+        from defib.agent.protocol import recv_response
+        stale = b"".join(make_device_packet(RSP_READY, b"DEFIB") for _ in range(5))
+        t = _BeaconTransport(then=stale + make_device_packet(RSP_ACK, bytes([ACK_OK])))
+        cmd, data = await recv_response(t, timeout=1.0)
+        assert cmd == RSP_ACK and data[0] == ACK_OK
 
-        Bug: READY packets consumed the timeout budget. After receiving
-        several READYs, there was no time left for the actual response.
-        Fix: reset deadline after each READY skip.
-        """
-        port = FakePort()
-        # 5 READY packets then the real response
-        for _ in range(5):
-            port.feed(make_device_packet(RSP_READY, b"DEFIB"))
-        port.feed(make_device_packet(RSP_ACK, bytes([ACK_OK])))
-
-        # recv_response uses _recv_packet_sync when transport has _port
-        # so we test via the sync path directly
+    @pytest.mark.asyncio
+    async def test_endless_readys_time_out_instead_of_waiting_forever(self):
+        import asyncio
         import time
-        from defib.agent.protocol import RSP_READY as _READY
-
-        deadline = time.monotonic() + 2.0
-        result_cmd = None
-        result_data = None
-        while time.monotonic() < deadline:
-            remaining = deadline - time.monotonic()
-            cmd, data = _recv_packet_sync(port, timeout=remaining)
-            if cmd != _READY:
-                result_cmd = cmd
-                result_data = data
-                break
-            # Reset deadline after READY (the fix)
-            deadline = time.monotonic() + 2.0
-
-        assert result_cmd == RSP_ACK
-        assert result_data[0] == ACK_OK
+        from defib.agent.protocol import recv_response
+        from defib.transport.base import TransportTimeout
+        t0 = time.monotonic()
+        with pytest.raises(TransportTimeout):
+            await asyncio.wait_for(recv_response(_BeaconTransport(), timeout=0.3), timeout=3.0)
+        assert time.monotonic() - t0 < 1.5
 
 
 # ---------------------------------------------------------------------------
