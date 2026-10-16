@@ -1409,7 +1409,6 @@ static void handle_scan(const uint8_t *data __attribute__((unused)),
 
     for (uint32_t s = 0; s < num_sectors; s++) {
         uint8_t status = SCAN_GOOD;
-        const uint8_t *ptr;
 
         proto_drain_fifo();
 
@@ -1429,30 +1428,33 @@ static void handle_scan(const uint8_t *data __attribute__((unused)),
                 }
                 continue;
             }
-            /* Good block: read data area into RAM buf for the rest of the
-             * scan (memory-mapped reads don't work on NAND). */
-            flash_read(s * sector_sz, scan_buf, sector_sz);
-            ptr = scan_buf;
-        } else {
-            /* NOR: direct mem-mapped read (FMC boot-mode window). */
-            ptr = (const uint8_t *)(FLASH_MEM + s * sector_sz);
+            /* Good block: its data area is read below through
+             * flash_read(), as NOR's is (memory-mapped reads don't work on
+             * NAND). */
         }
 
-        /* Pass 1: CRC32 */
-        uint32_t crc1 = crc32(0, ptr, sector_sz);
-
-        proto_drain_fifo();
-
-        /* Pattern check: sample first byte, scan for uniformity */
-        uint8_t first = ptr[0];
-        int all_ff = (first == 0xFF);
-        int all_same = 1;
-
-        for (uint32_t i = 1; i < sector_sz; i++) {
-            uint8_t b = ptr[i];
-            if (b != 0xFF) all_ff = 0;
-            if (b != first) all_same = 0;
-            if (!all_ff && !all_same) break;
+        /* Pass 1: CRC32 and the uniformity check, over bytes read through
+         * the register path. NOR used to read the memory-mapped boot-mode
+         * window, which wraps at 1 MiB on some SoCs (hi3536dv100): every
+         * sector past the first MiB was scanned as a copy of one in it,
+         * while CMD_READ and CMD_CRC32 (which use flash_read) read the
+         * chip correctly. NOR sectors larger than scan_buf go in chunks. */
+        uint32_t crc1 = 0;
+        uint8_t first = 0;
+        int all_ff = 1, all_same = 1;
+        for (uint32_t off = 0; off < sector_sz; ) {
+            uint32_t n = sector_sz - off;
+            if (n > sizeof(scan_buf)) n = sizeof(scan_buf);
+            flash_read(s * sector_sz + off, scan_buf, n);
+            crc1 = crc32(crc1, scan_buf, n);
+            if (off == 0) first = scan_buf[0];
+            for (uint32_t i = 0; i < n && (all_ff || all_same); i++) {
+                uint8_t b = scan_buf[i];
+                if (b != 0xFF) all_ff = 0;
+                if (b != first) all_same = 0;
+            }
+            off += n;
+            proto_drain_fifo();
         }
 
         if (all_ff) {
@@ -1462,13 +1464,14 @@ static void handle_scan(const uint8_t *data __attribute__((unused)),
         } else if (all_same) {
             status = SCAN_STUCK_PAT;
         } else if (!is_nand) {
-            /* Pass 2: stability check — re-read CRC.  NOR only because
-             * NAND re-reads always go through the same on-chip ECC and
-             * would never report differences (the chip auto-corrects
-             * single-bit flips).  For NAND, ECC error would be a
-             * separate signal we don't yet expose. */
+            /* Pass 2: stability check -- an independent second read of
+             * the sector, through the same register path.  NOR only
+             * because NAND re-reads always go through the same on-chip
+             * ECC and would never report differences (the chip
+             * auto-corrects single-bit flips).  For NAND, ECC error would
+             * be a separate signal we don't yet expose. */
             proto_drain_fifo();
-            uint32_t crc2 = crc32(0, ptr, sector_sz);
+            uint32_t crc2 = flash_crc32(s * sector_sz, sector_sz);
             if (crc2 != crc1) status = SCAN_UNSTABLE;
         }
 
