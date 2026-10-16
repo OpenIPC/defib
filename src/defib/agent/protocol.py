@@ -267,21 +267,22 @@ async def recv_packet(transport: Transport, timeout: float = 5.0) -> tuple[int, 
 async def recv_response(transport: Transport, timeout: float = 5.0) -> tuple[int, bytes]:
     """Receive a response packet, skipping stale READY packets.
 
-    Timeout resets after each READY skip — READY packets are expected
-    background traffic and shouldn't consume the timeout budget.
+    READY is skipped, but it never extends the wait. The agent sends READY
+    only from its idle loop (agent/main.c, every ~2 s with no command in
+    hand), so one that arrives after a command was sent means the agent is
+    idle: it never got the command. Resetting the deadline on each READY
+    turned a lost command into a wait that could not end (an `agent flash`
+    sat 12 minutes on hi3536dv100 with nothing written).
     """
     import time
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         cmd, data = await recv_packet(transport, remaining)
         if cmd != RSP_READY:
             return cmd, data
-        # Reset deadline after READY — don't let background READYs
-        # consume the timeout meant for the actual response
-        deadline = time.monotonic() + timeout
     raise TransportTimeout(f"No response within {timeout}s")
 
 
