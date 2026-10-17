@@ -219,9 +219,14 @@ def uboot_sf_lock_unsupported(response: str) -> bool:
     # subcommand. That is compatibility information only when the table itself
     # contains no sf lock entry. If sf lock is listed, a Usage response means our
     # invocation was rejected and must remain a hard failure.
-    usage_seen = any(line.startswith("usage:") for line in lines)
+    #
+    # Only the table counts. A console that echoes the command puts "sf lock 0"
+    # above "Usage:", and that echo is not an entry: OpenIPC/u-boot's sf has no
+    # lock subcommand at all and answers exactly this way.
+    usage_at = next((i for i, line in enumerate(lines) if line.startswith("usage:")), None)
+    usage_seen = usage_at is not None
     sf_usage: list[str] = []
-    for line in lines:
+    for line in lines[usage_at or 0:] if usage_seen else []:
         candidate = line.removeprefix("usage:").strip() if line.startswith("usage:") else line
         if re.match(r"^sf(?:\s|$)", candidate):
             sf_usage.append(candidate)
@@ -381,6 +386,28 @@ def detect_nor_size_mb(response: str) -> int | None:
             if value % divisor == 0:
                 return value // divisor
     return None
+
+
+NOR_SIZE_CANDIDATES_MB = (32, 16, 8)
+
+
+def nor_size_probe_read(ram_addr: int, size_mb: int) -> str:
+    """A 16-byte ``sf read`` that only a chip of at least ``size_mb`` accepts.
+
+    OpenIPC/u-boot (openipc-hisilicon) probes the flash at boot and its
+    ``sf probe`` prints nothing at the prompt, so the size it found is not on
+    offer; but ``sf read`` refuses an offset past the chip ("Offset exceeds
+    device limit"). The largest candidate whose last 16 bytes read is the size.
+    """
+    return f"sf read 0x{ram_addr:x} 0x{size_mb * 1024 * 1024 - 16:x} 0x10"
+
+
+def sf_read_succeeded(response: str) -> bool:
+    """True when ``sf read`` reported the read done and nothing refused it."""
+    text = response.lower()
+    if "exceeds" in text or "past flash size" in text or "error" in text:
+        return False
+    return "read: ok" in text
 
 
 def select_nor_size_mb(

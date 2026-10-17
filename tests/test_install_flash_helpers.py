@@ -18,6 +18,7 @@ from defib.install.layout import (
     uboot_sf_lock_unsupported,
     verify_spi_environment_crc,
 )
+from defib.install.layout import nor_size_probe_read, sf_read_succeeded
 
 
 def test_generic_tftp_keeps_explicit_ram_address():
@@ -182,6 +183,22 @@ def test_sf_lock_usage_without_lock_entry_is_unsupported():
     assert uboot_sf_lock_unsupported(response) is True
 
 
+def test_sf_lock_echoed_above_usage_without_lock_entry_is_unsupported():
+    """OpenIPC/u-boot (openipc-hisilicon): the console echoes the command, then
+    prints the sf table, which has `sf protect` but no `sf lock`."""
+    response = (
+        "sf lock 0\n"
+        "sf - SPI flash sub-system\n"
+        "\n"
+        "Usage:\n"
+        "sf probe [[bus:]cs] [hz] [mode] - init flash device on given SPI bus\n"
+        "sf read addr offset|partition len       - read `len' bytes\n"
+        "sf protect lock/unlock sector len       - protect/unprotect 'len' bytes\n"
+        "OpenIPC # "
+    )
+    assert uboot_sf_lock_unsupported(response) is True
+
+
 def test_sf_lock_usage_with_lock_entry_is_not_unsupported():
     response = "Usage:\nsf lock [offset] [len]\nOpenIPC # "
     assert uboot_sf_lock_unsupported(response) is False
@@ -319,3 +336,17 @@ def test_persisted_spi_environment_crc_rejects_invalid_header():
                 ram_addr=0x82000000,
             )
         )
+
+
+def test_nor_size_probe_read_targets_the_last_16_bytes():
+    assert nor_size_probe_read(0x42000000, 8) == "sf read 0x42000000 0x7ffff0 0x10"
+    assert nor_size_probe_read(0x42000000, 16) == "sf read 0x42000000 0xfffff0 0x10"
+
+
+def test_sf_read_succeeded_on_openipc_hisilicon_output():
+    ok = "device 0 offset 0x7ffff0, size 0x10\nSF: 16 bytes @ 0x7ffff0 Read: OK\nOpenIPC # "
+    past = "Offset exceeds device limit\nsf - SPI flash sub-system\n\nUsage:\nOpenIPC # "
+    mainline = "ERROR: attempting read past flash size (0x800000)\nOpenIPC # "
+    assert sf_read_succeeded(ok)
+    assert not sf_read_succeeded(past)
+    assert not sf_read_succeeded(mainline)

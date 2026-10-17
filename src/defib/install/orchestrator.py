@@ -24,7 +24,10 @@ from defib.install.layout import (
     erased_region_crc,
     mtdparts_partition_offset,
     nand_bootargs,
+    NOR_SIZE_CANDIDATES_MB,
     nor_layout,
+    nor_size_probe_read,
+    sf_read_succeeded,
     nor_mtdparts,
     parse_nand_erase_range,
     parse_uboot_crc32,
@@ -860,6 +863,14 @@ async def run_install(request: InstallRequest) -> None:
             nor_erase_block = int(block_match.group(1)) * 1024
 
         detected_nor_size = detect_nor_size_mb(resp)
+        if detected_nor_size is None:
+            # A U-Boot that probed the flash at boot may print nothing here;
+            # ask the chip instead, with reads that only fit a big enough one.
+            for candidate in NOR_SIZE_CANDIDATES_MB:
+                read_resp = await _cmd(nor_size_probe_read(ram_addr, candidate), timeout=5.0)
+                if sf_read_succeeded(read_resp):
+                    detected_nor_size = candidate
+                    break
         if nor_size and detected_nor_size and nor_size != detected_nor_size:
             warn(
                 f"--nor-size {nor_size} overrides detected "
@@ -1743,6 +1754,12 @@ async def run_install(request: InstallRequest) -> None:
                 if "uboot" in stage_set:
                     pre_default_resp = await _optional_printenv("ethaddr", timeout=5.0)
                     ubi_layout_eth = parse_printenv_value(pre_default_resp, "ethaddr")
+                    # totalmem is the DRAM this U-Boot measured at boot, set in
+                    # RAM only. Linux sizes its media memory from the saved
+                    # value (set_allocator) and without one assumes 64 MB --
+                    # half of a gk7205v300.
+                    mem_resp = await _optional_printenv("totalmem", timeout=5.0)
+                    totalmem = parse_printenv_value(mem_resp, "totalmem")
                     default_resp = await _cmd("env default -a", timeout=5.0)
                     default_error = uboot_flash_command_error(default_resp)
                     if default_error:
@@ -1750,8 +1767,13 @@ async def run_install(request: InstallRequest) -> None:
                             f"env default -a failed ({default_error}): "
                             f"{default_resp.strip()[-200:]}"
                         )
+                    if totalmem:
+                        await _cmd(f"setenv totalmem {totalmem}", timeout=3.0)
                     if output == "human":
-                        console.print("  U-Boot default environment loaded")
+                        console.print(
+                            "  U-Boot default environment loaded"
+                            + (f", totalmem {totalmem}" if totalmem else "")
+                        )
             elif "env" in stage_set and nand:
                 if output == "human":
                     console.print("\n  [bold]Setting boot environment[/bold] (NAND)")

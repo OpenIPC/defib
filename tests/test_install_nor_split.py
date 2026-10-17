@@ -52,7 +52,10 @@ class FakeNorUBoot:
         self.tftp_files: dict[str, bytes] = {}
         self.ram = b""
         self.flash = bytearray(b"\x5a" * CHIP_8M)  # an old layout's leftovers
-        self.env: dict[str, str] = {"ethaddr": FACTORY_MAC, "mtdparts": "saved"}
+        # totalmem as this U-Boot sets it at boot, from the DRAM it measured.
+        self.env: dict[str, str] = {
+            "ethaddr": FACTORY_MAC, "mtdparts": "saved", "totalmem": "128M",
+        }
 
     def reply(self, command: str) -> str:
         return "".join(self._one(part.strip()) for part in command.split(";")) or "\nOpenIPC # "
@@ -63,8 +66,14 @@ class FakeNorUBoot:
         words = command.split()
         if not words:
             return ""
+        if command == "sf lock 0":
+            # This U-Boot's sf has no lock subcommand: echo, then the table.
+            return ("sf lock 0\nsf - SPI flash sub-system\n\nUsage:\n"
+                    "sf probe [[bus:]cs] [hz] [mode] - init flash device\n"
+                    "sf protect lock/unlock sector len - protect/unprotect" + prompt)
         if command == "sf probe 0":
-            return 'SF: Detected XM25QH64C with page size 256 Bytes, Block:64KB Chip:8MB' + prompt
+            # Probed at boot already: says nothing, as on the cameras.
+            return prompt
         if words[0] in ("tftpboot", "tftp"):
             self.ram = self.tftp_files[words[-1]]
             return f"Bytes transferred = {len(self.ram)} (hex)" + prompt
@@ -82,6 +91,8 @@ class FakeNorUBoot:
             return f"SF: {size} bytes @ {off:#x} Written: OK" + prompt
         if words[:2] == ["sf", "read"]:
             off, size = int(words[3], 16), int(words[4], 16)
+            if off + size > CHIP_8M:
+                return "Offset exceeds device limit\nsf - SPI flash sub-system\n\nUsage:" + prompt
             self.ram = bytes(self.flash[off:off + size])
             return f"SF: {size} bytes @ {off:#x} Read: OK" + prompt
         if words[0] == "printenv":
@@ -174,10 +185,13 @@ async def test_split_install_writes_firmware_bin_over_the_whole_chip(monkeypatch
     assert bytes(device.flash[0x50000:0x50000 + len(image)]) == image
     # Nothing of the old layout is left for U-Boot's scan or the overlay.
     assert bytes(device.flash[0x50000 + len(image):]) == b"\xff" * (CHIP_8M - 0x50000 - len(image))
+    # The chip size came from reads, since sf probe says nothing.
+    assert "sf read 0x42000000 0x7ffff0 0x10" in device.commands
     assert "sf erase 0x50000 0x7b0000" in device.commands
     # U-Boot's own defaults, the MAC carried across; no fixed-slot env.
     assert "env default -a" in device.commands
     assert device.env.get("ethaddr") == FACTORY_MAC
+    assert device.env.get("totalmem") == "128M"
     assert not any(c.startswith("setenv mtdparts") for c in device.commands)
     assert not any("bootcmdnor" in c for c in device.commands)
 
