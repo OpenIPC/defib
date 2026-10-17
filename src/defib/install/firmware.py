@@ -17,12 +17,47 @@ class FirmwareBundle:
     For a UBI-only NAND package the kernel lives inside the rootfs image
     (``/boot/fitImage`` in the UBIFS volume): ``kernel_name`` is empty and
     ``kernel`` is ``b""``.
+
+    For a split NOR package (``openipc.<board>-nor-<variant>-split.tgz``) the
+    one image is ``firmware.bin.<board>``: it is carried as the rootfs, the
+    kernel is empty, and ``split`` is set.
     """
 
     kernel_name: str
     kernel: bytes
     rootfs_name: str
     rootfs: bytes
+    split: bool = False
+
+
+ERASE_BLOCK = 0x10000
+FDT_MAGIC = b"\xd0\x0d\xfe\xed"
+SQUASHFS_MAGIC = b"hsqs"
+
+
+def split_image_end(image: bytes) -> int:
+    """Where rootfs_data starts, relative to the image, for a split firmware.bin.
+
+    The FIT's ``totalsize`` (header bytes 4..7, big-endian) rounded up to a
+    64 KiB block is where the squashfs starts; its ``bytes_used`` (superblock
+    offset 40, little-endian) rounded up the same way is where it ends. The
+    kernel's mtdsplit, U-Boot and sysupgrade all draw the same lines.
+    Raises ValueError for anything else.
+    """
+    if image[:4] != FDT_MAGIC:
+        raise ValueError("firmware.bin does not start with a FIT image")
+    fit = int.from_bytes(image[4:8], "big")
+    squash = (fit + ERASE_BLOCK - 1) // ERASE_BLOCK * ERASE_BLOCK
+    if not fit or squash + 48 > len(image) or image[squash:squash + 4] != SQUASHFS_MAGIC:
+        raise ValueError("firmware.bin has no squashfs at the 64 KiB block after its FIT")
+    used = int.from_bytes(image[squash + 40:squash + 48], "little")
+    end = squash + (used + ERASE_BLOCK - 1) // ERASE_BLOCK * ERASE_BLOCK
+    if not used or end < len(image):
+        raise ValueError(
+            "firmware.bin runs past the end of its squashfs: not an image as the "
+            "OpenIPC build packs it"
+        )
+    return end
 
 
 def _is_ubi_member(name: str) -> bool:
@@ -45,6 +80,8 @@ def load_firmware_bundle(
     rootfs_name = ""
     rootfs: bytes | None = None
     ubi_members: list[str] = []
+    split_name = ""
+    split_image: bytes | None = None
     expected_md5: dict[str, str] = {}
 
     with tarfile.open(path, "r:gz") as archive:
@@ -58,6 +95,9 @@ def load_firmware_bundle(
                 line = stream.read().decode().strip()
                 if line:
                     expected_md5[name.removesuffix(".md5sum")] = line.split()[0]
+            elif name.rsplit("/", 1)[-1].startswith("firmware.bin"):
+                split_name = name
+                split_image = stream.read()
             elif ubi_only:
                 if _is_ubi_member(name):
                     ubi_members.append(name)
@@ -70,7 +110,37 @@ def load_firmware_bundle(
                 rootfs_name = name
                 rootfs = stream.read()
 
+    if split_image is not None and not ubi_only:
+        if kernel or rootfs:
+            raise ValueError(
+                "tarball holds both firmware.bin and a separate kernel/rootfs; "
+                "expected one OpenIPC package or the other"
+            )
+        expected = expected_md5.get(split_name)
+        if expected is not None and hashlib.md5(split_image).hexdigest() != expected:
+            raise ValueError(f"MD5 mismatch for {split_name}")
+        split_image_end(split_image)
+        board = split_name.rsplit("/", 1)[-1].removeprefix("firmware.bin").lstrip(".")
+        if boards is not None and board not in boards:
+            raise ValueError(
+                f"{split_name} is built for {board or 'an unnamed board'}, not "
+                + " or ".join(sorted(boards))
+                + "; refusing to write another board's firmware"
+            )
+        return FirmwareBundle(
+            kernel_name="",
+            kernel=b"",
+            rootfs_name=split_name,
+            rootfs=split_image,
+            split=True,
+        )
+
     if ubi_only:
+        if not rootfs and split_image is not None:
+            raise ValueError(
+                f"{split_name} is a split NOR package (openipc.<board>-nor-<variant>"
+                "-split.tgz); it cannot be installed on NAND"
+            )
         if not rootfs:
             raise ValueError(
                 "tarball has no rootfs.ubi.<board> image; this NAND layout needs "

@@ -104,6 +104,33 @@ gk7205v510/v530 NAND packages are published under board `gk7205v500`.
 `install --nand` on any other chip still uses the older split layout (raw
 kernel partition, `mtdparts` and `bootcmd` set by the installer).
 
+gk7202v300, gk7205v200, gk7205v300 and gk7605v100 take their U-Boot from
+OpenIPC/u-boot (`openipc-hisilicon`), also published per flash type. That NOR
+U-Boot works out the layout at every boot, so `install` loads its default
+environment (`env default -a`, keeping the camera's `ethaddr`) instead of
+writing `mtdparts` and `bootcmd`. Besides the fixed-slot package, their firmware
+ships a split NOR package, `openipc.<board>-nor-<variant>-split.tgz`, and
+`install` recognises it by its contents:
+
+| Offset | Size | Contents |
+|--------|------|----------|
+| `0x000000` | 256K | boot: `u-boot-<chip>-nor.bin` |
+| `0x040000` | 64K | env |
+| `0x050000` | rest of chip | firmware: `firmware.bin.<board>` (a hashed FIT, then the squashfs at the next 64 KiB); the kernel divides it into `kernel`, `rootfs` and `rootfs_data` at boot |
+
+```bash
+defib install -c gk7205v300 \
+  --firmware openipc.gk7205v300-nor-ultimate-split.tgz \
+  -p /dev/ttyUSB0 --power-cycle
+```
+
+The `rootfs` stage writes `firmware.bin` at `0x50000` and erases the rest of the
+chip, so the first boot starts with an empty overlay; the `kernel` and
+`rootfs-data` stages have nothing of their own to do. Only that U-Boot boots the
+image: a plan without the `uboot` stage warns that the one already on the flash
+must be it. See the [OpenIPC wiki](https://github.com/OpenIPC/wiki/blob/master/en/nor-split-layout.md)
+for the layout itself.
+
 Targets that must bootstrap through a stock U-Boot use an explicit U-Boot
 variant. For example, HiWatch DS-I203 uses:
 
@@ -135,7 +162,8 @@ cleanup behavior.
 The release U-Boot owns boot-critical hardware initialization such as DDR
 cold-init and RAM probing limits. Defib owns the layout it actually flashes: it
 detects NOR capacity, selects the standard OpenIPC 8/16/32 MiB layout, and
-persists the matching `mtdparts` before the first Linux boot. Device runtime
+persists the matching `mtdparts` before the first Linux boot (except on the
+gk7205v200 family above, whose U-Boot sets `mtdparts` itself). Device runtime
 policy such as `osmem`, Linux PHY parameters and sensor selection belongs to the
 firmware/device profile. An explicit local U-Boot can still be supplied with
 `--uboot`.

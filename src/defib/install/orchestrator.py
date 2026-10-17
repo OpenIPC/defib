@@ -13,7 +13,7 @@ from typing import NoReturn
 
 import typer
 
-from defib.install.firmware import load_firmware_bundle
+from defib.install.firmware import load_firmware_bundle, split_image_end
 from defib.install.layout import (
     NAND_LAYOUT,
     NAND_UBI_LAYOUT,
@@ -28,6 +28,7 @@ from defib.install.layout import (
     nor_mtdparts,
     parse_nand_erase_range,
     parse_uboot_crc32,
+    split_boards,
     ubi_nand_boards,
     select_nor_size_mb,
     set_uboot_env_verified,
@@ -58,6 +59,7 @@ async def run_install(request: InstallRequest) -> None:
         get_cached_path,
         has_firmware,
         pad_to_size,
+        supports_nor_split,
         uses_per_flash_type_uboot,
     )
     from defib.flashdump import get_ram_staging_addr, send_command
@@ -224,14 +226,50 @@ async def run_install(request: InstallRequest) -> None:
         if request.stages or request.skip_stages:
             console.print(f"  Stages:  [cyan]{', '.join(stages)}[/cyan]")
 
+    # The gk7205v200 family's OpenIPC/u-boot works out the NOR layout at every
+    # boot -- fixed slots or the split layout -- and owns mtdparts and bootcmd
+    # on both: its environment has no bootcmdnor to point at.
+    scanning_nor_uboot = not nand and supports_nor_split(chip)
     try:
         firmware = load_firmware_bundle(
             firmware_path,
             ubi_only=ubi_layout,
-            boards=ubi_nand_boards(chip) if ubi_layout else None,
+            boards=(
+                ubi_nand_boards(chip)
+                if ubi_layout
+                else split_boards(chip) if scanning_nor_uboot else None
+            ),
         )
     except ValueError as exc:
         fail(str(exc))
+
+    # openipc.<board>-nor-<variant>-split.tgz: one firmware.bin at 0x50000,
+    # which the kernel divides into kernel, rootfs and rootfs_data at boot.
+    split = firmware.split
+    if split:
+        if nand:
+            fail("A split NOR package (firmware.bin) cannot be installed on NAND", exit_code=2)
+        if not supports_nor_split(chip):
+            fail(f"{chip} does not use the split NOR layout (firmware.bin)", exit_code=2)
+        if has_stock_uboot:
+            fail(
+                "A stock U-Boot migration installs the fixed-slot package "
+                "(uImage and rootfs.squashfs), not firmware.bin",
+                exit_code=2,
+            )
+        if wipe_rootfs_data and "rootfs" not in stage_set:
+            fail(
+                "--wipe-rootfs-data on the split layout needs the rootfs stage: "
+                "where rootfs_data starts depends on the image written there",
+                exit_code=2,
+            )
+        if "rootfs" in stage_set and "uboot" not in stage_set:
+            warn(
+                "firmware.bin boots only on an OpenIPC U-Boot that knows the split "
+                "layout; the uboot stage is not in this plan, so the U-Boot "
+                "already on the flash must be one."
+            )
+        needs_tftp = bool(stage_set & {"uboot", "rootfs"})
 
     kernel_name = firmware.kernel_name
     kernel_data = firmware.kernel
@@ -253,6 +291,11 @@ async def run_install(request: InstallRequest) -> None:
         if ubi_layout:
             console.print("  Kernel: [cyan]inside the UBI image (/boot/fitImage)[/cyan]")
             console.print(f"  UBI:    [cyan]{rootfs_name}[/cyan] ({len(rootfs_data)} bytes)")
+        elif split:
+            console.print(
+                f"  Image:  [cyan]{rootfs_name}[/cyan] ({len(rootfs_data)} bytes; "
+                "split NOR layout, FIT + squashfs at 0x50000)"
+            )
         else:
             console.print(f"  Kernel: [cyan]{kernel_name}[/cyan] ({len(kernel_data)} bytes)")
             console.print(f"  Rootfs: [cyan]{rootfs_name}[/cyan] ({len(rootfs_data)} bytes)")
@@ -834,9 +877,18 @@ async def run_install(request: InstallRequest) -> None:
 
         k_off, k_sz = layout["kernel"]
         r_off, r_sz = layout["rootfs"]
-        if len(kernel_data) > k_sz:
+        if split:
+            # One image from the kernel offset; rootfs_data takes what is left,
+            # and needs at least one erase block of it.
+            chip_end = nor_size * 1024 * 1024
+            if k_off + split_image_end(rootfs_data) + nor_erase_block > chip_end:
+                await close_and_fail(
+                    f"{rootfs_name} does not fit {nor_size} MiB NOR with room "
+                    f"for settings: it ends at 0x{k_off + split_image_end(rootfs_data):X}"
+                )
+        elif len(kernel_data) > k_sz:
             await close_and_fail(f"Kernel too large: {len(kernel_data)} > {k_sz}")
-        if len(rootfs_data) > r_sz:
+        elif len(rootfs_data) > r_sz:
             await close_and_fail(f"Rootfs too large: {len(rootfs_data)} > {r_sz}")
 
         persistent_nor_stages = {"uboot", "kernel", "rootfs", "rootfs-data", "env"}
@@ -858,6 +910,11 @@ async def run_install(request: InstallRequest) -> None:
         assert layout is not None
         k_off, k_sz = layout["kernel"]
         r_off, r_sz = layout["rootfs"]
+        if split:
+            # firmware.bin goes where the kernel slot starts, and the erase
+            # runs to the end of the chip: nothing of the old layout survives
+            # to be found by U-Boot's scan or mistaken for an overlay.
+            r_off, r_sz = k_off, nor_size * 1024 * 1024 - k_off
 
     # --- Step 5: Pick a TFTP backend, stage / start, then drive U-Boot ---
     #
@@ -890,7 +947,7 @@ async def run_install(request: InstallRequest) -> None:
     tftp_files: dict[str, bytes] = {}
     if "uboot" in stage_set:
         tftp_files[tftp_alias["uboot"]] = uboot_data
-    if "kernel" in stage_set and not ubi_layout:
+    if "kernel" in stage_set and not ubi_layout and not split:
         tftp_files[tftp_alias["kernel"]] = kernel_data
     if "rootfs" in stage_set:
         tftp_files[tftp_alias["rootfs"]] = rootfs_data
@@ -1282,6 +1339,12 @@ async def run_install(request: InstallRequest) -> None:
                         "layout; the kernel ships inside the UBI image as "
                         "/boot/fitImage (written by the rootfs stage). Nothing to do."
                     )
+            elif "kernel" in stage_set and split:
+                if output == "human":
+                    console.print(
+                        "\n  [bold]kernel[/bold]: the FIT at the start of "
+                        "firmware.bin (written by the rootfs stage). Nothing to do."
+                    )
             elif "kernel" in stage_set:
                 await tftp_and_flash(
                     "kernel", tftp_alias["kernel"], kernel_data, k_off, k_sz
@@ -1487,8 +1550,19 @@ async def run_install(request: InstallRequest) -> None:
                     console.print("  [green]rootfs (UBI) OK[/green]")
             elif "rootfs" in stage_set:
                 await tftp_and_flash(
-                    "rootfs", tftp_alias["rootfs"], rootfs_data, r_off, r_sz
+                    "firmware.bin" if split else "rootfs",
+                    tftp_alias["rootfs"], rootfs_data, r_off, r_sz,
                 )
+
+            if "rootfs-data" in stage_set and split and output == "human":
+                if "rootfs" in stage_set:
+                    note = (
+                        "the rootfs stage erased everything after firmware.bin; "
+                        "the first boot makes an empty overlay there"
+                    )
+                else:
+                    note = "the existing overlay is left untouched"
+                console.print(f"\n  [bold]rootfs-data[/bold]: {note}. Nothing to do.")
 
             if "rootfs-data" in stage_set and ubi_layout and output == "human":
                 if "rootfs" in stage_set:
@@ -1499,6 +1573,7 @@ async def run_install(request: InstallRequest) -> None:
 
             erase_rootfs_data = (
                 not nand
+                and not split
                 and (
                     wipe_rootfs_data
                     or ("rootfs-data" in stage_set and has_stock_uboot)
@@ -1643,6 +1718,27 @@ async def run_install(request: InstallRequest) -> None:
                 if output == "human":
                     console.print(
                         "\n  [bold]Setting boot environment[/bold] (NAND UBI layout)"
+                    )
+                if "uboot" in stage_set:
+                    pre_default_resp = await _optional_printenv("ethaddr", timeout=5.0)
+                    ubi_layout_eth = parse_printenv_value(pre_default_resp, "ethaddr")
+                    default_resp = await _cmd("env default -a", timeout=5.0)
+                    default_error = uboot_flash_command_error(default_resp)
+                    if default_error:
+                        raise RuntimeError(
+                            f"env default -a failed ({default_error}): "
+                            f"{default_resp.strip()[-200:]}"
+                        )
+                    if output == "human":
+                        console.print("  U-Boot default environment loaded")
+            elif "env" in stage_set and scanning_nor_uboot and not has_stock_uboot:
+                # This U-Boot works out the NOR layout itself at every boot and
+                # sets mtdparts and the root device to match, so its defaults
+                # are the environment; only the camera's MAC is carried across.
+                if output == "human":
+                    console.print(
+                        "\n  [bold]Setting boot environment[/bold] "
+                        "(U-Boot scans the NOR layout)"
                     )
                 if "uboot" in stage_set:
                     pre_default_resp = await _optional_printenv("ethaddr", timeout=5.0)

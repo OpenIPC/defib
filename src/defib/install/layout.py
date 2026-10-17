@@ -67,6 +67,18 @@ def ubi_nand_boards(chip: str) -> set[str]:
     base = chip.partition(":")[0]
     return {base, _UBI_NAND_BOARD.get(base, base)}
 
+def split_boards(chip: str) -> set[str]:
+    """The ``firmware.bin.<board>`` suffixes a split NOR package for ``chip`` may carry.
+
+    Aliased chips (gk7205v210, gk7201v200, ...) install the image of the SoC
+    they are published under.
+    """
+    from defib.firmware import CHIP_TO_FIRMWARE
+
+    base = chip.partition(":")[0].lower()
+    return {base, CHIP_TO_FIRMWARE.get(base, base)}
+
+
 _MTDPART_RE = re.compile(
     r"^(?P<size>-|(?:0x[0-9a-f]+|\d+)[kmg]?)"
     r"(?:@(?P<offset>(?:0x[0-9a-f]+|\d+)[kmg]?))?"
