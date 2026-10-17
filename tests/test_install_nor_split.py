@@ -165,7 +165,8 @@ def test_split_package_for_another_board(tmp_path):
     (b"\x27\x05\x19\x56" + b"\x00" * 0x1FFFC, "does not start with a FIT"),
     (_split_image()[:0x20000] + b"\x00" * 0x30000, "no squashfs"),
     (_split_image() + b"\x00" * BLOCK, "runs past the end of its squashfs"),
-])
+    (_split_image()[:0x20000 + 0x2E000], "truncated"),
+], ids=["uimage", "no-squashfs", "trailing-bytes", "truncated"])
 def test_split_package_shape_is_checked(tmp_path, image, reason):
     with pytest.raises(ValueError, match=reason):
         load_firmware_bundle(_split_package(tmp_path / "fw.tgz", image=image))
@@ -243,3 +244,44 @@ async def test_split_install_refusals(monkeypatch, tmp_path, capsys, kwargs, cod
     assert exc.value.exit_code == code
     if kwargs.get("nand"):
         assert "cannot be installed on NAND" in capsys.readouterr().out
+
+
+def test_aliased_chip_accepts_the_nand_package_it_is_published_under():
+    from defib.install.layout import ubi_nand_boards
+
+    assert "gk7205v200" in ubi_nand_boards("gk7201v200")
+    assert "gk7205v500" in ubi_nand_boards("gk7205v510")
+
+
+@pytest.mark.asyncio
+async def test_split_erase_timeout_scales_with_the_chip(monkeypatch, tmp_path):
+    """0x50000 to the end of a 32 MiB chip is 507 blocks, not one partition."""
+    import defib.flashdump
+
+    timeouts: dict[str, float] = {}
+    firmware = _split_package(tmp_path / "fw.tgz")
+    device = FakeNorUBoot()
+    device.flash = bytearray(b"\x5a" * 32 * 1024 * 1024)
+    _seed_cache(monkeypatch, tmp_path)
+    _patch_install(monkeypatch, device)
+
+    async def send(transport_obj, command: str, timeout: float = 0.0, **kw):
+        timeouts[command] = timeout
+        if command.startswith("sf read") and "0x10" == command.split()[-1]:
+            device.commands.append(command)
+            return "SF: 16 bytes Read: OK\nOpenIPC # "
+        return device.reply(command)
+
+    monkeypatch.setattr(defib.flashdump, "send_command", send)
+    from defib.install.orchestrator import run_install
+
+    global CHIP_8M
+    saved, CHIP_8M = CHIP_8M, 32 * 1024 * 1024
+    try:
+        await run_install(InstallRequest(
+            chip="gk7205v200", firmware_path=str(firmware), port="COM15", nic="eth0",
+            output="json", stages=("rootfs",),
+        ))
+    finally:
+        CHIP_8M = saved
+    assert timeouts["sf erase 0x50000 0x1fb0000"] >= 0x1FB0000 / 0x10000

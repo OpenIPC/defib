@@ -866,9 +866,16 @@ async def run_install(request: InstallRequest) -> None:
         if detected_nor_size is None:
             # A U-Boot that probed the flash at boot may print nothing here;
             # ask the chip instead, with reads that only fit a big enough one.
+            # A refused read is the expected answer on a smaller chip, so it
+            # must not end the install; the download-mode client reports the
+            # command's status itself, the shell its text.
             for candidate in NOR_SIZE_CANDIDATES_MB:
-                read_resp = await _cmd(nor_size_probe_read(ram_addr, candidate), timeout=5.0)
-                if sf_read_succeeded(read_resp):
+                read_ok, read_resp = await _cmd_result(
+                    nor_size_probe_read(ram_addr, candidate),
+                    timeout=5.0,
+                    allow_failure=True,
+                )
+                if read_ok and (download_mode or sf_read_succeeded(read_resp)):
                     detected_nor_size = candidate
                     break
         if nor_size and detected_nor_size and nor_size != detected_nor_size:
@@ -1267,10 +1274,13 @@ async def run_install(request: InstallRequest) -> None:
                         f"    Erase: 0x{flash_off:X}+0x{erase_len:X} "
                         f"(payload 0x{len(orig_data):X})"
                     )
-                erase_resp = await _cmd(
-                    erase_cmd,
-                    timeout=180.0 if not nand else 120.0,
+                # About a second per 64 KiB block at worst: the split layout
+                # erases the whole chip after the environment here, 0x1FB0000
+                # on 32 MiB, not one fixed-size partition.
+                erase_timeout = (
+                    max(180.0, erase_len / 0x10000 * 1.0) if not nand else 120.0
                 )
+                erase_resp = await _cmd(erase_cmd, timeout=erase_timeout)
                 erase_error = uboot_flash_command_error(erase_resp)
                 if erase_error:
                     console.print(

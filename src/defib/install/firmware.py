@@ -52,7 +52,11 @@ def split_image_end(image: bytes) -> int:
         raise ValueError("firmware.bin has no squashfs at the 64 KiB block after its FIT")
     used = int.from_bytes(image[squash + 40:squash + 48], "little")
     end = squash + (used + ERASE_BLOCK - 1) // ERASE_BLOCK * ERASE_BLOCK
-    if not used or end < len(image):
+    if not used or len(image) < squash + used:
+        raise ValueError(
+            "firmware.bin ends inside its squashfs: the image is truncated"
+        )
+    if end < len(image):
         raise ValueError(
             "firmware.bin runs past the end of its squashfs: not an image as the "
             "OpenIPC build packs it"
