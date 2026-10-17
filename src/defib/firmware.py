@@ -32,7 +32,6 @@ OPENIPC_BASE_URL = (
 # Chips that have pre-built u-boot-{chip}-universal.bin binaries on OpenIPC.
 # CV6xx chips are deliberately absent — see CV6XX_BOOT_VARIANTS below.
 AVAILABLE_FIRMWARE: set[str] = {
-    "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
     "hi3516av100", "hi3516av200", "hi3516av300",
     "hi3516cv100", "hi3516cv200", "hi3516cv300", "hi3516cv500",
     "hi3516dv100", "hi3516dv300",
@@ -42,16 +41,28 @@ AVAILABLE_FIRMWARE: set[str] = {
     "t40a", "t40n", "t40xp",
 }
 
-# SoCs whose OpenIPC U-Boot is built from OpenIPC/u-boot-xmedia and published
-# once per flash type as u-boot-{chip}-nor.bin / u-boot-{chip}-nand.bin. The
+# SoCs whose OpenIPC U-Boot is published once per flash type as
+# u-boot-{chip}-nor.bin / u-boot-{chip}-nand.bin: the u-boot-xmedia SoCs, and
+# the gk7205v200 family built from OpenIPC/u-boot (openipc-hisilicon). The
 # NAND build owns the UBI-only layout (768k boot, 256k env, rest ubi) in its
 # default environment, so a NOR image must never be installed on NAND or vice
-# versa. The old u-boot-{chip}-universal.bin of the HiSilicon members was the
-# retired u-boot-hi3516ev200 build with the split NAND layout; it is never
-# downloaded for these SoCs again.
+# versa. The old u-boot-{chip}-universal.bin of these SoCs came from retired
+# per-SoC repositories (u-boot-hi3516ev200, u-boot-gk7205v200); it is never
+# downloaded for them again.
 PER_FLASH_TYPE_UBOOT: frozenset[str] = frozenset({
     "hi3516ev200", "hi3516ev300", "hi3518ev300", "hi3516dv200",
     "gk7205v500", "gk7205v510", "gk7205v530",
+    "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
+})
+
+# SoCs whose OpenIPC firmware also ships the split NOR layout,
+# openipc.<board>-nor-<variant>-split.tgz: one firmware.bin (a hashed FIT, then
+# the squashfs at the next 64 KiB) written at 0x50000, which the kernel divides
+# into kernel, rootfs and rootfs_data at boot. Their OpenIPC/u-boot NOR build
+# boots it, and also scans the fixed slots, so it owns mtdparts and bootcmd on
+# either layout.
+NOR_SPLIT_SOCS: frozenset[str] = frozenset({
+    "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
 })
 
 FLASH_TYPES: tuple[str, ...] = ("nor", "nand")
@@ -143,6 +154,12 @@ def uses_per_flash_type_uboot(chip: str) -> bool:
     """True for SoCs whose U-Boot is published per flash type (nor/nand)."""
     base = _strip_variant(chip).lower()
     return CHIP_TO_FIRMWARE.get(base, base) in PER_FLASH_TYPE_UBOOT
+
+
+def supports_nor_split(chip: str) -> bool:
+    """True for SoCs whose firmware and NOR U-Boot use the split NOR layout."""
+    base = _strip_variant(chip).lower()
+    return CHIP_TO_FIRMWARE.get(base, base) in NOR_SPLIT_SOCS
 
 
 def asset_name(chip: str, flash_type: str | None = None) -> str | None:

@@ -35,8 +35,8 @@ class TestFirmwareUrl:
         assert "hi3518ev200" in url
 
     def test_url_format(self):
-        url = firmware_url("gk7205v200")
-        assert url == "https://github.com/OpenIPC/firmware/releases/download/latest/u-boot-gk7205v200-universal.bin"
+        url = firmware_url("hi3516cv300")
+        assert url == "https://github.com/OpenIPC/firmware/releases/download/latest/u-boot-hi3516cv300-universal.bin"
 
 
 class TestHasFirmware:
@@ -58,7 +58,7 @@ class TestAvailableFirmware:
         assert len(AVAILABLE_FIRMWARE) >= 20
 
     def test_common_chips_included(self):
-        for chip in ["gk7205v200", "hi3518ev200"]:
+        for chip in ["hi3516cv300", "hi3518ev200"]:
             assert chip in AVAILABLE_FIRMWARE
 
     def test_per_flash_type_socs_are_not_universal(self):
@@ -265,11 +265,13 @@ class TestV500Donor:
 
 
 class TestPerFlashTypeUBoot:
-    """u-boot-xmedia SoCs publish u-boot-<soc>-{nor,nand}.bin, not -universal."""
+    """u-boot-xmedia SoCs and the gk7205v200 family (OpenIPC/u-boot) publish
+    u-boot-<soc>-{nor,nand}.bin, not -universal."""
 
     SOCS = (
         "hi3516ev200", "hi3516ev300", "hi3518ev300", "hi3516dv200",
         "gk7205v500", "gk7205v510", "gk7205v530",
+        "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
     )
 
     def test_set_matches_the_published_socs(self):

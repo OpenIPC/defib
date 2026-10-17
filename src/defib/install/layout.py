@@ -63,9 +63,28 @@ _UBI_NAND_BOARD = {"gk7205v510": "gk7205v500", "gk7205v530": "gk7205v500"}
 
 
 def ubi_nand_boards(chip: str) -> set[str]:
-    """The ``rootfs.ubi.<board>`` suffixes a NAND package for ``chip`` may carry."""
+    """The ``rootfs.ubi.<board>`` suffixes a NAND package for ``chip`` may carry.
+
+    An aliased chip (gk7201v200, gk7205v210, ...) installs the U-Boot of the SoC
+    it is published under, and that SoC's package with it.
+    """
+    from defib.firmware import CHIP_TO_FIRMWARE
+
     base = chip.partition(":")[0]
-    return {base, _UBI_NAND_BOARD.get(base, base)}
+    published = CHIP_TO_FIRMWARE.get(base.lower(), base)
+    return {base, published, _UBI_NAND_BOARD.get(base, base), _UBI_NAND_BOARD.get(published, published)}
+
+def split_boards(chip: str) -> set[str]:
+    """The ``firmware.bin.<board>`` suffixes a split NOR package for ``chip`` may carry.
+
+    Aliased chips (gk7205v210, gk7201v200, ...) install the image of the SoC
+    they are published under.
+    """
+    from defib.firmware import CHIP_TO_FIRMWARE
+
+    base = chip.partition(":")[0].lower()
+    return {base, CHIP_TO_FIRMWARE.get(base, base)}
+
 
 _MTDPART_RE = re.compile(
     r"^(?P<size>-|(?:0x[0-9a-f]+|\d+)[kmg]?)"
@@ -207,9 +226,14 @@ def uboot_sf_lock_unsupported(response: str) -> bool:
     # subcommand. That is compatibility information only when the table itself
     # contains no sf lock entry. If sf lock is listed, a Usage response means our
     # invocation was rejected and must remain a hard failure.
-    usage_seen = any(line.startswith("usage:") for line in lines)
+    #
+    # Only the table counts. A console that echoes the command puts "sf lock 0"
+    # above "Usage:", and that echo is not an entry: OpenIPC/u-boot's sf has no
+    # lock subcommand at all and answers exactly this way.
+    usage_at = next((i for i, line in enumerate(lines) if line.startswith("usage:")), None)
+    usage_seen = usage_at is not None
     sf_usage: list[str] = []
-    for line in lines:
+    for line in lines[usage_at or 0:] if usage_seen else []:
         candidate = line.removeprefix("usage:").strip() if line.startswith("usage:") else line
         if re.match(r"^sf(?:\s|$)", candidate):
             sf_usage.append(candidate)
@@ -369,6 +393,28 @@ def detect_nor_size_mb(response: str) -> int | None:
             if value % divisor == 0:
                 return value // divisor
     return None
+
+
+NOR_SIZE_CANDIDATES_MB = (32, 16, 8)
+
+
+def nor_size_probe_read(ram_addr: int, size_mb: int) -> str:
+    """A 16-byte ``sf read`` that only a chip of at least ``size_mb`` accepts.
+
+    OpenIPC/u-boot (openipc-hisilicon) probes the flash at boot and its
+    ``sf probe`` prints nothing at the prompt, so the size it found is not on
+    offer; but ``sf read`` refuses an offset past the chip ("Offset exceeds
+    device limit"). The largest candidate whose last 16 bytes read is the size.
+    """
+    return f"sf read 0x{ram_addr:x} 0x{size_mb * 1024 * 1024 - 16:x} 0x10"
+
+
+def sf_read_succeeded(response: str) -> bool:
+    """True when ``sf read`` reported the read done and nothing refused it."""
+    text = response.lower()
+    if "exceeds" in text or "past flash size" in text or "error" in text:
+        return False
+    return "read: ok" in text
 
 
 def select_nor_size_mb(
