@@ -116,7 +116,7 @@ ships a split NOR package, `openipc.<board>-nor-<variant>-split.tgz`, and
 |--------|------|----------|
 | `0x000000` | 256K | boot: `u-boot-<chip>-nor.bin` |
 | `0x040000` | 64K | env |
-| `0x050000` | rest of chip | firmware: `firmware.bin.<board>` (a hashed FIT, then the squashfs at the next 64 KiB); the kernel divides it into `kernel`, `rootfs` and `rootfs_data` at boot |
+| `0x050000` | rest of chip | firmware: `firmware.bin.<board>` (the uImage, then the squashfs at the next 64 KiB); the kernel divides it into `kernel`, `rootfs` and `rootfs_data` at boot, from its own device tree |
 
 ```bash
 defib install -c gk7205v300 \
@@ -126,9 +126,10 @@ defib install -c gk7205v300 \
 
 The `rootfs` stage writes `firmware.bin` at `0x50000` and erases the rest of the
 chip, so the first boot starts with an empty overlay; the `kernel` and
-`rootfs-data` stages have nothing of their own to do. Only that U-Boot boots the
-image: a plan without the `uboot` stage warns that the one already on the flash
-must be it. See the [OpenIPC wiki](https://github.com/OpenIPC/wiki/blob/master/en/nor-split-layout.md)
+`rootfs-data` stages have nothing of their own to do. Any U-Boot that loads the
+kernel from `0x50000` boots the image -- the kernel ignores whatever `mtdparts`
+and `root=` it passes -- so a plan without the `uboot` stage needs no more than
+that. See the [OpenIPC wiki](https://github.com/OpenIPC/wiki/blob/master/en/nor-split-layout.md)
 for the layout itself.
 
 Targets that must bootstrap through a stock U-Boot use an explicit U-Boot
