@@ -19,8 +19,9 @@ class FirmwareBundle:
     ``kernel`` is ``b""``.
 
     For a split NOR package (``openipc.<board>-nor-<variant>-split.tgz``) the
-    one image is ``firmware.bin.<board>``: it is carried as the rootfs, the
-    kernel is empty, and ``split`` is set.
+    one image is ``firmware.bin.<board>`` -- the uImage, then the squashfs at
+    the next 64 KiB block: it is carried as the rootfs, the kernel is empty,
+    and ``split`` is set.
     """
 
     kernel_name: str
@@ -31,25 +32,26 @@ class FirmwareBundle:
 
 
 ERASE_BLOCK = 0x10000
-FDT_MAGIC = b"\xd0\x0d\xfe\xed"
+UIMAGE_MAGIC = b"\x27\x05\x19\x56"
+UIMAGE_HEADER = 64
 SQUASHFS_MAGIC = b"hsqs"
 
 
 def split_image_end(image: bytes) -> int:
     """Where rootfs_data starts, relative to the image, for a split firmware.bin.
 
-    The FIT's ``totalsize`` (header bytes 4..7, big-endian) rounded up to a
-    64 KiB block is where the squashfs starts; its ``bytes_used`` (superblock
-    offset 40, little-endian) rounded up the same way is where it ends. The
-    kernel's mtdsplit, U-Boot and sysupgrade all draw the same lines.
-    Raises ValueError for anything else.
+    The uImage header (64 bytes) plus its data size (bytes 12..15, big-endian)
+    rounded up to a 64 KiB block is where the squashfs starts; its
+    ``bytes_used`` (superblock offset 40, little-endian) rounded up the same way
+    is where it ends. The kernel's mtdsplit, U-Boot and sysupgrade all draw the
+    same lines. Raises ValueError for anything else.
     """
-    if image[:4] != FDT_MAGIC:
-        raise ValueError("firmware.bin does not start with a FIT image")
-    fit = int.from_bytes(image[4:8], "big")
-    squash = (fit + ERASE_BLOCK - 1) // ERASE_BLOCK * ERASE_BLOCK
-    if not fit or squash + 48 > len(image) or image[squash:squash + 4] != SQUASHFS_MAGIC:
-        raise ValueError("firmware.bin has no squashfs at the 64 KiB block after its FIT")
+    if image[:4] != UIMAGE_MAGIC:
+        raise ValueError("firmware.bin does not start with a uImage")
+    kernel = UIMAGE_HEADER + int.from_bytes(image[12:16], "big")
+    squash = (kernel + ERASE_BLOCK - 1) // ERASE_BLOCK * ERASE_BLOCK
+    if squash + 48 > len(image) or image[squash:squash + 4] != SQUASHFS_MAGIC:
+        raise ValueError("firmware.bin has no squashfs at the 64 KiB block after its uImage")
     used = int.from_bytes(image[squash + 40:squash + 48], "little")
     end = squash + (used + ERASE_BLOCK - 1) // ERASE_BLOCK * ERASE_BLOCK
     if not used or len(image) < squash + used:

@@ -266,12 +266,6 @@ async def run_install(request: InstallRequest) -> None:
                 "where rootfs_data starts depends on the image written there",
                 exit_code=2,
             )
-        if "rootfs" in stage_set and "uboot" not in stage_set:
-            warn(
-                "firmware.bin boots only on an OpenIPC U-Boot that knows the split "
-                "layout; the uboot stage is not in this plan, so the U-Boot "
-                "already on the flash must be one."
-            )
         needs_tftp = bool(stage_set & {"uboot", "rootfs"})
 
     kernel_name = firmware.kernel_name
@@ -297,7 +291,7 @@ async def run_install(request: InstallRequest) -> None:
         elif split:
             console.print(
                 f"  Image:  [cyan]{rootfs_name}[/cyan] ({len(rootfs_data)} bytes; "
-                "split NOR layout, FIT + squashfs at 0x50000)"
+                "split NOR layout, uImage + squashfs at 0x50000)"
             )
         else:
             console.print(f"  Kernel: [cyan]{kernel_name}[/cyan] ({len(kernel_data)} bytes)")
@@ -1363,7 +1357,7 @@ async def run_install(request: InstallRequest) -> None:
             elif "kernel" in stage_set and split:
                 if output == "human":
                     console.print(
-                        "\n  [bold]kernel[/bold]: the FIT at the start of "
+                        "\n  [bold]kernel[/bold]: the uImage at the start of "
                         "firmware.bin (written by the rootfs stage). Nothing to do."
                     )
             elif "kernel" in stage_set:

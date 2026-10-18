@@ -1,6 +1,6 @@
 """Split NOR install for the gk7205v200 family (OpenIPC/u-boot openipc-hisilicon).
 
-openipc.<board>-nor-<variant>-split.tgz carries one firmware.bin: a hashed FIT,
+openipc.<board>-nor-<variant>-split.tgz carries one firmware.bin: the uImage,
 then the squashfs at the next 64 KiB block. It is written at 0x50000 and the
 rest of the chip is erased; the kernel divides it into kernel, rootfs and
 rootfs_data at boot. That U-Boot works out the NOR layout itself, so the env
@@ -24,13 +24,15 @@ BLOCK = 0x10000
 CHIP_8M = 8 * 1024 * 1024
 
 
-def _split_image(fit_size: int = 0x18000, squashfs_used: int = 0x2F000) -> bytes:
-    """A FIT whose totalsize rounds up to 0x20000, then a squashfs there."""
-    fit = b"\xd0\x0d\xfe\xed" + fit_size.to_bytes(4, "big")
-    fit = fit.ljust((fit_size + BLOCK - 1) // BLOCK * BLOCK, b"\xab")
+def _split_image(kernel_size: int = 0x18000, squashfs_used: int = 0x2F000) -> bytes:
+    """A uImage whose header and data round up to 0x20000, then a squashfs there."""
+    data = kernel_size - 64
+    kernel = b"\x27\x05\x19\x56" + b"\x00" * 8 + data.to_bytes(4, "big")
+    kernel = (kernel + b"\x00" * 16 + b"Linux-4.9.37-gk7205v200").ljust(64, b"\x00")
+    kernel = kernel.ljust((kernel_size + BLOCK - 1) // BLOCK * BLOCK, b"\xab")
     squashfs = b"hsqs" + b"\x00" * 36 + squashfs_used.to_bytes(8, "little")
     squashfs = squashfs.ljust((squashfs_used + BLOCK - 1) // BLOCK * BLOCK, b"\xcd")
-    return fit + squashfs
+    return kernel + squashfs
 
 
 def _split_package(path: Path, board: str = "gk7205v200", image: bytes | None = None,
@@ -162,7 +164,7 @@ def test_split_package_for_another_board(tmp_path):
 
 
 @pytest.mark.parametrize("image, reason", [
-    (b"\x27\x05\x19\x56" + b"\x00" * 0x1FFFC, "does not start with a FIT"),
+    (b"\xd0\x0d\xfe\xed" + b"\x00" * 0x1FFFC, "does not start with a uImage"),
     (_split_image()[:0x20000] + b"\x00" * 0x30000, "no squashfs"),
     (_split_image() + b"\x00" * BLOCK, "runs past the end of its squashfs"),
     (_split_image()[:0x20000 + 0x2E000], "truncated"),
@@ -223,7 +225,7 @@ async def test_split_kernel_and_rootfs_data_stages_write_nothing(monkeypatch, tm
 
 @pytest.mark.asyncio
 async def test_split_image_too_big_for_the_chip(monkeypatch, tmp_path):
-    image = _split_image(fit_size=0x18000, squashfs_used=0x7B0000 - 0x20000)  # ends at the chip end
+    image = _split_image(kernel_size=0x18000, squashfs_used=0x7B0000 - 0x20000)  # ends at the chip end
     firmware = _split_package(tmp_path / "fw.tgz", image=image)
     with pytest.raises(typer.Exit):
         await _install(monkeypatch, tmp_path, firmware)

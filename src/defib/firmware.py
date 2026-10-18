@@ -56,11 +56,11 @@ PER_FLASH_TYPE_UBOOT: frozenset[str] = frozenset({
 })
 
 # SoCs whose OpenIPC firmware also ships the split NOR layout,
-# openipc.<board>-nor-<variant>-split.tgz: one firmware.bin (a hashed FIT, then
+# openipc.<board>-nor-<variant>-split.tgz: one firmware.bin (the uImage, then
 # the squashfs at the next 64 KiB) written at 0x50000, which the kernel divides
-# into kernel, rootfs and rootfs_data at boot. Their OpenIPC/u-boot NOR build
-# boots it, and also scans the fixed slots, so it owns mtdparts and bootcmd on
-# either layout.
+# into kernel, rootfs and rootfs_data at boot from its own device tree. Any
+# U-Boot that loads the kernel from 0x50000 boots it; their OpenIPC/u-boot NOR
+# build also scans the flash and owns mtdparts and bootcmd on either layout.
 NOR_SPLIT_SOCS: frozenset[str] = frozenset({
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
 })
