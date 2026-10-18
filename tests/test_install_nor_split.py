@@ -168,7 +168,9 @@ def test_split_package_for_another_board(tmp_path):
     (_split_image()[:0x20000] + b"\x00" * 0x30000, "no squashfs"),
     (_split_image() + b"\x00" * BLOCK, "runs past the end of its squashfs"),
     (_split_image()[:0x20000 + 0x2E000], "truncated"),
-], ids=["uimage", "no-squashfs", "trailing-bytes", "truncated"])
+    (_split_image(kernel_size=64)[:0x40] + b"\x00" * (BLOCK - 0x40) + _split_image()[0x20000:],
+     "holds no kernel"),
+], ids=["uimage", "no-squashfs", "trailing-bytes", "truncated", "empty-kernel"])
 def test_split_package_shape_is_checked(tmp_path, image, reason):
     with pytest.raises(ValueError, match=reason):
         load_firmware_bundle(_split_package(tmp_path / "fw.tgz", image=image))

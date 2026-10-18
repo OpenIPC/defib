@@ -48,7 +48,10 @@ def split_image_end(image: bytes) -> int:
     """
     if image[:4] != UIMAGE_MAGIC:
         raise ValueError("firmware.bin does not start with a uImage")
-    kernel = UIMAGE_HEADER + int.from_bytes(image[12:16], "big")
+    data = int.from_bytes(image[12:16], "big")
+    if not data:
+        raise ValueError("firmware.bin's uImage holds no kernel")
+    kernel = UIMAGE_HEADER + data
     squash = (kernel + ERASE_BLOCK - 1) // ERASE_BLOCK * ERASE_BLOCK
     if squash + 48 > len(image) or image[squash:squash + 4] != SQUASHFS_MAGIC:
         raise ValueError("firmware.bin has no squashfs at the 64 KiB block after its uImage")
