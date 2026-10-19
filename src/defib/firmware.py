@@ -8,8 +8,9 @@ Two asset families are published, and which one applies depends on the SoC:
 - u-boot-xmedia SoCs (hi3516ev200/ev300, hi3518ev300, hi3516dv200,
   gk7205v500/v510/v530): ``u-boot-{chip}-{nor|nand}.bin`` — one bare U-Boot per
   flash type, because each build carries that flash type's partition layout.
-- CV6xx SoCs: ``boot-{chip}[-{variant}]-nor.bin`` — a composite image
-  (GSL + DDR tables + U-Boot) that the bootrom expects as a single blob.
+- SoCs booted from a signed boot image (hi3516cv608/cv610, hi3519dv500):
+  ``boot-{chip}[-{variant}]-nor.bin`` — a composite image (GSL + DDR tables +
+  U-Boot) that the bootrom expects as a single blob.
 
 Caches downloads in a platform-appropriate directory to avoid re-downloading.
 """
@@ -30,7 +31,7 @@ OPENIPC_BASE_URL = (
 )
 
 # Chips that have pre-built u-boot-{chip}-universal.bin binaries on OpenIPC.
-# CV6xx chips are deliberately absent — see CV6XX_BOOT_VARIANTS below.
+# Boot-image SoCs are deliberately absent — see BOOT_IMAGE_VARIANTS below.
 AVAILABLE_FIRMWARE: set[str] = {
     "hi3516av100", "hi3516av200", "hi3516av300",
     "hi3516cv100", "hi3516cv200", "hi3516cv300", "hi3516cv500",
@@ -55,23 +56,44 @@ PER_FLASH_TYPE_UBOOT: frozenset[str] = frozenset({
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
 })
 
-# SoCs whose OpenIPC firmware also ships the split NOR layout,
+# The firmware package a chip installs, where it is not the chip's own: one
+# hi3516cv6xx build serves the whole CV6xx family, and hi3516dv500 is the
+# hi3519dv500 die. Packages are openipc.<board>-<flash>-<variant>[-split].tgz.
+FIRMWARE_PACKAGE_BOARD: dict[str, str] = {
+    "hi3516cv608": "hi3516cv6xx",
+    "hi3516cv610": "hi3516cv6xx",
+    "hi3516cv613": "hi3516cv6xx",
+    "hi3516dv500": "hi3519dv500",
+}
+
+# Package boards whose OpenIPC firmware ships the split NOR layout,
 # openipc.<board>-nor-<variant>-split.tgz: one firmware.bin (the uImage, then
-# the squashfs at the next 64 KiB) written at 0x50000, which the kernel divides
-# into kernel, rootfs and rootfs_data at boot from its own device tree. Any
-# U-Boot that loads the kernel from 0x50000 boots it; their OpenIPC/u-boot NOR
-# build also scans the flash and owns mtdparts and bootcmd on either layout.
+# the squashfs at the next 64 KiB) written where the boot area ends, which the
+# kernel divides into kernel, rootfs and rootfs_data at boot from its own
+# device tree. Any U-Boot that loads the kernel from there boots it; their
+# OpenIPC/u-boot NOR build also scans the flash and owns mtdparts and bootcmd.
 NOR_SPLIT_SOCS: frozenset[str] = frozenset({
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
+    "hi3516cv6xx", "hi3519dv500",
 })
+
+# NOR boot area -- (boot partition size, env partition size) -- where it is
+# not OpenIPC's usual 256k(boot),64k(env), keyed by package board. The
+# firmware starts where it ends. hi3519dv500's signed boot image is 383 KiB,
+# so its board has 512k(boot),256k(env) and the firmware at 0xc0000.
+DEFAULT_NOR_BOOT_AREA: tuple[int, int] = (0x40000, 0x10000)
+NOR_BOOT_AREAS: dict[str, tuple[int, int]] = {
+    "hi3519dv500": (0x80000, 0x40000),
+}
 
 FLASH_TYPES: tuple[str, ...] = ("nor", "nand")
 DEFAULT_FLASH_TYPE = "nor"
 
-# CV6xx SoCs publish a composite boot image, not a bare U-Boot, and no
+# SoCs booted from a signed composite boot image (GSL + DDR tables + U-Boot)
+# publish boot-{chip}[-{variant}]-nor.bin, not a bare U-Boot, and no
 # u-boot-{chip}-universal.bin exists for any of them — the URL assumed by
 # #112 always 404'd, so auto-download could never work and users had to
-# hand-seed the cache. The real assets are boot-{chip}[-{variant}]-nor.bin.
+# hand-seed the cache.
 #
 # Variants are board-specific: across the five hi3516cv610 images the GSL is
 # identical but each carries a different U-Boot, and the DDR table differs by
@@ -79,7 +101,7 @@ DEFAULT_FLASH_TYPE = "nor"
 # in the recovery handshake identifies the board, so a variant cannot be
 # guessed — a chip with more than one published image must be requested
 # explicitly as "chip:variant" (e.g. hi3516cv610:00g).
-CV6XX_BOOT_VARIANTS: dict[str, tuple[str, ...]] = {
+BOOT_IMAGE_VARIANTS: dict[str, tuple[str, ...]] = {
     "hi3516cv608": (),  # single image, no variant suffix
     "hi3516cv610": ("00g", "00s", "10b", "20g", "20s"),
     "hi3519dv500": ("dmeb", "dmebpro"),
@@ -156,17 +178,28 @@ def uses_per_flash_type_uboot(chip: str) -> bool:
     return CHIP_TO_FIRMWARE.get(base, base) in PER_FLASH_TYPE_UBOOT
 
 
+def package_board(chip: str) -> str:
+    """The board name of the firmware package ``chip`` installs."""
+    base = _strip_variant(chip).lower()
+    name = CHIP_TO_FIRMWARE.get(base, base)
+    return FIRMWARE_PACKAGE_BOARD.get(name, name)
+
+
 def supports_nor_split(chip: str) -> bool:
     """True for SoCs whose firmware and NOR U-Boot use the split NOR layout."""
-    base = _strip_variant(chip).lower()
-    return CHIP_TO_FIRMWARE.get(base, base) in NOR_SPLIT_SOCS
+    return package_board(chip) in NOR_SPLIT_SOCS
+
+
+def nor_boot_area(chip: str) -> tuple[int, int]:
+    """``(boot size, env size)`` of ``chip``'s NOR layout; the firmware follows."""
+    return NOR_BOOT_AREAS.get(package_board(chip), DEFAULT_NOR_BOOT_AREA)
 
 
 def asset_name(chip: str, flash_type: str | None = None) -> str | None:
     """Published release filename for a chip, or None if there isn't one.
 
-    Returns None both for chips OpenIPC doesn't build and for a CV6xx chip
-    named without the variant needed to pick between several board images.
+    Returns None both for chips OpenIPC doesn't build and for a boot-image
+    chip named without the variant needed to pick between several board images.
 
     ``flash_type`` (``"nor"``/``"nand"``) picks the build for SoCs listed in
     PER_FLASH_TYPE_UBOOT and defaults to NOR there. Every other chip publishes
@@ -180,8 +213,8 @@ def asset_name(chip: str, flash_type: str | None = None) -> str | None:
         # Board variants (e.g. ``:emmc``) do not change the per-flash build.
         return f"u-boot-{name}-{kind}.bin"
 
-    if name in CV6XX_BOOT_VARIANTS:
-        variants = CV6XX_BOOT_VARIANTS[name]
+    if name in BOOT_IMAGE_VARIANTS:
+        variants = BOOT_IMAGE_VARIANTS[name]
         if not variants:
             # Only one image published; any variant suffix is not meaningful.
             return f"boot-{name}-nor.bin"
@@ -218,7 +251,7 @@ def has_firmware(chip: str, flash_type: str | None = None) -> bool:
 
 def _legacy_cache_name(chip: str) -> str:
     """Historic cache filename, which assumed every chip used the universal
-    naming. CV6xx users were told to seed the cache under this name by #112,
+    naming. Boot-image users were told to seed the cache under this name by #112,
     so keep reading it rather than silently re-downloading over it."""
     base = _strip_variant(chip)
     return f"u-boot-{CHIP_TO_FIRMWARE.get(base, base)}-universal.bin"
@@ -299,7 +332,7 @@ def _unavailable_message(chip: str) -> str:
     """Explain why a chip/variant cannot be resolved to a published asset."""
     base, _ = _split_variant(chip)
     name = CHIP_TO_FIRMWARE.get(base, base)
-    variants = CV6XX_BOOT_VARIANTS.get(name)
+    variants = BOOT_IMAGE_VARIANTS.get(name)
     if variants:
         return (
             f"'{chip}' needs an explicit board variant — OpenIPC publishes "

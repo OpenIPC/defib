@@ -78,12 +78,13 @@ def split_boards(chip: str) -> set[str]:
     """The ``firmware.bin.<board>`` suffixes a split NOR package for ``chip`` may carry.
 
     Aliased chips (gk7205v210, gk7201v200, ...) install the image of the SoC
-    they are published under.
+    they are published under, and a family built once (hi3516cv610 ->
+    hi3516cv6xx) the family's.
     """
-    from defib.firmware import CHIP_TO_FIRMWARE
+    from defib.firmware import CHIP_TO_FIRMWARE, package_board
 
     base = chip.partition(":")[0].lower()
-    return {base, CHIP_TO_FIRMWARE.get(base, base)}
+    return {base, CHIP_TO_FIRMWARE.get(base, base), package_board(base)}
 
 
 _MTDPART_RE = re.compile(
@@ -435,8 +436,30 @@ def select_nor_size_mb(
     return 8, "fallback"
 
 
-def nor_layout(nor_size_mb: int) -> dict[str, tuple[int, int]]:
-    """Return the standard OpenIPC NOR partition layout for a flash size."""
+# (boot size, env size) of every layout above
+STANDARD_NOR_BOOT_AREA = (NOR8M_LAYOUT["boot"][1], NOR8M_LAYOUT["env"][1])
+
+
+def nor_layout(
+    nor_size_mb: int, boot_area: tuple[int, int] = STANDARD_NOR_BOOT_AREA
+) -> dict[str, tuple[int, int]]:
+    """Return the OpenIPC NOR partition layout for a flash size.
+
+    ``boot_area`` is the board's (boot size, env size); see
+    defib.firmware.nor_boot_area. The fixed kernel/rootfs slots exist only
+    behind the usual 256k(boot),64k(env). Behind any other boot area only the
+    split layout is published: "kernel" is then an empty slot where the
+    firmware starts, and "rootfs" the rest of the chip.
+    """
+    if boot_area != STANDARD_NOR_BOOT_AREA:
+        boot, env = boot_area
+        firmware = boot + env
+        return {
+            "boot": (0, boot),
+            "env": (boot, env),
+            "kernel": (firmware, 0),
+            "rootfs": (firmware, nor_size_mb * 1024 * 1024 - firmware),
+        }
     if nor_size_mb >= 32:
         return NOR32M_LAYOUT
     if nor_size_mb >= 16:
