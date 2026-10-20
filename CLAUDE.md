@@ -168,12 +168,13 @@ Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
   `u-boot-<chip>-universal.bin`; the SoCs in `PER_FLASH_TYPE_UBOOT` (the
   u-boot-xmedia ones: hi3516ev200/ev300, hi3518ev300, hi3516dv200,
   gk7205v500/v510/v530; and the OpenIPC/u-boot gk7202v300, gk7205v200/v300,
-  gk7605v100) publish `u-boot-<chip>-nor.bin` and `-nand.bin` instead, so
+  gk7605v100, hi3516cv300, hi3516ev100 -- ev100 has no NAND build) publish `u-boot-<chip>-nor.bin` and `-nand.bin` instead, so
   callers pass `flash_type` (NOR when unknown). On NAND those SoCs install the
   UBI-only layout (`NAND_UBI_LAYOUT` in `install/layout.py`: 768k boot, 256k
   env, rest ubi), whose mtdparts/bootcmd/bootargs come from the U-Boot default
   env; `NAND_LAYOUT` is the legacy split layout for other chips. The
-  `NOR_SPLIT_SOCS` (gk7205v200 family, hi3516cv6xx, hi3519dv500; keyed by
+  `NOR_SPLIT_SOCS` (gk7205v200 family, hi3516cv6xx, hi3519dv500,
+  hi3516cv300/ev100; keyed by
   package board, `FIRMWARE_PACKAGE_BOARD` maps cv608/cv610/cv613 to
   `hi3516cv6xx` and hi3516dv500 to `hi3519dv500`) install the split NOR
   package: one `firmware.bin.<board>` where the boot area ends (0x50000;
