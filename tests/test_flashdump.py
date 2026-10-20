@@ -388,6 +388,177 @@ class TestDumpFlashSfProbe:
             )
 
 
+class TestSfReadOk:
+    """Old U-Boot 2010.06 says nothing on a successful sf read."""
+
+    def test_mainline_ok(self):
+        from defib.flashdump import sf_read_ok
+        assert sf_read_ok("sf read 0x82000000 0x0 0x1000000\r\n"
+                          "SF: 16777216 bytes @ 0x0 Read: OK\r\nOpenIPC # ")
+
+    def test_silent_2010_06_ok(self):
+        from defib.flashdump import sf_read_ok
+        assert sf_read_ok("sf read 0x82000000 0x0 0x1000000\r\nOpenIPC # ")
+
+    def test_failures(self):
+        from defib.flashdump import sf_read_ok
+        for resp in (
+            "sf read 0x82000000 0x0 0x1000000\r\nSF: Read: ERROR\r\nOpenIPC # ",
+            "sf read 0x82000000 0x0 0x1000000\r\nUsage:\r\nsf - SPI flash\r\nOpenIPC # ",
+            "device 0 offset 0x0, size 0x1000\nOpenIPC # \n",
+            "sf read 0x82000000 0x0 0x1000000\r\n",
+            "",
+        ):
+            assert not sf_read_ok(resp), resp
+
+
+class RamDevice(MockTransport):
+    """U-Boot with a RAM image: answers crc32 and md.b from ``ram``.
+
+    ``flaky`` is a set of offsets whose first md.b answer is corrupted.
+    """
+
+    def __init__(self, base: int, ram: bytes, flaky: set[int] | None = None):
+        super().__init__()
+        self.base, self.ram, self.flaky = base, ram, set(flaky or ())
+
+    async def write(self, data: bytes) -> None:
+        import zlib
+        self._tx_log.append(data)
+        parts = data.decode().split()
+        if parts[:1] == ["crc32"]:
+            a, n = int(parts[1], 16) - self.base, int(parts[2], 16)
+            crc = zlib.crc32(self.ram[a:a + n])
+            self._rx.extend(f"CRC32 for {parts[1]} ==> {crc:08x}\nOpenIPC # ".encode())
+        elif parts[:1] == ["md.b"]:
+            a, n = int(parts[1], 16) - self.base, int(parts[2], 16)
+            chunk = bytearray(self.ram[a:a + n])
+            if a in self.flaky:
+                self.flaky.discard(a)
+                chunk[0] ^= 0xFF
+            lines = [
+                f"{self.base + a + i:08x}: " + " ".join(f"{b:02x}" for b in chunk[i:i + 16])
+                for i in range(0, n, 16)
+            ]
+            self._rx.extend(("\n".join(lines) + "\nOpenIPC # ").encode())
+        else:
+            self._rx.extend(b"OpenIPC # ")
+
+
+class TestVerifyAndRepair:
+    """The whole-image check after a dump, which also covers resumed runs."""
+
+    BASE = 0x82000000
+
+    def _setup(self, tmp_path, ram: bytes, file: bytes):
+        path = tmp_path / "dump.bin"
+        path.write_bytes(file)
+        return str(path)
+
+    @pytest.mark.asyncio
+    async def test_match_reads_nothing(self, tmp_path):
+        from defib.flashdump import verify_and_repair
+        ram = os.urandom(0x4000)
+        path = self._setup(tmp_path, ram, ram)
+        dev = RamDevice(self.BASE, ram)
+        assert await verify_and_repair(dev, path, self.BASE, len(ram), block=0x2000) == 0
+        assert not any(b.startswith(b"md.b") for b in dev._tx_log)
+
+    @pytest.mark.asyncio
+    async def test_rereads_only_the_bad_chunks(self, tmp_path):
+        from defib.flashdump import verify_and_repair
+        ram = os.urandom(0x4000)
+        bad = bytearray(ram)
+        bad[0x1000:0x2000] = bytes(0x1000)  # a run that wrote zeros
+        bad[0x3abc] ^= 1                    # one flipped byte
+        path = self._setup(tmp_path, ram, bytes(bad))
+        dev = RamDevice(self.BASE, ram, flaky={0x3000})
+        assert await verify_and_repair(dev, path, self.BASE, len(ram), block=0x2000) == 2
+        assert open(path, "rb").read() == ram
+        reads = [b for b in dev._tx_log if b.startswith(b"md.b")]
+        assert len(reads) == 3  # 0x1000 once, 0x3000 twice (first answer corrupt)
+
+    @pytest.mark.asyncio
+    async def test_unreadable_chunk_raises(self, tmp_path):
+        from defib.flashdump import verify_and_repair
+        ram = os.urandom(0x2000)
+        bad = bytearray(ram)
+        bad[0] ^= 1
+        path = self._setup(tmp_path, ram, bytes(bad))
+
+        class Broken(RamDevice):
+            async def write(self, data: bytes) -> None:
+                if data.startswith(b"md.b"):
+                    self._rx.extend(b"OpenIPC # ")
+                else:
+                    await super().write(data)
+
+        with pytest.raises(RuntimeError, match="0x0"):
+            await verify_and_repair(Broken(self.BASE, ram), path, self.BASE, len(ram))
+
+
+class TestVerifyAndRepairFailures:
+    BASE = 0x82000000
+
+    @pytest.mark.asyncio
+    async def test_later_failure_keeps_earlier_repairs(self, tmp_path):
+        from defib.flashdump import verify_and_repair
+        ram = os.urandom(0x4000)
+        bad = bytearray(ram)
+        bad[0x10] ^= 1
+        bad[0x3010] ^= 1
+        path = tmp_path / "dump.bin"
+        path.write_bytes(bytes(bad))
+
+        class LastChunkUnreadable(RamDevice):
+            async def write(self, data: bytes) -> None:
+                if data.startswith(b"md.b 0x82003000"):
+                    self._rx.extend(b"OpenIPC # ")
+                else:
+                    await super().write(data)
+
+        with pytest.raises(RuntimeError, match="0x3000"):
+            await verify_and_repair(
+                LastChunkUnreadable(self.BASE, ram), str(path), self.BASE, len(ram),
+                block=0x2000,
+            )
+        assert path.read_bytes()[:0x1000] == ram[:0x1000]
+
+    @pytest.mark.asyncio
+    async def test_no_crc_answer_is_unverified_not_bad(self, tmp_path):
+        from defib.flashdump import verify_and_repair
+        ram = os.urandom(0x2000)
+        path = tmp_path / "dump.bin"
+        path.write_bytes(ram)
+
+        class Mute(RamDevice):
+            async def write(self, data: bytes) -> None:
+                if data.startswith(b"crc32"):
+                    self._rx.extend(b"OpenIPC # ")
+                else:
+                    await super().write(data)
+
+        dev = Mute(self.BASE, ram)
+        with pytest.raises(RuntimeError, match="could not be verified"):
+            await verify_and_repair(dev, str(path), self.BASE, len(ram))
+        assert not any(b.startswith(b"md.b") for b in dev._tx_log)
+
+    @pytest.mark.asyncio
+    async def test_complete_file_is_verified_not_dumped_again(self, tmp_path):
+        from defib.flashdump import dump_flash
+        ram = bytes([0xEA, 0x00, 0x04, 0x17]) * 4 + os.urandom(0x4000 - 16)
+        bad = bytearray(ram)
+        bad[0x2345] ^= 1
+        path = tmp_path / "dump.bin"
+        path.write_bytes(bytes(bad))
+        dev = RamDevice(self.BASE, ram)
+        n = await dump_flash(dev, str(path), flash_size=len(ram), ram_addr=self.BASE)
+        assert n == len(ram)
+        assert path.read_bytes() == ram
+        chunk_reads = [b for b in dev._tx_log if b.startswith(b"md.b") and b"0x1000" in b]
+        assert len(chunk_reads) == 1
+
+
 class TestDumpFlashResume:
     """Test resume from partial file."""
 
