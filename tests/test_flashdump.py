@@ -388,6 +388,30 @@ class TestDumpFlashSfProbe:
             )
 
 
+class TestSfReadOk:
+    """Old U-Boot 2010.06 says nothing on a successful sf read."""
+
+    def test_mainline_ok(self):
+        from defib.flashdump import sf_read_ok
+        assert sf_read_ok("sf read 0x82000000 0x0 0x1000000\r\n"
+                          "SF: 16777216 bytes @ 0x0 Read: OK\r\nOpenIPC # ")
+
+    def test_silent_2010_06_ok(self):
+        from defib.flashdump import sf_read_ok
+        assert sf_read_ok("sf read 0x82000000 0x0 0x1000000\r\nOpenIPC # ")
+
+    def test_failures(self):
+        from defib.flashdump import sf_read_ok
+        for resp in (
+            "sf read 0x82000000 0x0 0x1000000\r\nSF: Read: ERROR\r\nOpenIPC # ",
+            "sf read 0x82000000 0x0 0x1000000\r\nUsage:\r\nsf - SPI flash\r\nOpenIPC # ",
+            "device 0 offset 0x0, size 0x1000\nOpenIPC # \n",
+            "sf read 0x82000000 0x0 0x1000000\r\n",
+            "",
+        ):
+            assert not sf_read_ok(resp), resp
+
+
 class TestDumpFlashResume:
     """Test resume from partial file."""
 

@@ -510,6 +510,24 @@ async def detect_ram_staging_addr(
     )
 
 
+def sf_read_ok(resp: str) -> bool:
+    """Whether ``sf read`` answered as a successful read.
+
+    Mainline U-Boot says "Read: OK". U-Boot 2010.06, which the older HiSilicon
+    SDKs and OpenIPC's legacy hi3516cv300 build ship, prints nothing at all on
+    success and returns to the prompt. Only that exact shape counts: the echo,
+    then the prompt with no other output. Anything else without "Read: OK"
+    (an error, a usage line, a mainline answer cut short, a timeout before
+    the prompt) is a failure. The content check that follows still judges
+    the bytes.
+    """
+    if "Read: OK" in resp:
+        return True
+    lines = [ln.strip() for ln in resp.replace("\r", "\n").split("\n")]
+    lines = [ln for ln in lines if ln and not ln.startswith("sf read")]
+    return len(lines) == 1 and lines[0].endswith("#")
+
+
 async def dump_flash(
     transport: Transport,
     output_path: str,
@@ -580,7 +598,7 @@ async def dump_flash(
     cmd = f"sf read 0x{ram_addr:x} 0x0 0x{flash_size:x}"
     resp = await send_command(transport, cmd, timeout=SF_READ_TIMEOUT, wait_for="# ")
 
-    if "Read: OK" not in resp:
+    if not sf_read_ok(resp):
         raise RuntimeError(
             f"sf read failed or timed out. Response: {resp.strip()[-200:]}"
         )
