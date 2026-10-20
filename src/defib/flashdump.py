@@ -491,19 +491,31 @@ async def verify_and_repair(
     a resumed dump keeps whatever the earlier run wrote, and a chunk is kept
     unverified when the check itself fails on the wire. This compares the
     whole file with one ``crc32`` of the RAM copy; on a mismatch it narrows
-    down by ``block``, re-reads each differing ``chunk`` until it matches,
-    and raises if one never does. Returns the number of chunks rewritten.
+    down by ``block`` and re-reads each differing ``chunk`` until it matches,
+    writing it to the file at once, so a later failure keeps the repairs
+    made so far. Raises if a chunk never matches, or if the device never
+    answers a ``crc32`` (the image is then unverified, not known bad).
+    Returns the number of chunks rewritten.
     """
     import zlib
 
+    async def device_crc(addr: int, n: int, timeout: float = 5.0) -> int:
+        for _ in range(3):
+            crc = await _get_device_crc32(transport, addr, n, timeout)
+            if crc is not None:
+                return crc
+        raise RuntimeError(
+            f"No crc32 answer for 0x{addr:x}+0x{n:x}: the dump could not be verified"
+        )
+
     # crc32 runs at a few MB/s on the slowest SoCs
     whole_timeout = 5.0 + size / (1 << 20)
-    with open(output_path, "rb") as f:
-        data = bytearray(f.read(size))
+    with open(output_path, "rb") as src:
+        data = bytearray(src.read(size))
     if len(data) != size:
         raise RuntimeError(f"{output_path} holds {len(data)} bytes, expected {size}")
 
-    if await _get_device_crc32(transport, ram_addr, size, whole_timeout) == zlib.crc32(data):
+    if await device_crc(ram_addr, size, whole_timeout) == zlib.crc32(data):
         if on_log:
             on_log("Whole-image CRC32 matches the device")
         return 0
@@ -511,33 +523,33 @@ async def verify_and_repair(
     if on_log:
         on_log("Whole-image CRC32 differs from the device, re-reading what differs")
     fixed = 0
-    for boff in range(0, size, block):
-        bend = min(boff + block, size)
-        if await _get_device_crc32(
-            transport, ram_addr + boff, bend - boff
-        ) == zlib.crc32(data[boff:bend]):
-            continue
-        for off in range(boff, bend, chunk):
-            n = min(chunk, bend - off)
-            want = await _get_device_crc32(transport, ram_addr + off, n)
-            if want == zlib.crc32(data[off:off + n]):
-                continue
-            for _ in range(max_retries + 1):
-                resp = await send_command(
-                    transport, f"md.b 0x{ram_addr + off:x} 0x{n:x}",
-                    timeout=15.0, wait_for="# ",
-                )
-                got = parse_md_output(resp)
-                if want is not None and len(got) == n and zlib.crc32(got) == want:
-                    data[off:off + n] = got
-                    fixed += 1
-                    break
-            else:
-                raise RuntimeError(f"Could not read a matching copy of 0x{off:x}")
     with open(output_path, "r+b") as f:
-        f.write(data)
+        for boff in range(0, size, block):
+            bend = min(boff + block, size)
+            if await device_crc(ram_addr + boff, bend - boff) == zlib.crc32(data[boff:bend]):
+                continue
+            for off in range(boff, bend, chunk):
+                n = min(chunk, bend - off)
+                want = await device_crc(ram_addr + off, n)
+                if want == zlib.crc32(data[off:off + n]):
+                    continue
+                for _ in range(max_retries + 1):
+                    resp = await send_command(
+                        transport, f"md.b 0x{ram_addr + off:x} 0x{n:x}",
+                        timeout=15.0, wait_for="# ",
+                    )
+                    got = parse_md_output(resp)
+                    if len(got) == n and zlib.crc32(got) == want:
+                        data[off:off + n] = got
+                        f.seek(off)
+                        f.write(got)
+                        f.flush()
+                        fixed += 1
+                        break
+                else:
+                    raise RuntimeError(f"Could not read a matching copy of 0x{off:x}")
 
-    if await _get_device_crc32(transport, ram_addr, size, whole_timeout) != zlib.crc32(data):
+    if await device_crc(ram_addr, size, whole_timeout) != zlib.crc32(data):
         raise RuntimeError("Whole-image CRC32 still differs from the device after repair")
     if on_log:
         on_log(f"Re-read {fixed} chunk(s); whole-image CRC32 now matches the device")
@@ -722,6 +734,12 @@ async def dump_flash(
             if on_log:
                 pct = offset * 100 // flash_size
                 on_log(f"Resuming from 0x{offset:x} ({pct}% already done)")
+        elif existing == flash_size and has_crc32:
+            # A complete file from an earlier run: check it, repair what differs
+            offset = flash_size
+            file_mode = "r+b"
+            if on_log:
+                on_log("Output file is complete; verifying it against the device")
 
     verified = 0
     errors = 0

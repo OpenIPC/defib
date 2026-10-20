@@ -497,6 +497,68 @@ class TestVerifyAndRepair:
             await verify_and_repair(Broken(self.BASE, ram), path, self.BASE, len(ram))
 
 
+class TestVerifyAndRepairFailures:
+    BASE = 0x82000000
+
+    @pytest.mark.asyncio
+    async def test_later_failure_keeps_earlier_repairs(self, tmp_path):
+        from defib.flashdump import verify_and_repair
+        ram = os.urandom(0x4000)
+        bad = bytearray(ram)
+        bad[0x10] ^= 1
+        bad[0x3010] ^= 1
+        path = tmp_path / "dump.bin"
+        path.write_bytes(bytes(bad))
+
+        class LastChunkUnreadable(RamDevice):
+            async def write(self, data: bytes) -> None:
+                if data.startswith(b"md.b 0x82003000"):
+                    self._rx.extend(b"OpenIPC # ")
+                else:
+                    await super().write(data)
+
+        with pytest.raises(RuntimeError, match="0x3000"):
+            await verify_and_repair(
+                LastChunkUnreadable(self.BASE, ram), str(path), self.BASE, len(ram),
+                block=0x2000,
+            )
+        assert path.read_bytes()[:0x1000] == ram[:0x1000]
+
+    @pytest.mark.asyncio
+    async def test_no_crc_answer_is_unverified_not_bad(self, tmp_path):
+        from defib.flashdump import verify_and_repair
+        ram = os.urandom(0x2000)
+        path = tmp_path / "dump.bin"
+        path.write_bytes(ram)
+
+        class Mute(RamDevice):
+            async def write(self, data: bytes) -> None:
+                if data.startswith(b"crc32"):
+                    self._rx.extend(b"OpenIPC # ")
+                else:
+                    await super().write(data)
+
+        dev = Mute(self.BASE, ram)
+        with pytest.raises(RuntimeError, match="could not be verified"):
+            await verify_and_repair(dev, str(path), self.BASE, len(ram))
+        assert not any(b.startswith(b"md.b") for b in dev._tx_log)
+
+    @pytest.mark.asyncio
+    async def test_complete_file_is_verified_not_dumped_again(self, tmp_path):
+        from defib.flashdump import dump_flash
+        ram = bytes([0xEA, 0x00, 0x04, 0x17]) * 4 + os.urandom(0x4000 - 16)
+        bad = bytearray(ram)
+        bad[0x2345] ^= 1
+        path = tmp_path / "dump.bin"
+        path.write_bytes(bytes(bad))
+        dev = RamDevice(self.BASE, ram)
+        n = await dump_flash(dev, str(path), flash_size=len(ram), ram_addr=self.BASE)
+        assert n == len(ram)
+        assert path.read_bytes() == ram
+        chunk_reads = [b for b in dev._tx_log if b.startswith(b"md.b") and b"0x1000" in b]
+        assert len(chunk_reads) == 1
+
+
 class TestDumpFlashResume:
     """Test resume from partial file."""
 
