@@ -1,8 +1,10 @@
-"""Split NOR install for the gk7205v200 family (OpenIPC/u-boot openipc-hisilicon).
+"""Split NOR install (OpenIPC/u-boot openipc-hisilicon): the gk7205v200 family,
+hi3516cv6xx and hi3519dv500.
 
 openipc.<board>-nor-<variant>-split.tgz carries one firmware.bin: the uImage,
-then the squashfs at the next 64 KiB block. It is written at 0x50000 and the
-rest of the chip is erased; the kernel divides it into kernel, rootfs and
+then the squashfs at the next 64 KiB block. It is written where the board's
+boot area ends (0x50000; 0xc0000 on hi3519dv500) and the rest of the chip is
+erased; the kernel divides it into kernel, rootfs and
 rootfs_data at boot. That U-Boot works out the NOR layout itself, so the env
 stage loads its defaults rather than writing fixed-slot mtdparts.
 """
@@ -84,7 +86,7 @@ class FakeNorUBoot:
             return f"crc32 for {words[1]} ... ==> {zlib.crc32(self.ram[:size]):08x}" + prompt
         if words[:2] == ["sf", "erase"]:
             off, size = int(words[2], 16), int(words[3], 16)
-            assert off + size <= CHIP_8M
+            assert off + size <= len(self.flash)
             self.flash[off:off + size] = b"\xff" * size
             return f"SF: {size} bytes @ {off:#x} Erased: OK" + prompt
         if words[:2] == ["sf", "write"]:
@@ -93,7 +95,7 @@ class FakeNorUBoot:
             return f"SF: {size} bytes @ {off:#x} Written: OK" + prompt
         if words[:2] == ["sf", "read"]:
             off, size = int(words[3], 16), int(words[4], 16)
-            if off + size > CHIP_8M:
+            if off + size > len(self.flash):
                 return "Offset exceeds device limit\nsf - SPI flash sub-system\n\nUsage:" + prompt
             self.ram = bytes(self.flash[off:off + size])
             return f"SF: {size} bytes @ {off:#x} Read: OK" + prompt
@@ -124,14 +126,19 @@ def _seed_cache(monkeypatch, tmp_path: Path) -> None:
     for soc in ("gk7205v200", "hi3516ev300"):
         (cache / f"u-boot-{soc}-nor.bin").write_bytes(b"N" * 0x36000)
         (cache / f"u-boot-{soc}-universal.bin").write_bytes(b"X" * 0x30000)
+    # Signed boot images; hi3519dv500's is 383 KiB, past a 256 KiB boot partition.
+    (cache / "boot-hi3516cv610-20s-nor.bin").write_bytes(b"C" * 0x3A000)
+    (cache / "boot-hi3519dv500-dmeb-nor.bin").write_bytes(b"D" * 0x5FC00)
 
 
 async def _install(monkeypatch, tmp_path, firmware: Path, *, chip: str = "gk7205v200",
+                   chip_size: int = CHIP_8M,
                    **kwargs) -> tuple[FakeNorUBoot, dict[str, object]]:
     from defib.install.orchestrator import run_install
 
     _seed_cache(monkeypatch, tmp_path)
     device = FakeNorUBoot()
+    device.flash = bytearray(b"\x5a" * chip_size)
     seen = _patch_install(monkeypatch, device)
     await run_install(InstallRequest(
         chip=chip, firmware_path=str(firmware), port="COM15", nic="eth0",
@@ -199,6 +206,52 @@ async def test_split_install_writes_firmware_bin_over_the_whole_chip(monkeypatch
     assert device.env.get("totalmem") == "128M"
     assert not any(c.startswith("setenv mtdparts") for c in device.commands)
     assert not any("bootcmdnor" in c for c in device.commands)
+
+
+@pytest.mark.asyncio
+async def test_split_install_behind_a_larger_boot_area(monkeypatch, tmp_path):
+    """hi3519dv500: 512k boot, 256k env, firmware.bin from 0xc0000."""
+    chip_16m = 16 * 1024 * 1024
+    firmware = _split_package(tmp_path / "openipc.hi3519dv500-nor-ultimate-split.tgz",
+                              board="hi3519dv500")
+    device, seen = await _install(monkeypatch, tmp_path, firmware,
+                                  chip="hi3519dv500:dmeb", chip_size=chip_16m)
+
+    assert Path(str(seen["burned"])).name == "boot-hi3519dv500-dmeb-nor.bin"
+    # The whole signed boot image, padded to its 512 KiB partition.
+    assert bytes(device.flash[:0x80000]) == b"D" * 0x5FC00 + b"\xff" * (0x80000 - 0x5FC00)
+    image = _split_image()
+    assert bytes(device.flash[0xC0000:0xC0000 + len(image)]) == image
+    assert bytes(device.flash[0xC0000 + len(image):]) == (
+        b"\xff" * (chip_16m - 0xC0000 - len(image))
+    )
+    assert f"sf erase 0xc0000 0x{chip_16m - 0xC0000:x}" in device.commands
+
+
+@pytest.mark.asyncio
+async def test_split_install_of_a_family_package(monkeypatch, tmp_path):
+    """hi3516cv610 installs the one hi3516cv6xx build, at 0x50000."""
+    firmware = _split_package(tmp_path / "openipc.hi3516cv6xx-nor-lite-split.tgz",
+                              board="hi3516cv6xx")
+    device, seen = await _install(monkeypatch, tmp_path, firmware, chip="hi3516cv610:20s")
+
+    assert Path(str(seen["burned"])).name == "boot-hi3516cv610-20s-nor.bin"
+    image = _split_image()
+    assert bytes(device.flash[0x50000:0x50000 + len(image)]) == image
+    assert "sf erase 0x50000 0x7b0000" in device.commands
+
+
+@pytest.mark.asyncio
+async def test_fixed_slot_package_behind_a_larger_boot_area_is_refused(
+    monkeypatch, tmp_path, capsys
+):
+    firmware = tmp_path / "openipc.hi3519dv500-nor-ultimate.tgz"
+    _write_tar(firmware, {"uImage.hi3519dv500": b"K" * 1024,
+                          "rootfs.squashfs.hi3519dv500": b"R" * 2048})
+    with pytest.raises(typer.Exit) as exc:
+        await _install(monkeypatch, tmp_path, firmware, chip="hi3519dv500:dmeb")
+    assert exc.value.exit_code == 2
+    assert "install the split NOR package" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
@@ -289,3 +342,25 @@ async def test_split_erase_timeout_scales_with_the_chip(monkeypatch, tmp_path):
     finally:
         CHIP_8M = saved
     assert timeouts["sf erase 0x50000 0x1fb0000"] >= 0x1FB0000 / 0x10000
+
+
+def test_package_board_and_boot_area_are_data():
+    from defib.firmware import nor_boot_area, package_board, supports_nor_split
+    from defib.install.layout import nor_layout, split_boards
+
+    assert package_board("hi3516cv610:00g") == "hi3516cv6xx"
+    assert package_board("hi3516dv500") == "hi3519dv500"
+    assert package_board("gk7205v210") == "gk7205v200"
+    assert "hi3516cv6xx" in split_boards("hi3516cv608")
+    for chip in ("hi3516cv608", "hi3516cv610", "hi3516cv613", "hi3519dv500",
+                 "hi3516dv500", "gk7205v200"):
+        assert supports_nor_split(chip), chip
+    assert not supports_nor_split("hi3516ev300")
+
+    assert nor_boot_area("hi3516cv610") == (0x40000, 0x10000)
+    assert nor_boot_area("hi3516dv500") == (0x80000, 0x40000)
+    layout = nor_layout(16, nor_boot_area("hi3519dv500"))
+    assert layout["env"] == (0x80000, 0x40000)
+    assert layout["kernel"] == (0xC0000, 0)
+    assert layout["rootfs"] == (0xC0000, 16 * 1024 * 1024 - 0xC0000)
+    assert nor_layout(16, nor_boot_area("hi3516cv610"))["kernel"] == (0x50000, 0x300000)

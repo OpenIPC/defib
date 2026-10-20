@@ -118,16 +118,24 @@ ships a split NOR package, `openipc.<board>-nor-<variant>-split.tgz`, and
 | `0x040000` | 64K | env |
 | `0x050000` | rest of chip | firmware: `firmware.bin.<board>` (the uImage, then the squashfs at the next 64 KiB); the kernel divides it into `kernel`, `rootfs` and `rootfs_data` at boot, from its own device tree |
 
+hi3516cv608/cv610/cv613 and hi3519dv500/hi3516dv500 ship only the split
+package, one build per family (`openipc.hi3516cv6xx-nor-lite-split.tgz`,
+`openipc.hi3519dv500-nor-ultimate-split.tgz`). Their boot partition holds
+the signed boot image, `boot-<chip>[-<variant>]-nor.bin`. hi3519dv500's
+image is 383 KiB, so its board puts the env at `0x80000` (256K) and the
+firmware at `0xC0000`. Each board's boot area is data in `defib.firmware`
+(`NOR_BOOT_AREAS`), and `install` writes `firmware.bin` where it ends.
+
 ```bash
 defib install -c gk7205v300 \
   --firmware openipc.gk7205v300-nor-ultimate-split.tgz \
   -p /dev/ttyUSB0 --power-cycle
 ```
 
-The `rootfs` stage writes `firmware.bin` at `0x50000` and erases the rest of the
-chip, so the first boot starts with an empty overlay; the `kernel` and
-`rootfs-data` stages have nothing of their own to do. Any U-Boot that loads the
-kernel from `0x50000` boots the image -- the kernel ignores whatever `mtdparts`
+The `rootfs` stage writes `firmware.bin` where the boot area ends and erases
+the rest of the chip, so the first boot starts with an empty overlay; the
+`kernel` and `rootfs-data` stages have nothing of their own to do. Any U-Boot
+that loads the kernel from there boots the image -- the kernel ignores whatever `mtdparts`
 and `root=` it passes -- so a plan without the `uboot` stage needs no more than
 that. See the [OpenIPC wiki](https://github.com/OpenIPC/wiki/blob/master/en/nor-split-layout.md)
 for the layout itself.

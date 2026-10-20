@@ -8,7 +8,7 @@ from defib.firmware import (
     AVAILABLE_FIRMWARE,
     CLASSIC_UBOOT_VARIANTS,
     PER_FLASH_TYPE_UBOOT,
-    CV6XX_BOOT_VARIANTS,
+    BOOT_IMAGE_VARIANTS,
     asset_name,
     download_firmware,
     firmware_url,
@@ -113,7 +113,7 @@ class TestCV6xxBootImages:
         assert asset_name("hi3516cv608") == "boot-hi3516cv608-nor.bin"
 
     def test_cv6xx_never_uses_universal_naming(self):
-        for chip in CV6XX_BOOT_VARIANTS:
+        for chip in BOOT_IMAGE_VARIANTS:
             assert chip not in AVAILABLE_FIRMWARE
             for name in (chip, f"{chip}:00g", f"{chip}:dmeb"):
                 resolved = asset_name(name)
@@ -151,7 +151,7 @@ class TestCV6xxBootImages:
         monkeypatch.setattr("sys.platform", "linux")
         with pytest.raises(ValueError, match="explicit board variant") as exc:
             download_firmware("hi3516cv610")
-        for variant in CV6XX_BOOT_VARIANTS["hi3516cv610"]:
+        for variant in BOOT_IMAGE_VARIANTS["hi3516cv610"]:
             assert f"hi3516cv610:{variant}" in str(exc.value)
 
 

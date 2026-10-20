@@ -18,7 +18,7 @@ from defib.install.layout import (
     NAND_LAYOUT,
     NAND_UBI_LAYOUT,
     NAND_UBI_OFFSET,
-    NOR8M_LAYOUT,
+    STANDARD_NOR_BOOT_AREA,
     align_up,
     detect_nor_size_mb,
     erased_region_crc,
@@ -62,6 +62,7 @@ async def run_install(request: InstallRequest) -> None:
         get_cached_path,
         has_firmware,
         pad_to_size,
+        nor_boot_area,
         supports_nor_split,
         uses_per_flash_type_uboot,
     )
@@ -191,9 +192,10 @@ async def run_install(request: InstallRequest) -> None:
             exit_code=2,
         )
 
-    # The NOR boot and env partitions are fixed across the standard OpenIPC
-    # 8/16/32 MiB layouts. Kernel/rootfs sizing is selected after ``sf probe``
-    # reports the actual flash capacity.
+    # The NOR boot and env partitions are the board's (256k/64k on most, see
+    # defib.firmware.nor_boot_area) whatever the flash size. Kernel/rootfs
+    # sizing is selected after ``sf probe`` reports the actual flash capacity.
+    boot_area = nor_boot_area(chip)
     layout: dict[str, tuple[int, int]] | None
     if ubi_layout:
         layout = None
@@ -211,8 +213,8 @@ async def run_install(request: InstallRequest) -> None:
         layout = None
         flash_cmd = "sf"
         flash_label = f"NOR {nor_size}MB (override)" if nor_size else "NOR auto-detect"
-        b_off, b_sz = NOR8M_LAYOUT["boot"]
-        _, env_sz = NOR8M_LAYOUT["env"]
+        b_off = 0
+        b_sz, env_sz = boot_area
 
     # --- Step 1: Extract firmware tarball ---
     if output == "human":
@@ -246,9 +248,17 @@ async def run_install(request: InstallRequest) -> None:
     except ValueError as exc:
         fail(str(exc))
 
-    # openipc.<board>-nor-<variant>-split.tgz: one firmware.bin at 0x50000,
-    # which the kernel divides into kernel, rootfs and rootfs_data at boot.
+    # openipc.<board>-nor-<variant>-split.tgz: one firmware.bin where the boot
+    # area ends, which the kernel divides into kernel, rootfs and rootfs_data
+    # at boot.
     split = firmware.split
+    if not nand and not split and boot_area != STANDARD_NOR_BOOT_AREA:
+        fail(
+            f"{chip} has no fixed kernel/rootfs slots behind its "
+            f"{boot_area[0] // 1024}k boot and {boot_area[1] // 1024}k env: "
+            "install the split NOR package (openipc.<board>-nor-<variant>-split.tgz)",
+            exit_code=2,
+        )
     if split:
         if nand:
             fail("A split NOR package (firmware.bin) cannot be installed on NAND", exit_code=2)
@@ -291,7 +301,8 @@ async def run_install(request: InstallRequest) -> None:
         elif split:
             console.print(
                 f"  Image:  [cyan]{rootfs_name}[/cyan] ({len(rootfs_data)} bytes; "
-                "split NOR layout, uImage + squashfs at 0x50000)"
+                "split NOR layout, uImage + squashfs at "
+                f"0x{sum(boot_area):X})"
             )
         else:
             console.print(f"  Kernel: [cyan]{kernel_name}[/cyan] ({len(kernel_data)} bytes)")
@@ -885,7 +896,7 @@ async def run_install(request: InstallRequest) -> None:
             )
         except ValueError as exc:
             await close_and_fail(str(exc), exit_code=2)
-        layout = nor_layout(nor_size)
+        layout = nor_layout(nor_size, boot_area)
 
         k_off, k_sz = layout["kernel"]
         r_off, r_sz = layout["rootfs"]
@@ -1664,7 +1675,7 @@ async def run_install(request: InstallRequest) -> None:
                     raise typer.Exit(1)
                 preserved_stock_env["ethaddr"] = reset_eth
 
-                env_off, env_size = nor_layout(nor_size)["env"]
+                env_off, env_size = nor_layout(nor_size, boot_area)["env"]
                 if env_off % nor_erase_block or env_size % nor_erase_block:
                     raise RuntimeError(
                         "U-Boot environment partition is not aligned to the "
@@ -1853,7 +1864,7 @@ async def run_install(request: InstallRequest) -> None:
                     raise RuntimeError(f"saveenv failed: {save_resp.strip()}")
 
                 if has_stock_uboot:
-                    env_off, env_size = nor_layout(nor_size)["env"]
+                    env_off, env_size = nor_layout(nor_size, boot_area)["env"]
                     persisted_crc = await verify_spi_environment_crc(
                         _cmd,
                         env_off=env_off,

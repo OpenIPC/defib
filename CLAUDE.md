@@ -173,10 +173,15 @@ Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
   UBI-only layout (`NAND_UBI_LAYOUT` in `install/layout.py`: 768k boot, 256k
   env, rest ubi), whose mtdparts/bootcmd/bootargs come from the U-Boot default
   env; `NAND_LAYOUT` is the legacy split layout for other chips. The
-  `NOR_SPLIT_SOCS` (gk7205v200 family) also install the split NOR package:
-  one `firmware.bin.<board>` at 0x50000, the rest of the chip erased, which
-  the kernel divides at boot; their NOR U-Boot scans the layout, so the env
-  stage loads its defaults (`env default -a`) on either NOR layout.
+  `NOR_SPLIT_SOCS` (gk7205v200 family, hi3516cv6xx, hi3519dv500; keyed by
+  package board, `FIRMWARE_PACKAGE_BOARD` maps cv608/cv610/cv613 to
+  `hi3516cv6xx` and hi3516dv500 to `hi3519dv500`) install the split NOR
+  package: one `firmware.bin.<board>` where the boot area ends (0x50000;
+  `NOR_BOOT_AREAS` gives hi3519dv500 512k boot + 256k env, so 0xC0000), the
+  rest of the chip erased, which the kernel divides at boot; their NOR U-Boot
+  scans the layout, so the env stage loads its defaults (`env default -a`) on
+  either NOR layout. Boot-image SoCs (`BOOT_IMAGE_VARIANTS`) publish
+  `boot-<chip>[-<variant>]-nor.bin` instead of a bare U-Boot.
 - **Capture** (`src/defib/capture/`) — record/replay UART sessions in `.dcap`.
 - Loose modules worth knowing: `flashdump.py` (dump flash through a U-Boot
   console), `ubi.py` (extract UBIFS volumes from raw UBI), `uboot_env.py`,
