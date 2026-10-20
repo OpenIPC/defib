@@ -460,19 +460,88 @@ async def _detect_crc32(transport: Transport) -> bool:
 
 
 async def _get_device_crc32(
-    transport: Transport, addr: int, size: int
+    transport: Transport, addr: int, size: int, timeout: float = 5.0
 ) -> int | None:
     """Run crc32 on the device and parse the result.
 
     U-Boot crc32 output: "CRC32 for 42000000 ... 42000fff ==> abcd1234"
     """
     cmd = f"crc32 0x{addr:x} 0x{size:x}"
-    resp = await send_command(transport, cmd, timeout=5.0, wait_for="# ")
+    resp = await send_command(transport, cmd, timeout=timeout, wait_for="# ")
     # Parse "==> XXXXXXXX" pattern
     m = re.search(r"==>\s*([0-9a-fA-F]{8})", resp)
     if m:
         return int(m.group(1), 16)
     return None
+
+
+async def verify_and_repair(
+    transport: Transport,
+    output_path: str,
+    ram_addr: int,
+    size: int,
+    on_log: Callable[[str], None] | None = None,
+    block: int = 0x10000,
+    chunk: int = 0x1000,
+    max_retries: int = 5,
+) -> int:
+    """Check the whole file against the copy in RAM, and re-read what differs.
+
+    The per-chunk check in the dump loop only covers chunks read in this run:
+    a resumed dump keeps whatever the earlier run wrote, and a chunk is kept
+    unverified when the check itself fails on the wire. This compares the
+    whole file with one ``crc32`` of the RAM copy; on a mismatch it narrows
+    down by ``block``, re-reads each differing ``chunk`` until it matches,
+    and raises if one never does. Returns the number of chunks rewritten.
+    """
+    import zlib
+
+    # crc32 runs at a few MB/s on the slowest SoCs
+    whole_timeout = 5.0 + size / (1 << 20)
+    with open(output_path, "rb") as f:
+        data = bytearray(f.read(size))
+    if len(data) != size:
+        raise RuntimeError(f"{output_path} holds {len(data)} bytes, expected {size}")
+
+    if await _get_device_crc32(transport, ram_addr, size, whole_timeout) == zlib.crc32(data):
+        if on_log:
+            on_log("Whole-image CRC32 matches the device")
+        return 0
+
+    if on_log:
+        on_log("Whole-image CRC32 differs from the device, re-reading what differs")
+    fixed = 0
+    for boff in range(0, size, block):
+        bend = min(boff + block, size)
+        if await _get_device_crc32(
+            transport, ram_addr + boff, bend - boff
+        ) == zlib.crc32(data[boff:bend]):
+            continue
+        for off in range(boff, bend, chunk):
+            n = min(chunk, bend - off)
+            want = await _get_device_crc32(transport, ram_addr + off, n)
+            if want == zlib.crc32(data[off:off + n]):
+                continue
+            for _ in range(max_retries + 1):
+                resp = await send_command(
+                    transport, f"md.b 0x{ram_addr + off:x} 0x{n:x}",
+                    timeout=15.0, wait_for="# ",
+                )
+                got = parse_md_output(resp)
+                if want is not None and len(got) == n and zlib.crc32(got) == want:
+                    data[off:off + n] = got
+                    fixed += 1
+                    break
+            else:
+                raise RuntimeError(f"Could not read a matching copy of 0x{off:x}")
+    with open(output_path, "r+b") as f:
+        f.write(data)
+
+    if await _get_device_crc32(transport, ram_addr, size, whole_timeout) != zlib.crc32(data):
+        raise RuntimeError("Whole-image CRC32 still differs from the device after repair")
+    if on_log:
+        on_log(f"Re-read {fixed} chunk(s); whole-image CRC32 now matches the device")
+    return fixed
 
 
 async def detect_ram_staging_addr(
@@ -713,14 +782,15 @@ async def dump_flash(
                     except Exception:
                         # CRC check failed due to transport — still have data, use it
                         break
-                    if device_crc is not None and device_crc != local_crc:
+                    if device_crc is None or device_crc != local_crc:
                         errors += 1
                         if attempt < max_retries:
                             retries_total += 1
                             if on_log:
+                                dev = "?" if device_crc is None else f"{device_crc:08x}"
                                 on_log(
                                     f"CRC mismatch at 0x{offset:x} "
-                                    f"(local={local_crc:08x} device={device_crc:08x}), "
+                                    f"(local={local_crc:08x} device={dev}), "
                                     f"retry {attempt + 1}"
                                 )
                             continue
@@ -759,6 +829,9 @@ async def dump_flash(
                     "eta_s": eta,
                     "crc_enabled": has_crc32,
                 })
+
+    if has_crc32 and offset == flash_size:
+        await verify_and_repair(transport, output_path, ram_addr, flash_size, on_log)
 
     if on_log:
         msg = f"Flash dump saved: {output_path} ({offset} bytes)"
