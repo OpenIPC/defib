@@ -191,15 +191,18 @@ const FW_DIRECT_BASE =
   'https://github.com/OpenIPC/firmware/releases/download/latest';
 
 // Asset name → chip, e.g. u-boot-gk7205v300-universal.bin → gk7205v300.
-// The u-boot-xmedia SoCs, and hi3516cv300/hi3516ev100 from OpenIPC/u-boot,
-// publish per flash type instead (-nor.bin, -nand.bin); a recovery loads
-// U-Boot into RAM and needs no flash layout, so it takes the -nor one, as
-// `defib burn` does without --nand. The -universal image still published for
-// cv300/ev100 is U-Boot 2010.06, which cannot boot their split NOR layout.
+// The u-boot-xmedia SoCs, and the gk7205v200 family and hi3516cv300/hi3516ev100
+// from OpenIPC/u-boot, publish per flash type instead (-nor.bin, -nand.bin); a
+// recovery loads U-Boot into RAM and needs no flash layout, so it takes the
+// -nor one, as `defib burn` does without --nand. The -universal images still
+// published for them are older builds (2016.11 on Goke, 2010.06 on cv300/ev100)
+// that do not scan the flash: once their environment is wiped they fall back to
+// the 8 MB slots, and they cannot boot the split NOR layout.
 const FW_ASSET_RE = /^u-boot-(.+)-(universal|nor)\.bin$/;
 const XMEDIA_SOCS = new Set([
   'hi3516ev200', 'hi3516ev300', 'hi3518ev300', 'hi3516dv200',
   'gk7205v500', 'gk7205v510', 'gk7205v530',
+  'gk7202v300', 'gk7205v200', 'gk7205v300', 'gk7605v100',
   'hi3516cv300', 'hi3516ev100',
 ]);
 
