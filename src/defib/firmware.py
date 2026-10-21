@@ -87,6 +87,9 @@ NOR_SPLIT_SOCS: frozenset[str] = frozenset({
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
     "hi3516cv6xx", "hi3519dv500",
     "hi3516cv300", "hi3516ev100",
+    # Not hi3516ev300: its kernel fills the 2 MiB slot, so its firmware
+    # ships fixed slots only.
+    "hi3516ev200", "hi3518ev300", "hi3516dv200",
 })
 
 # NOR boot area -- (boot partition size, env partition size) -- where it is
