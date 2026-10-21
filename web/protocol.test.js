@@ -626,6 +626,20 @@ describe('fwAssetName', () => {
     assert.equal(fwAssetName('hi3516ev300'), 'u-boot-hi3516ev300-nor.bin');
     assert.equal(fwAssetName('gk7205v510'), 'u-boot-gk7205v510-nor.bin');
     assert.equal(fwAssetName('gk7205v300'), 'u-boot-gk7205v300-universal.bin');
+    assert.equal(fwAssetName('hi3516cv300'), 'u-boot-hi3516cv300-nor.bin');
+    assert.equal(fwAssetName('hi3516ev100'), 'u-boot-hi3516ev100-nor.bin');
+  });
+  it('takes the -nor build of hi3516cv300/ev100 over their 2010.06 universal', () => {
+    const idx = parseReleaseAssets({ assets: [
+      { name: 'u-boot-hi3516cv300-universal.bin', size: 1, digest: null },
+      { name: 'u-boot-hi3516cv300-nor.bin', size: 2, digest: null },
+      { name: 'u-boot-hi3516cv300-nand.bin', size: 3, digest: null },
+      { name: 'u-boot-hi3516ev100-universal.bin', size: 4, digest: null },
+      { name: 'u-boot-hi3516ev100-nor.bin', size: 5, digest: null },
+    ] });
+    assert.equal(idx.get('hi3516cv300').name, 'u-boot-hi3516cv300-nor.bin');
+    assert.equal(idx.get('hi3516ev100').name, 'u-boot-hi3516ev100-nor.bin');
+    assert.equal(idx.size, 2);
   });
   it('takes each chip\'s own asset and ignores a stale -universal one', () => {
     const idx = parseReleaseAssets({ assets: [

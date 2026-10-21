@@ -34,9 +34,8 @@ OPENIPC_BASE_URL = (
 # Boot-image SoCs are deliberately absent — see BOOT_IMAGE_VARIANTS below.
 AVAILABLE_FIRMWARE: set[str] = {
     "hi3516av100", "hi3516av200", "hi3516av300",
-    "hi3516cv100", "hi3516cv200", "hi3516cv300", "hi3516cv500",
+    "hi3516cv100", "hi3516cv200", "hi3516cv500",
     "hi3516dv100", "hi3516dv300",
-    "hi3516ev100",
     "hi3518av100", "hi3518cv100", "hi3518ev100", "hi3518ev200",
     "hi3519v101", "hi3520dv200", "hi3536cv100", "hi3536dv100",
     "t40a", "t40n", "t40xp",
@@ -44,17 +43,29 @@ AVAILABLE_FIRMWARE: set[str] = {
 
 # SoCs whose OpenIPC U-Boot is published once per flash type as
 # u-boot-{chip}-nor.bin / u-boot-{chip}-nand.bin: the u-boot-xmedia SoCs, and
-# the gk7205v200 family built from OpenIPC/u-boot (openipc-hisilicon). The
+# the gk7205v200 family and hi3516cv300/hi3516ev100 built from OpenIPC/u-boot
+# (openipc-hisilicon). The
 # NAND build owns the UBI-only layout (768k boot, 256k env, rest ubi) in its
 # default environment, so a NOR image must never be installed on NAND or vice
 # versa. The old u-boot-{chip}-universal.bin of these SoCs came from retired
 # per-SoC repositories (u-boot-hi3516ev200, u-boot-gk7205v200); it is never
-# downloaded for them again.
+# downloaded for them again. hi3516cv300/hi3516ev100 still have a
+# u-boot-*-universal.bin (U-Boot 2010.06), which knows no split layout.
 PER_FLASH_TYPE_UBOOT: frozenset[str] = frozenset({
     "hi3516ev200", "hi3516ev300", "hi3518ev300", "hi3516dv200",
     "gk7205v500", "gk7205v510", "gk7205v530",
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
+    "hi3516cv300", "hi3516ev100",
 })
+
+# Of those, the SoCs with no NAND build published: asking for one finds none.
+NOR_ONLY_UBOOT: frozenset[str] = frozenset({"hi3516ev100"})
+
+# Of those, the SoCs whose old u-boot-*-universal.bin must never stand in for
+# the -nor build, even offline: it is U-Boot 2010.06, which knows no split
+# layout, and install writes the split firmware and loads that U-Boot's
+# default environment.
+NO_UNIVERSAL_FALLBACK: frozenset[str] = frozenset({"hi3516cv300", "hi3516ev100"})
 
 # The firmware package a chip installs, where it is not the chip's own: one
 # hi3516cv6xx build serves the whole CV6xx family, and hi3516dv500 is the
@@ -75,6 +86,7 @@ FIRMWARE_PACKAGE_BOARD: dict[str, str] = {
 NOR_SPLIT_SOCS: frozenset[str] = frozenset({
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
     "hi3516cv6xx", "hi3519dv500",
+    "hi3516cv300", "hi3516ev100",
 })
 
 # NOR boot area -- (boot partition size, env partition size) -- where it is
@@ -210,6 +222,8 @@ def asset_name(chip: str, flash_type: str | None = None) -> str | None:
     name = CHIP_TO_FIRMWARE.get(base.lower(), base.lower())
 
     if name in PER_FLASH_TYPE_UBOOT:
+        if kind == "nand" and name in NOR_ONLY_UBOOT:
+            return None
         # Board variants (e.g. ``:emmc``) do not change the per-flash build.
         return f"u-boot-{name}-{kind}.bin"
 
@@ -415,6 +429,7 @@ def download_firmware(
         if (
             uses_per_flash_type_uboot(chip)
             and normalize_flash_type(flash_type) == "nor"
+            and package_board(chip) not in NO_UNIVERSAL_FALLBACK
         ):
             legacy = _cached_file(_legacy_cache_name(chip))
             if legacy is not None:

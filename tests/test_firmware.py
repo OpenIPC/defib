@@ -35,8 +35,8 @@ class TestFirmwareUrl:
         assert "hi3518ev200" in url
 
     def test_url_format(self):
-        url = firmware_url("hi3516cv300")
-        assert url == "https://github.com/OpenIPC/firmware/releases/download/latest/u-boot-hi3516cv300-universal.bin"
+        url = firmware_url("hi3516cv200")
+        assert url == "https://github.com/OpenIPC/firmware/releases/download/latest/u-boot-hi3516cv200-universal.bin"
 
 
 class TestHasFirmware:
@@ -55,10 +55,10 @@ class TestHasFirmware:
 
 class TestAvailableFirmware:
     def test_at_least_20_chips(self):
-        assert len(AVAILABLE_FIRMWARE) >= 20
+        assert len(AVAILABLE_FIRMWARE | PER_FLASH_TYPE_UBOOT) >= 20
 
     def test_common_chips_included(self):
-        for chip in ["hi3516cv300", "hi3518ev200"]:
+        for chip in ["hi3516cv200", "hi3518ev200"]:
             assert chip in AVAILABLE_FIRMWARE
 
     def test_per_flash_type_socs_are_not_universal(self):
@@ -185,10 +185,10 @@ class TestLegacyCacheSeeding:
 
 class TestClassicChipsUnchanged:
     def test_universal_naming_preserved(self):
-        assert asset_name("hi3516cv300") == "u-boot-hi3516cv300-universal.bin"
+        assert asset_name("hi3516cv200") == "u-boot-hi3516cv200-universal.bin"
 
     def test_flash_type_does_not_rename_universal_images(self):
-        assert asset_name("hi3516cv300", "nand") == "u-boot-hi3516cv300-universal.bin"
+        assert asset_name("hi3516cv200", "nand") == "u-boot-hi3516cv200-universal.bin"
 
     def test_variant_still_ignored_for_classic_socs(self):
         assert asset_name("hi3516ev300:emmc") == asset_name("hi3516ev300")
@@ -272,10 +272,17 @@ class TestPerFlashTypeUBoot:
         "hi3516ev200", "hi3516ev300", "hi3518ev300", "hi3516dv200",
         "gk7205v500", "gk7205v510", "gk7205v530",
         "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
+        "hi3516cv300",
     )
+    NOR_ONLY = ("hi3516ev100",)
 
     def test_set_matches_the_published_socs(self):
-        assert set(self.SOCS) == PER_FLASH_TYPE_UBOOT
+        assert set(self.SOCS + self.NOR_ONLY) == PER_FLASH_TYPE_UBOOT
+
+    @pytest.mark.parametrize("soc", NOR_ONLY)
+    def test_nor_only_has_no_nand_build(self, soc):
+        assert asset_name(soc) == f"u-boot-{soc}-nor.bin"
+        assert asset_name(soc, "nand") is None
 
     @pytest.mark.parametrize("soc", SOCS)
     def test_name_per_flash_type(self, soc):
@@ -350,6 +357,24 @@ class TestPerFlashTypeUBoot:
         assert download_firmware("hi3516ev300") == legacy
         with pytest.raises(ConnectionError):
             download_firmware("hi3516ev300", flash_type="nand")
+
+    @pytest.mark.parametrize("soc", ["hi3516cv300", "hi3516ev100"])
+    def test_no_universal_fallback_for_split_2010_06_socs(self, soc, tmp_path, monkeypatch):
+        # Their universal image is U-Boot 2010.06, which cannot boot the
+        # split layout install writes: offline, fail rather than flash it.
+        from defib import firmware
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        (get_cache_dir() / f"u-boot-{soc}-universal.bin").write_bytes(b"U" * 4096)
+
+        def offline(url, dest, on_progress=None):
+            raise ConnectionError("offline")
+
+        monkeypatch.setattr(firmware, "_download", offline)
+        assert get_cached_path(soc) is None
+        with pytest.raises(ConnectionError):
+            download_firmware(soc)
 
     def test_gk7205v5xx_shares_the_v500_donor_cache_entry(self, tmp_path, monkeypatch):
         # download_v500_donor() caches u-boot-xmedia's NOR build under the

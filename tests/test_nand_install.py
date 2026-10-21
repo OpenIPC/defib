@@ -139,8 +139,8 @@ async def test_nand_install_without_crc32_keeps_legacy_compatibility(
     rootfs = b"R" * 2048
     with tarfile.open(firmware_tar, "w:gz") as archive:
         for name, payload in (
-            ("uImage.hi3516cv300", kernel),
-            ("rootfs.squashfs.hi3516cv300", rootfs),
+            ("uImage.hi3516cv200", kernel),
+            ("rootfs.squashfs.hi3516cv200", rootfs),
         ):
             info = tarfile.TarInfo(name)
             info.size = len(payload)
@@ -260,7 +260,7 @@ async def test_nand_install_without_crc32_keeps_legacy_compatibility(
 
     await run_install(
         InstallRequest(
-            chip="hi3516cv300",
+            chip="hi3516cv200",
             firmware_path=str(firmware_tar),
             uboot_path=str(uboot),
             port="COM15",
