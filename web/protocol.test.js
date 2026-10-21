@@ -385,13 +385,14 @@ describe('SoC Lists', () => {
 // U-Boot asset resolution (issue #113)
 // ================================================================
 
-// Trimmed shape of api.github.com .../releases/tags/latest, with the real
-// digest and size of u-boot-gk7205v300-universal.bin.
+// Trimmed shape of api.github.com .../releases/tags/latest. The gk7205v300
+// entry carries a real asset's digest and size (taken from its former
+// -universal image); gk7205v300 now loads its -nor build.
 const RELEASE_FIXTURE = {
   tag_name: 'latest',
   assets: [
     {
-      name: 'u-boot-gk7205v300-universal.bin',
+      name: 'u-boot-gk7205v300-nor.bin',
       size: 256459,
       digest: 'sha256:0160bbcb7b8e40a13abbc96d34bc26575534e0ea0d6cc4a5b947ce0bd55ce3dc',
     },
@@ -403,7 +404,7 @@ const RELEASE_FIXTURE = {
 };
 
 describe('parseReleaseAssets', () => {
-  it('keeps only u-boot-*-universal.bin assets', () => {
+  it('keeps only each chip\'s own U-Boot asset', () => {
     const m = parseReleaseAssets(RELEASE_FIXTURE);
     assert.deepEqual([...m.keys()].sort(), ['gk7205v300', 'hi3520dv200']);
   });
@@ -412,7 +413,7 @@ describe('parseReleaseAssets', () => {
     const a = parseReleaseAssets(RELEASE_FIXTURE).get('gk7205v300');
     assert.equal(a.size, 256459);
     assert.equal(a.sha256, '0160bbcb7b8e40a13abbc96d34bc26575534e0ea0d6cc4a5b947ce0bd55ce3dc');
-    assert.equal(a.url, `${FW_DIRECT_BASE}/u-boot-gk7205v300-universal.bin`);
+    assert.equal(a.url, `${FW_DIRECT_BASE}/u-boot-gk7205v300-nor.bin`);
   });
 
   it('tolerates a missing digest', () => {
@@ -625,7 +626,8 @@ describe('fwAssetName', () => {
   it('names the -nor build for u-boot-xmedia SoCs, -universal otherwise', () => {
     assert.equal(fwAssetName('hi3516ev300'), 'u-boot-hi3516ev300-nor.bin');
     assert.equal(fwAssetName('gk7205v510'), 'u-boot-gk7205v510-nor.bin');
-    assert.equal(fwAssetName('gk7205v300'), 'u-boot-gk7205v300-universal.bin');
+    assert.equal(fwAssetName('gk7205v300'), 'u-boot-gk7205v300-nor.bin');
+    assert.equal(fwAssetName('hi3516cv200'), 'u-boot-hi3516cv200-universal.bin');
     assert.equal(fwAssetName('hi3516cv300'), 'u-boot-hi3516cv300-nor.bin');
     assert.equal(fwAssetName('hi3516ev100'), 'u-boot-hi3516ev100-nor.bin');
   });
@@ -650,7 +652,7 @@ describe('fwAssetName', () => {
       { name: 'u-boot-gk7205v300-nor.bin', size: 5, digest: null },
     ] });
     assert.equal(idx.get('hi3516ev300').name, 'u-boot-hi3516ev300-nor.bin');
-    assert.equal(idx.get('gk7205v300').name, 'u-boot-gk7205v300-universal.bin');
+    assert.equal(idx.get('gk7205v300').name, 'u-boot-gk7205v300-nor.bin');
     assert.equal(idx.size, 2);
   });
 });
