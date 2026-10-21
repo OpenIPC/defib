@@ -288,13 +288,13 @@ async def test_split_image_too_big_for_the_chip(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kwargs, code", [
-    ({"chip": "hi3516ev300"}, 2),
+    ({"chip": "hi3518ev200"}, 2),
     # NAND here is the UBI layout, whose package loader names the mistake.
     ({"nand": True}, 1),
     ({"wipe_rootfs_data": True, "stages": ("rootfs-data",)}, 2),
 ])
 async def test_split_install_refusals(monkeypatch, tmp_path, capsys, kwargs, code):
-    board = "hi3516ev300" if kwargs.get("chip") == "hi3516ev300" else "gk7205v200"
+    board = "hi3518ev200" if kwargs.get("chip") == "hi3518ev200" else "gk7205v200"
     firmware = _split_package(tmp_path / "fw.tgz", board=board)
     with pytest.raises(typer.Exit) as exc:
         await _install(monkeypatch, tmp_path, firmware, **kwargs)
@@ -357,7 +357,8 @@ def test_package_board_and_boot_area_are_data():
                  "hi3516ev200", "hi3518ev300", "hi3516dv200"):
         assert supports_nor_split(chip), chip
     assert nor_boot_area("hi3516cv300") == (0x40000, 0x10000)
-    assert not supports_nor_split("hi3516ev300")
+    assert supports_nor_split("hi3516ev300")
+    assert not supports_nor_split("hi3516cv500")
 
     assert nor_boot_area("hi3516cv610") == (0x40000, 0x10000)
     assert nor_boot_area("hi3516dv500") == (0x80000, 0x40000)
