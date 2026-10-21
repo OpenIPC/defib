@@ -61,6 +61,12 @@ PER_FLASH_TYPE_UBOOT: frozenset[str] = frozenset({
 # Of those, the SoCs with no NAND build published: asking for one finds none.
 NOR_ONLY_UBOOT: frozenset[str] = frozenset({"hi3516ev100"})
 
+# Of those, the SoCs whose old u-boot-*-universal.bin must never stand in for
+# the -nor build, even offline: it is U-Boot 2010.06, which knows no split
+# layout, and install writes the split firmware and loads that U-Boot's
+# default environment.
+NO_UNIVERSAL_FALLBACK: frozenset[str] = frozenset({"hi3516cv300", "hi3516ev100"})
+
 # The firmware package a chip installs, where it is not the chip's own: one
 # hi3516cv6xx build serves the whole CV6xx family, and hi3516dv500 is the
 # hi3519dv500 die. Packages are openipc.<board>-<flash>-<variant>[-split].tgz.
@@ -423,6 +429,7 @@ def download_firmware(
         if (
             uses_per_flash_type_uboot(chip)
             and normalize_flash_type(flash_type) == "nor"
+            and package_board(chip) not in NO_UNIVERSAL_FALLBACK
         ):
             legacy = _cached_file(_legacy_cache_name(chip))
             if legacy is not None:

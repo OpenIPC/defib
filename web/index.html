@@ -297,9 +297,11 @@ async function standardSendFirmware(firmware, profile, chip) {
   const ddrAddr = parseInt(profile.ADDRESS[0], 16);
   const splAddr = parseInt(profile.ADDRESS[1], 16);
   const ubootAddr = parseInt(profile.ADDRESS[2], 16);
-  // Only the u-boot-xmedia images are cut at their payload: the profiles here
-  // carry no SRAMLIMIT, and on other chips the profile length is what the
-  // Web UI has always sent safely.
+  // Only the -nor images (u-boot-xmedia, and hi3516cv300/ev100's
+  // OpenIPC/u-boot build, whose SPL runs to 0x5400 past the profile's
+  // 0x4F00) are cut at their payload: the profiles here carry no SRAMLIMIT,
+  // and on other chips the profile length is what the Web UI has always
+  // sent safely.
   const profileMax = parseInt(profile.FILELEN[1], 16);
   const splMax = XMEDIA_SOCS.has(fwNameForChip(chip))
     ? detectSplSize(firmware, profileMax) : profileMax;

@@ -358,6 +358,24 @@ class TestPerFlashTypeUBoot:
         with pytest.raises(ConnectionError):
             download_firmware("hi3516ev300", flash_type="nand")
 
+    @pytest.mark.parametrize("soc", ["hi3516cv300", "hi3516ev100"])
+    def test_no_universal_fallback_for_split_2010_06_socs(self, soc, tmp_path, monkeypatch):
+        # Their universal image is U-Boot 2010.06, which cannot boot the
+        # split layout install writes: offline, fail rather than flash it.
+        from defib import firmware
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        (get_cache_dir() / f"u-boot-{soc}-universal.bin").write_bytes(b"U" * 4096)
+
+        def offline(url, dest, on_progress=None):
+            raise ConnectionError("offline")
+
+        monkeypatch.setattr(firmware, "_download", offline)
+        assert get_cached_path(soc) is None
+        with pytest.raises(ConnectionError):
+            download_firmware(soc)
+
     def test_gk7205v5xx_shares_the_v500_donor_cache_entry(self, tmp_path, monkeypatch):
         # download_v500_donor() caches u-boot-xmedia's NOR build under the
         # same name the OpenIPC/firmware release uses, so either source
