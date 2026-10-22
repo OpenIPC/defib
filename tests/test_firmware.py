@@ -258,8 +258,10 @@ class TestV500Donor:
         first = firmware.download_v500_donor("gk7205v510")
         again = firmware.download_v500_donor("gk7205v510")
         assert first == again == get_cache_dir() / "u-boot-gk7205v510-nor.bin"
+        # OpenIPC/u-boot's build on the firmware release; the retired
+        # u-boot-xmedia release carries the same key and DDR-init areas.
         assert urls == [
-            "https://github.com/OpenIPC/u-boot-xmedia/releases/download/latest/"
+            "https://github.com/OpenIPC/firmware/releases/download/latest/"
             "u-boot-gk7205v510-nor.bin"
         ]
 
@@ -377,9 +379,8 @@ class TestPerFlashTypeUBoot:
             download_firmware(soc)
 
     def test_gk7205v5xx_shares_the_v500_donor_cache_entry(self, tmp_path, monkeypatch):
-        # download_v500_donor() caches u-boot-xmedia's NOR build under the
-        # same name the OpenIPC/firmware release uses, so either source
-        # satisfies the other.
+        # download_v500_donor() caches the NOR build under the same name the
+        # install path uses, so either one satisfies the other.
         monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
         monkeypatch.setattr("sys.platform", "linux")
         donor = get_cache_dir() / "u-boot-gk7205v510-nor.bin"

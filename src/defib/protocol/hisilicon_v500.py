@@ -81,7 +81,7 @@ V500_AGENT_LOAD_ADDR = 0x41007000
 def wrap_v500_payload(donor: bytes, payload: bytes, load_addr: int) -> bytes:
     """Put ``payload`` in the boot-code area of a V500 boot image.
 
-    ``donor`` is a complete V500 U-Boot image (e.g. OpenIPC u-boot-xmedia's
+    ``donor`` is a complete V500 U-Boot image (e.g. OpenIPC's
     ``u-boot-gk7205v500-nor.bin``). Its key area, params and aux (DDR init)
     area are kept verbatim; its boot code is replaced by ``payload`` and the
     two length fields are patched to match. The bootrom runs the boot code

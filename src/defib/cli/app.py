@@ -1087,7 +1087,7 @@ def agent_upload(
     chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial device (/dev/ttyUSB0), tcp://host:port, rfc2217://host:port, or socket:///path"),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
-    file: str | None = typer.Option(None, "-f", "--file", help="CV6xx: composite boot file (GSL+DDR+U-Boot), required. V500: U-Boot image whose header and DDR-init code carry the agent (default: OpenIPC u-boot-xmedia download). Ignored for other protocols"),
+    file: str | None = typer.Option(None, "-f", "--file", help="CV6xx: composite boot file (GSL+DDR+U-Boot), required. V500: U-Boot image whose header and DDR-init code carry the agent (default: OpenIPC u-boot-<chip>-nor.bin download). Ignored for other protocols"),
     power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via configured controller (DEFIB_POWER_TYPE)"),
     poe_port_override: str = typer.Option("", "--poe-port", help="Explicit MikroTik ether port (e.g. ether3) — overrides comment-based auto-discovery. Requires --power-cycle."),
 ) -> None:
