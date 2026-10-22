@@ -174,10 +174,10 @@ Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
   env, rest ubi), whose mtdparts/bootcmd/bootargs come from the U-Boot default
   env; `NAND_LAYOUT` is the legacy split layout for other chips. The
   `NOR_SPLIT_SOCS` (gk7205v200 family, hi3516cv6xx, hi3519dv500,
-  hi3516cv300/ev100, the hi3516ev200 family -- hi3516ev300 split-only;
-  keyed by
-  package board, `FIRMWARE_PACKAGE_BOARD` maps cv608/cv610/cv613 to
-  `hi3516cv6xx` and hi3516dv500 to `hi3519dv500`) install the split NOR
+  hi3516cv300/ev100, the hi3516ev200 family -- hi3516ev300 split-only --
+  and the gk7205v500 family; keyed by package board, `FIRMWARE_PACKAGE_BOARD`
+  maps cv608/cv610/cv613 to `hi3516cv6xx`, hi3516dv500 to `hi3519dv500` and
+  gk7205v510/v530 to `gk7205v500`) install the split NOR
   package: one `firmware.bin.<board>` where the boot area ends (0x50000;
   `NOR_BOOT_AREAS` gives hi3519dv500 512k boot + 256k env, so 0xC0000), the
   rest of the chip erased, which the kernel divides at boot; their NOR U-Boot

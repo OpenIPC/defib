@@ -75,6 +75,9 @@ FIRMWARE_PACKAGE_BOARD: dict[str, str] = {
     "hi3516cv610": "hi3516cv6xx",
     "hi3516cv613": "hi3516cv6xx",
     "hi3516dv500": "hi3519dv500",
+    # one gk7205v500 build serves the V500 family, as on NAND
+    "gk7205v510": "gk7205v500",
+    "gk7205v530": "gk7205v500",
 }
 
 # Package boards whose OpenIPC firmware ships the split NOR layout,
@@ -88,6 +91,7 @@ NOR_SPLIT_SOCS: frozenset[str] = frozenset({
     "hi3516cv6xx", "hi3519dv500",
     "hi3516cv300", "hi3516ev100",
     "hi3516ev200", "hi3518ev300", "hi3516dv200",
+    "gk7205v500",
     # Split-only, like hi3516cv6xx: its kernel fills the 2 MiB slot, so no
     # fixed-slot package can ship beside the split one.
     "hi3516ev300",
