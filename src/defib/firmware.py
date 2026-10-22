@@ -482,13 +482,13 @@ def _download(
         raise ConnectionError(f"Failed to download firmware: {e}") from e
 
 
-# V500-family (gk7205v500/v510/v530) U-Boot is built in OpenIPC/u-boot-xmedia,
-# not OpenIPC/firmware. defib only needs its boot-image header and DDR-init
-# (aux) code to carry the flash agent, and those do not depend on the flash
-# type, so the smaller NOR build is the donor.
-XMEDIA_UBOOT_BASE_URL = (
-    "https://github.com/OpenIPC/u-boot-xmedia/releases/download/latest"
-)
+# V500-family (gk7205v500/v510/v530) U-Boot is OpenIPC/u-boot's NOR build on
+# the OpenIPC/firmware release, as for every other per-flash-type SoC (the
+# retired OpenIPC/u-boot-xmedia published it before). defib only needs its
+# boot-image header and DDR-init (aux) code to carry the flash agent, and
+# those do not depend on the flash type, so the smaller NOR build is the donor.
+# Both builds carry the same key area and aux area byte for byte, so the agent
+# boot image does not change with the source.
 
 
 def download_v500_donor(chip: str) -> Path:
@@ -502,4 +502,4 @@ def download_v500_donor(chip: str) -> Path:
     if dest.exists():
         logger.info("Using cached V500 donor: %s", dest)
         return dest
-    return _download(f"{XMEDIA_UBOOT_BASE_URL}/{name}", dest)
+    return _download(f"{OPENIPC_BASE_URL}/{name}", dest)
