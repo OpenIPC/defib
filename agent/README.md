@@ -85,9 +85,10 @@ Requires `arm-none-eabi-gcc` (Arch: `pacman -S arm-none-eabi-gcc arm-none-eabi-n
 | hi3536dv100 | 0x12080000 | 0x14000000 | 0x80000000 | 0x81000000 |
 
 gk7205v500 also serves gk7205v510/v530. The V500 bootrom has no SPL stage:
-`defib agent upload` puts the agent in the boot-code slot of an OpenIPC
-u-boot-xmedia image (downloaded, or `-f` for your own), whose DDR-init code
-runs first; the bootrom then executes the slot in place at `0x41007000`.
+`defib agent upload` puts the agent in the boot-code slot of OpenIPC's
+`u-boot-<chip>-nor.bin` (downloaded from the OpenIPC/firmware `latest`
+release, or `-f` for your own), whose DDR-init code runs first; the bootrom
+then executes the slot in place at `0x41007000`.
 
 hi3536dv100 also covers the "Hi3536E" that Xiongmai puts in its NVRs, a
 variant of the same die. Its UART runs off a fixed 24 MHz clock, so
