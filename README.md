@@ -58,7 +58,7 @@ Flash a complete OpenIPC release (U-Boot + kernel + rootfs) in one command:
 
 ```bash
 defib install -c hi3516ev300 \
-  --firmware openipc.hi3516ev300-nor-lite.tgz \
+  --firmware openipc.hi3516ev300-nor-lite-split.tgz \
   -p /dev/uart-IVG85HG50PYA-S \
   --power-cycle --nor-size 8
 ```
@@ -69,15 +69,18 @@ The install command orchestrates the entire process:
 3. Reaches an OpenIPC U-Boot shell through boot ROM or a registered stock-U-Boot bootstrap
 4. Detects the flash and selects the standard OpenIPC layout
 5. Starts a multi-file TFTP server and configures U-Boot networking
-6. Flashes each partition (U-Boot, kernel, rootfs) with CRC32 verification
+6. Flashes U-Boot and the firmware with CRC32 verification: the kernel and
+   rootfs into fixed slots, or, from a `-split.tgz` package, one `firmware.bin`
+   where the boot area ends (0x50000), which the kernel divides at boot
 7. Saves the boot environment and resets
 
 Requires root for TFTP port 69 and NIC IP assignment. Standard 8/16/32 MiB
 NOR layouts are selected from U-Boot flash detection; `--nor-size` remains an
 explicit override.
 
-hi3516ev200, hi3516ev300, hi3518ev300, hi3516dv200 and gk7205v500/v510/v530
-take their U-Boot from OpenIPC/u-boot-xmedia, published once per flash type as
+hi3516ev200, hi3516ev300, hi3518ev300, hi3516dv200, gk7205v500/v510/v530, the
+gk7205v200 family and hi3516cv300/ev100 take their U-Boot from OpenIPC/u-boot,
+published once per flash type as
 `u-boot-<chip>-nor.bin` and `u-boot-<chip>-nand.bin`. `install` picks the build
 from `--nand`; `burn` loads the NOR build unless `--nand` is given. On NAND
 these SoCs use a UBI-only layout:
