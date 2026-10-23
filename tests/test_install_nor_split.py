@@ -354,8 +354,11 @@ def test_package_board_and_boot_area_are_data():
     assert "hi3516cv6xx" in split_boards("hi3516cv608")
     for chip in ("hi3516cv608", "hi3516cv610", "hi3516cv613", "hi3519dv500",
                  "hi3516dv500", "gk7205v200", "hi3516cv300", "hi3516ev100",
-                 "hi3516ev200", "hi3518ev300", "hi3516dv200"):
+                 "hi3516ev200", "hi3518ev300", "hi3516dv200",
+                 "gk7205v500", "gk7205v510", "gk7205v530"):
         assert supports_nor_split(chip), chip
+    assert package_board("gk7205v530") == "gk7205v500"
+    assert "gk7205v500" in split_boards("gk7205v510")
     assert nor_boot_area("hi3516cv300") == (0x40000, 0x10000)
     assert supports_nor_split("hi3516ev300")
     assert not supports_nor_split("hi3516cv500")
