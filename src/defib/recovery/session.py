@@ -273,7 +273,7 @@ class RecoverySession:
             is_early = (
                 Stage.DDR_INIT not in send_result.stages_completed
             )
-            if is_early and attempt < attempts:
+            if is_early and send_result.retryable and attempt < attempts:
                 last_attempt_error = err
                 continue
 

@@ -174,3 +174,100 @@ class TestCV6xxFirmwareTransfer:
 
         assert result.success
         assert Stage.GSL in result.stages_completed
+
+
+def _transport_through_ddr_table(spl_output: bytes, then_acks: int = 0) -> MockTransport:
+    """A device that ACKs the GSL, answers the board-ID query, ACKs the DDR
+    table, prints `spl_output` while it trains, and ACKs `then_acks` more
+    frames after that. The padding is read away by the board-ID query and the
+    training window, as in test_send_firmware."""
+    transport = MockTransport(flush_clears_buffer=False)
+    parts = parse_cv6xx_boot(_build_cv6xx_firmware())
+    transport.enqueue_rx(ACK_BYTE * (1 + (len(parts.gsl_data) + 1023) // 1024 + 1))
+    board_response = bytearray(11)
+    board_response[0] = 0xCE
+    board_response[1] = 0x01
+    board_response[10] = 0xAA
+    transport.enqueue_rx(bytes(board_response))
+    transport.enqueue_rx(ACK_BYTE * 2000)
+    transport.enqueue_rx(spl_output)
+    if then_acks:
+        transport.enqueue_rx(ACK_BYTE * then_acks)
+    return transport
+
+
+# What a CV6xx SPL printed on a CV608 over UART (#148): the header, then the
+# size once the table trained.
+SPL_TRAINED = (
+    b"boot table version     :V0.1\r\n"
+    b"boot table build time  :2026/03/01 17:22:29\r\n"
+    b"boot table file name   :Hi3516CV608-DMEB_4L_DDR2_1333M_64MB_16bit-A7_950M_QFN.xlsm\r\n"
+    b"DDR size: 0x00000040\r\n"
+)
+# A CV610 table sent to that CV608: refused, then trained from flash.
+SPL_REJECTED = (
+    b"boot table version     :V0.2\r\n"
+    b"boot table build time  :2026/03/01 17:22:42\r\n"
+    b"boot table file name   :Hi3516CV610-DMEB_4L_DDR3_2133M_128MB_16bit-A7_950M_QFN.xlsm"
+    b"The table is incorrect.\r\nflash\r\n"
+    b"boot table board switch:0x00000000\r\n"
+    b"DDR size: 0x00000040\r\nSystem startup\r\n"
+)
+# What #148 reported from a CV610 module: the header, then nothing at all.
+SPL_SILENT = (
+    b"boot table version     :V0.2\r\n"
+    b"boot table build time  :2026/03/01 17:22:42\r\n"
+    b"boot table file name   :Hi3516CV610-DMEB_4L_DDR3_2133M_128MB_16bit-A7_950M_QFN.xlsm\r\n"
+)
+
+
+class TestCV6xxDdrTrainingVerdict:
+    """The SPL says how DDR training went; send_firmware must listen (#148).
+
+    Before, the stage slept a fixed window and sent U-Boot regardless, so a
+    table that never trained and a table the SPL refused both surfaced as
+    "Failed to send U-Boot" four seconds later."""
+
+    @pytest.mark.asyncio
+    async def test_a_trained_table_goes_on_to_uboot(self):
+        transport = _transport_through_ddr_table(SPL_TRAINED, then_acks=5000)
+        protocol = HiSiliconCV6xx(ddr_training_wait=1.0, ddr_training_timeout=0.5)
+        result = await protocol.send_firmware(transport, _build_cv6xx_firmware())
+
+        assert result.success, result.error
+        assert Stage.UBOOT in result.stages_completed
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_table_says_so_and_sends_no_uboot(self):
+        transport = _transport_through_ddr_table(SPL_REJECTED)
+        protocol = HiSiliconCV6xx(ddr_training_wait=1.0, ddr_training_timeout=0.5)
+        result = await protocol.send_firmware(transport, _build_cv6xx_firmware())
+
+        assert not result.success
+        assert "rejected the DDR table" in result.error
+        assert not result.retryable
+        assert Stage.DDR_TABLE in result.stages_completed
+        assert Stage.UBOOT not in result.stages_completed
+
+    @pytest.mark.asyncio
+    async def test_a_table_that_never_trains_says_so(self):
+        transport = _transport_through_ddr_table(SPL_SILENT)
+        protocol = HiSiliconCV6xx(ddr_training_wait=1.0, ddr_training_timeout=0.5)
+        result = await protocol.send_firmware(transport, _build_cv6xx_firmware())
+
+        assert not result.success
+        assert "DDR training did not finish" in result.error
+        # A marginal training could pass on another power-up, and one more
+        # attempt is cheap, so this one is left to the session's retry.
+        assert result.retryable
+        assert Stage.UBOOT not in result.stages_completed
+
+    @pytest.mark.asyncio
+    async def test_a_quiet_spl_still_gets_uboot(self):
+        """No header, no verdict: nothing to go on, so the upload happens as
+        it always has."""
+        transport = _transport_through_ddr_table(b"", then_acks=5000)
+        protocol = HiSiliconCV6xx(ddr_training_wait=1.0, ddr_training_timeout=0.5)
+        result = await protocol.send_firmware(transport, _build_cv6xx_firmware())
+
+        assert result.success, result.error

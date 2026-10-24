@@ -430,3 +430,43 @@ async def test_session_max_attempts_respected(monkeypatch):
     assert "PRESTEP0" in (result.error or "")
     assert call_count["send_firmware"] == 3
     assert power.cycle_count == 3
+
+
+@pytest.mark.asyncio
+async def test_session_does_not_retry_a_failure_marked_final(monkeypatch):
+    """A CV6xx SPL that refuses the DDR table refuses it after every power
+    cycle (#148): with automated power the session used to cycle the board
+    and send the same image again. One attempt, one cycle."""
+    from defib.protocol.hisilicon_cv6xx import HiSiliconCV6xx
+
+    transport = _ScriptedTransport()
+    power = _FakePowerController()
+    call_count = {"send_firmware": 0}
+
+    async def rejected(self, transport, firmware, on_progress=None,
+                       uboot_override=None):  # noqa: ARG001
+        call_count["send_firmware"] += 1
+        return RecoveryResult(
+            success=False,
+            error="The SPL rejected the DDR table",
+            stages_completed=[Stage.GSL, Stage.DDR_TABLE],
+            retryable=False,
+        )
+
+    monkeypatch.setattr(HiSiliconCV6xx, "send_firmware", rejected)
+    monkeypatch.setattr(HiSiliconCV6xx, "handshake", _fake_handshake_ok)
+
+    session = RecoverySession(
+        chip="hi3516cv610",
+        firmware_data=b"\x00" * 1024,
+        power_controller=power,
+        poe_port="",
+    )
+    logs: list[LogEvent] = []
+    result = await session.run(transport, on_log=logs.append, max_handshake_attempts=2)
+
+    assert not result.success
+    assert "rejected the DDR table" in (result.error or "")
+    assert call_count["send_firmware"] == 1
+    assert power.cycle_count == 1
+    assert not [e for e in logs if "retry" in e.message.lower()]
