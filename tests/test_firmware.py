@@ -274,7 +274,7 @@ class TestPerFlashTypeUBoot:
         "hi3516ev200", "hi3516ev300", "hi3518ev300", "hi3516dv200",
         "gk7205v500", "gk7205v510", "gk7205v530",
         "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
-        "hi3516cv300",
+        "gk7201v200", "hi3516cv300",
     )
     NOR_ONLY = ("hi3516ev100",)
 

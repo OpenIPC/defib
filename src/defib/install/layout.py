@@ -65,7 +65,7 @@ _UBI_NAND_BOARD = {"gk7205v510": "gk7205v500", "gk7205v530": "gk7205v500"}
 def ubi_nand_boards(chip: str) -> set[str]:
     """The ``rootfs.ubi.<board>`` suffixes a NAND package for ``chip`` may carry.
 
-    An aliased chip (gk7201v200, gk7205v210, ...) installs the U-Boot of the SoC
+    An aliased chip (gk7205v210, hi3518ev201, ...) installs the U-Boot of the SoC
     it is published under, and that SoC's package with it.
     """
     from defib.firmware import CHIP_TO_FIRMWARE
@@ -77,7 +77,7 @@ def ubi_nand_boards(chip: str) -> set[str]:
 def split_boards(chip: str) -> set[str]:
     """The ``firmware.bin.<board>`` suffixes a split NOR package for ``chip`` may carry.
 
-    Aliased chips (gk7205v210, gk7201v200, ...) install the image of the SoC
+    Aliased chips (gk7205v210, hi3518ev201, ...) install the image of the SoC
     they are published under, and a family built once (hi3516cv610 ->
     hi3516cv6xx) the family's.
     """
