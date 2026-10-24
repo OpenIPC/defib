@@ -45,6 +45,20 @@ GSL_LOAD_ADDR = 0x04020000
 DDR_LOAD_ADDR = 0x41000000
 UBOOT_LOAD_ADDR = 0x41000000
 DDR_TRAINING_WAIT = 1.5  # seconds
+# How long past DDR_TRAINING_WAIT to keep waiting once the SPL has printed the
+# table header but not yet "DDR size". A board that trains does it within tens
+# of milliseconds of the header (a stock CV610 boot: ~35 ms), so this is slack
+# for a slow link, not for slow training.
+DDR_TRAINING_TIMEOUT = 10.0  # seconds
+
+# What the SPL prints over UART while it brings up DDR from the uploaded table
+# (#148). It names the table first, and once the controller has trained it
+# prints the size; a table it will not use -- one built for another chip --
+# it calls incorrect, and it then trains from the boot table in flash and
+# starts the U-Boot there, so nothing will take the upload that follows.
+SPL_TABLE_HEADER = "boot table file name"
+SPL_DDR_TRAINED = "DDR size"
+SPL_TABLE_REJECTED = "The table is incorrect"
 
 
 def _emit(callback: Callable[[ProgressEvent], None] | None, event: ProgressEvent) -> None:
@@ -164,10 +178,15 @@ def build_ddr_table(parts: CV6xxBootParts, board_id: int = 0) -> bytes:
 class HiSiliconCV6xx(BootProtocol):
     """HI3516CV6xx series boot protocol."""
 
-    def __init__(self, ddr_training_wait: float = DDR_TRAINING_WAIT) -> None:
+    def __init__(
+        self,
+        ddr_training_wait: float = DDR_TRAINING_WAIT,
+        ddr_training_timeout: float = DDR_TRAINING_TIMEOUT,
+    ) -> None:
         self._board_id: int = 0
         self._cpu_id: int | None = None
         self._ddr_training_wait = ddr_training_wait
+        self._ddr_training_timeout = ddr_training_timeout
 
     @classmethod
     def name(cls) -> str:
@@ -404,8 +423,25 @@ class HiSiliconCV6xx(BootProtocol):
             stage=Stage.DDR_TRAINING, bytes_sent=0, bytes_total=1,
             message="Waiting for DDR training...",
         ))
+        # The SPL's own account of the training, kept whole: a marker can be
+        # split across two reads.
+        spl_text = ""
         start = time.monotonic()
-        while time.monotonic() - start < self._ddr_training_wait:
+        while True:
+            elapsed = time.monotonic() - start
+            if elapsed >= self._ddr_training_wait:
+                # The usual window is enough unless the SPL has named its table
+                # and has neither trained nor refused it yet -- then give it
+                # the slack, and stop the moment it answers.
+                pending = (
+                    SPL_TABLE_HEADER in spl_text
+                    and SPL_DDR_TRAINED not in spl_text
+                    and SPL_TABLE_REJECTED not in spl_text
+                )
+                if not pending or elapsed >= (
+                    self._ddr_training_wait + self._ddr_training_timeout
+                ):
+                    break
             try:
                 waiting = await transport.bytes_waiting()
                 if waiting > 0:
@@ -416,11 +452,38 @@ class HiSiliconCV6xx(BootProtocol):
                     ascii_str = "".join(
                         chr(b) for b in chunk if 32 <= b <= 126 or b in (10, 13)
                     )
+                    spl_text += ascii_str
                     if ascii_str.strip():
                         logger.info("DDR training: %s", ascii_str.strip())
             except TransportTimeout:
                 pass
             await asyncio.sleep(0.05)
+
+        # Only on the SPL's word. Silence proves nothing -- not every SPL is
+        # known to narrate -- so a training that printed nothing goes on to
+        # the U-Boot upload exactly as before.
+        if SPL_TABLE_REJECTED in spl_text:
+            return RecoveryResult(
+                success=False, stages_completed=stages,
+                error=(
+                    "The SPL rejected the DDR table (\"The table is "
+                    "incorrect\"): this boot image is for another chip or "
+                    "variant. The SPL fell back to the boot table in flash "
+                    "and starts the U-Boot there, so it will not take an "
+                    "upload."
+                ),
+            )
+        if SPL_TABLE_HEADER in spl_text and SPL_DDR_TRAINED not in spl_text:
+            return RecoveryResult(
+                success=False, stages_completed=stages,
+                error=(
+                    "DDR training did not finish: the SPL accepted the DDR "
+                    "table and went silent without printing \"DDR size\". "
+                    "This table does not train this board's memory; try "
+                    "another variant, or the boot table from the board's own "
+                    "flash."
+                ),
+            )
 
         _emit(on_progress, ProgressEvent(
             stage=Stage.DDR_TRAINING, bytes_sent=1, bytes_total=1,
