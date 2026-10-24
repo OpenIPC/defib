@@ -63,6 +63,10 @@ class RecoveryResult:
     stages_completed: list[Stage] = field(default_factory=list)
     error: str | None = None
     elapsed_ms: float = 0.0
+    # False when the device has given a definite answer that another power
+    # cycle cannot change -- a CV6xx SPL refusing the DDR table, say -- so the
+    # session's early-failure retry would only send the same image again.
+    retryable: bool = True
     # Bytes consumed off the wire during the post-upload break/autoboot-detection
     # phase. Without this, the U-Boot banner that streams between TAIL ACK and
     # the autoboot countdown is silently swallowed by the send_break loop and

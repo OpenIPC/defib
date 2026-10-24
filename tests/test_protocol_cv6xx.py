@@ -245,6 +245,7 @@ class TestCV6xxDdrTrainingVerdict:
 
         assert not result.success
         assert "rejected the DDR table" in result.error
+        assert not result.retryable
         assert Stage.DDR_TABLE in result.stages_completed
         assert Stage.UBOOT not in result.stages_completed
 
@@ -256,6 +257,9 @@ class TestCV6xxDdrTrainingVerdict:
 
         assert not result.success
         assert "DDR training did not finish" in result.error
+        # A marginal training could pass on another power-up, and one more
+        # attempt is cheap, so this one is left to the session's retry.
+        assert result.retryable
         assert Stage.UBOOT not in result.stages_completed
 
     @pytest.mark.asyncio

@@ -463,8 +463,10 @@ class HiSiliconCV6xx(BootProtocol):
         # known to narrate -- so a training that printed nothing goes on to
         # the U-Boot upload exactly as before.
         if SPL_TABLE_REJECTED in spl_text:
+            # Not retryable: the SPL checks the table against the chip, so
+            # the same image is refused the same way after any power cycle.
             return RecoveryResult(
-                success=False, stages_completed=stages,
+                success=False, stages_completed=stages, retryable=False,
                 error=(
                     "The SPL rejected the DDR table (\"The table is "
                     "incorrect\"): this boot image is for another chip or "
