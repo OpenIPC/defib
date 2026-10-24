@@ -306,8 +306,27 @@ async def test_split_install_refusals(monkeypatch, tmp_path, capsys, kwargs, cod
 def test_aliased_chip_accepts_the_nand_package_it_is_published_under():
     from defib.install.layout import ubi_nand_boards
 
-    assert "gk7205v200" in ubi_nand_boards("gk7201v200")
+    assert "gk7205v200" in ubi_nand_boards("gk7205v210")
     assert "gk7205v500" in ubi_nand_boards("gk7205v510")
+
+
+def test_gk7201v200_installs_its_own_build():
+    """gk7201v200 publishes its own U-Boot (nor and nand) and firmware, on the
+    gk7205v500 kernel tree with the split layout; it is no gk7205v200 alias."""
+    from defib.firmware import (
+        CHIP_TO_FIRMWARE, PER_FLASH_TYPE_UBOOT, asset_name, package_board,
+        supports_nor_split,
+    )
+    from defib.install.layout import split_boards, ubi_nand_boards
+
+    assert "gk7201v200" not in CHIP_TO_FIRMWARE
+    assert "gk7201v200" in PER_FLASH_TYPE_UBOOT
+    assert package_board("gk7201v200") == "gk7201v200"
+    assert supports_nor_split("gk7201v200")
+    assert split_boards("gk7201v200") == {"gk7201v200"}
+    assert ubi_nand_boards("gk7201v200") == {"gk7201v200"}
+    assert asset_name("gk7201v200", "nor") == "u-boot-gk7201v200-nor.bin"
+    assert asset_name("gk7201v200", "nand") == "u-boot-gk7201v200-nand.bin"
 
 
 @pytest.mark.asyncio

@@ -55,6 +55,7 @@ PER_FLASH_TYPE_UBOOT: frozenset[str] = frozenset({
     "hi3516ev200", "hi3516ev300", "hi3518ev300", "hi3516dv200",
     "gk7205v500", "gk7205v510", "gk7205v530",
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
+    "gk7201v200",
     "hi3516cv300", "hi3516ev100",
 })
 
@@ -91,7 +92,7 @@ NOR_SPLIT_SOCS: frozenset[str] = frozenset({
     "hi3516cv6xx", "hi3519dv500",
     "hi3516cv300", "hi3516ev100",
     "hi3516ev200", "hi3518ev300", "hi3516dv200",
-    "gk7205v500",
+    "gk7205v500", "gk7201v200",
     # Split-only, like hi3516cv6xx: its kernel fills the 2 MiB slot, so no
     # fixed-slot package can ship beside the split one.
     "hi3516ev300",
@@ -143,7 +144,6 @@ CLASSIC_UBOOT_VARIANTS: dict[str, dict[str, str]] = {
 CHIP_TO_FIRMWARE: dict[str, str] = {
     "hi3518ev201": "hi3518ev200",
     "hi3516dv100": "hi3516dv100",
-    "gk7201v200": "gk7205v200",
     "gk7201v300": "gk7205v200",
     "gk7205v210": "gk7205v200",
 }
