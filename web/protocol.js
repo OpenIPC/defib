@@ -101,6 +101,8 @@ function chunkData(data, size = 1024) {
 
 // CV6xx boot file parser
 const CV6XX_GSL_LOAD_ADDR = 0x04021A00;
+// The same bounds as src/defib/protocol/hisilicon_cv6xx.py, which says where
+// each comes from; change them together.
 const CV6XX_IMAGE_ALIGNMENT = 0x100;
 const CV6XX_CODE_ALIGNMENT = 0x200;
 const CV6XX_HEADER_FIELDS_SIZE = 40;
