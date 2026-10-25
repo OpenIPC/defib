@@ -63,12 +63,28 @@ SPL_TABLE_HEADER = "boot table file name"
 SPL_DDR_TRAINED = "DDR size"
 SPL_TABLE_REJECTED = "The table is incorrect"
 
+# Bounds for parse_cv6xx_boot(), from the composite images OpenIPC publishes.
+# Two image-tool layouts are known: hi3516cv608/cv610 put the GSL header at
+# 0x800 with 0x400 between the GSL and the DDR header; hi3519dv500 puts it at
+# 0x1200 with 0x100 between them (#130). The bounds sit well past both so the
+# next generation's layout still parses, while a scan of a wrong or corrupt
+# file stays short and cannot wander into the U-Boot payload.
+#
+# Every header in either layout starts on a 0x100 boundary, and every GSL and
+# U-Boot payload length is a multiple of 0x200.
 IMAGE_ALIGNMENT = 0x100
 CODE_ALIGNMENT = 0x200
+# The header fields the parser reads: magic, version, structure and signature
+# lengths and the payload length at +36 for a code image; up to the 8-byte
+# board map at +300 for the DDR header.
 IMAGE_HEADER_FIELDS_SIZE = 40
 DDR_PARAMS_FIELDS_SIZE = 308
+# Where the GSL header may start: 0x800 and 0x1200 seen, 64 KiB allowed.
 MAX_GSL_HEADER_OFFSET = 0x10000
+# GSL end to DDR header: 0x400 and 0x100 seen, 4 KiB allowed.
 MAX_SECTION_GAP = 0x1000
+# The board map at +300 is 8 bytes, one table index per board ID, so a ninth
+# table could never be selected; every published image carries one.
 MAX_DDR_TABLES = 8
 
 
@@ -83,7 +99,11 @@ class CV6xxBootParts:
     gsl_data: bytes
     gsl_size: int
     params_start: int
-    offset_32: int
+    # Where DDR table 0 starts in file_data: past the DDR header's structure
+    # and its params-area offset, both validated by the parser. Kept rather
+    # than recomputed, so build_ddr_table() cannot read the header any
+    # differently from how it was checked.
+    first_table_offset: int
     table_count: int
     table_size: int
     board_mapping: bytes
@@ -255,7 +275,7 @@ def parse_cv6xx_boot(file_data: bytes) -> CV6xxBootParts:
                 gsl_data=file_data[:gsl.end],
                 gsl_size=gsl.end,
                 params_start=params.offset,
-                offset_32=params.table_offset - params.offset - params.structure_length,
+                first_table_offset=params.table_offset,
                 table_count=params.table_count,
                 table_size=params.table_size,
                 board_mapping=params.board_mapping,
@@ -298,17 +318,10 @@ def build_ddr_table(parts: CV6xxBootParts, board_id: int = 0) -> bytes:
     if mapped_index >= parts.table_count:
         mapped_index = 0
 
-    params_structure_length = struct.unpack_from(
-        "<I", parts.file_data, parts.params_start + 8,
-    )[0]
-    first_table_offset = (
-        parts.params_start + params_structure_length + parts.offset_32
-    )
-
     ddr_buf = bytearray()
     # Preserve the REE key and DDR image headers, then append the selected table.
-    ddr_buf.extend(parts.file_data[parts.gsl_size:first_table_offset])
-    table_offset = first_table_offset + (mapped_index * parts.table_size)
+    ddr_buf.extend(parts.file_data[parts.gsl_size:parts.first_table_offset])
+    table_offset = parts.first_table_offset + (mapped_index * parts.table_size)
     ddr_buf.extend(parts.file_data[table_offset:table_offset + parts.table_size])
 
     return bytes(ddr_buf)
