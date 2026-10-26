@@ -586,3 +586,51 @@ class TestCacheRevalidation:
         self._fetch(monkeypatch, fail=True)
         assert download_v500_donor("gk7205v500") == donor
         assert donor.read_bytes() == self.OLD
+
+    # Review (#167): the installers ask get_cached_path() and download only on
+    # None, so the release check has to live there.
+    def test_get_cached_path_reports_a_stale_copy_as_not_cached(self, tmp_path, monkeypatch):
+        from defib.firmware import get_cached_path
+
+        path = self._seed(tmp_path, monkeypatch, meta={"etag": '"old"'})
+        self._remote(monkeypatch, etag='"new"')
+        assert get_cached_path("hi3516cv610:20s") is None
+        assert get_cached_path("hi3516cv610:20s", check_release=False) == path
+
+    def test_a_display_lookup_does_not_ask_the_release(self, tmp_path, monkeypatch):
+        from defib.firmware import get_cached_path
+
+        path = self._seed(tmp_path, monkeypatch, meta={"etag": '"old"'})
+        seen = self._remote(monkeypatch, etag='"new"')
+        assert get_cached_path("hi3516cv610:20s", check_release=False) == path
+        assert not seen
+
+    def test_a_failed_refresh_leaves_the_copy_still_stale(self, tmp_path, monkeypatch):
+        # Sidecar-less, same size, released after it was cached: a rollback
+        # that gave it a fresh mtime made it look newer than the release.
+        from defib.firmware import get_cached_path
+
+        path = self._seed(tmp_path, monkeypatch, mtime=1_761_400_000)  # 2025-10-25
+        self._remote(monkeypatch, last_modified="Mon, 26 Oct 2026 17:31:42 GMT", size=4096)
+        self._fetch(monkeypatch, fail=True)
+        assert download_firmware("hi3516cv610:20s") == path
+        assert path.read_bytes() == self.OLD
+        assert path.stat().st_mtime == 1_761_400_000
+        assert get_cached_path("hi3516cv610:20s") is None
+
+    def test_a_malformed_response_keeps_the_cached_donor(self, tmp_path, monkeypatch):
+        from defib import firmware
+        from defib.firmware import download_v500_donor
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        donor = get_cache_dir() / "u-boot-gk7205v500-nor.bin"
+        donor.write_bytes(self.OLD)
+        self._remote(monkeypatch, size=1)  # stale
+
+        def broken(req, timeout=None):
+            raise ValueError("invalid literal for int(): 'abc'")
+
+        monkeypatch.setattr(firmware.urllib.request, "urlopen", broken)
+        assert download_v500_donor("gk7205v500") == donor
+        assert donor.read_bytes() == self.OLD
