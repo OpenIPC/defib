@@ -436,3 +436,153 @@ class TestStaleCacheRefresh:
         monkeypatch.setattr(firmware, "_download", offline)
         assert download_firmware("hi3536dv100") == path
         assert path.read_bytes() == self.OLD
+
+
+class TestCacheRevalidation:
+    """A cached published image is checked against the release (defib#148:
+    a user's cached hi3516cv610 20s image predated the fix they needed)."""
+
+    NAME = "boot-hi3516cv610-20s-nor.bin"
+    OLD = b"O" * 4096
+    NEW = b"N" * 4096
+
+    def _seed(self, tmp_path, monkeypatch, data=None, meta=None, mtime=None):
+        import json
+        import os
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        path = get_cache_dir() / self.NAME
+        path.write_bytes(self.OLD if data is None else data)
+        if meta is not None:
+            path.with_name(path.name + ".meta").write_text(json.dumps(meta))
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def _remote(self, monkeypatch, **validators):
+        from defib import firmware
+
+        seen = []
+
+        def remote(url):
+            seen.append(url)
+            return {"etag": None, "last_modified": None, "size": None, **validators}
+
+        monkeypatch.setattr(firmware, "_remote_validators", remote)
+        return seen
+
+    def _fetch(self, monkeypatch, fail=False):
+        from defib import firmware
+
+        calls = []
+
+        def fake_download(url, dest, on_progress=None):
+            calls.append(url)
+            if fail:
+                if dest.exists():
+                    dest.unlink()  # what _download() does on failure
+                raise ConnectionError("offline")
+            dest.write_bytes(self.NEW)
+            return dest
+
+        monkeypatch.setattr(firmware, "_download", fake_download)
+        return calls
+
+    def test_a_changed_etag_downloads_again(self, tmp_path, monkeypatch):
+        path = self._seed(tmp_path, monkeypatch, meta={"etag": '"old"'})
+        self._remote(monkeypatch, etag='"new"', size=4096)
+        calls = self._fetch(monkeypatch)
+        assert download_firmware("hi3516cv610:20s") == path
+        assert calls and path.read_bytes() == self.NEW
+
+    def test_the_same_etag_keeps_the_cache(self, tmp_path, monkeypatch):
+        path = self._seed(tmp_path, monkeypatch, meta={"etag": '"same"'})
+        self._remote(monkeypatch, etag='"same"', size=4096)
+        calls = self._fetch(monkeypatch)
+        assert download_firmware("hi3516cv610:20s") == path
+        assert not calls and path.read_bytes() == self.OLD
+
+    def test_a_cache_older_than_the_release_downloads_again(self, tmp_path, monkeypatch):
+        # Cached before sidecars existed, a day before the fix was published.
+        path = self._seed(tmp_path, monkeypatch, mtime=1_761_400_000)  # 2025-10-25
+        self._remote(monkeypatch, last_modified="Mon, 26 Oct 2026 17:31:42 GMT", size=4096)
+        calls = self._fetch(monkeypatch)
+        download_firmware("hi3516cv610:20s")
+        assert calls and path.read_bytes() == self.NEW
+
+    def test_a_cache_newer_than_the_release_is_kept(self, tmp_path, monkeypatch):
+        path = self._seed(tmp_path, monkeypatch, mtime=1_900_000_000)  # 2030
+        self._remote(monkeypatch, last_modified="Mon, 26 Oct 2026 17:31:42 GMT", size=4096)
+        calls = self._fetch(monkeypatch)
+        download_firmware("hi3516cv610:20s")
+        assert not calls and path.read_bytes() == self.OLD
+
+    def test_a_different_size_downloads_again(self, tmp_path, monkeypatch):
+        path = self._seed(tmp_path, monkeypatch, mtime=1_900_000_000)
+        self._remote(monkeypatch, size=204288)
+        calls = self._fetch(monkeypatch)
+        download_firmware("hi3516cv610:20s")
+        assert calls and path.read_bytes() == self.NEW
+
+    def test_offline_the_cache_is_used(self, tmp_path, monkeypatch):
+        path = self._seed(tmp_path, monkeypatch, meta={"etag": '"old"'})
+        calls = self._fetch(monkeypatch)  # conftest: _remote_validators -> None
+        assert download_firmware("hi3516cv610:20s") == path
+        assert not calls and path.read_bytes() == self.OLD
+
+    def test_a_failed_refresh_keeps_the_old_copy(self, tmp_path, monkeypatch):
+        path = self._seed(tmp_path, monkeypatch, meta={"etag": '"old"'})
+        self._remote(monkeypatch, etag='"new"')
+        self._fetch(monkeypatch, fail=True)
+        assert download_firmware("hi3516cv610:20s") == path
+        assert path.read_bytes() == self.OLD
+
+    def test_a_download_records_its_validators(self, tmp_path, monkeypatch):
+        import io
+        import json
+        from defib import firmware
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+
+        class Resp(io.BytesIO):
+            headers = {"ETag": '"abc"', "Last-Modified": "Mon, 26 Oct 2026 17:31:42 GMT",
+                       "Content-Length": "4096"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(firmware.urllib.request, "urlopen",
+                            lambda req, timeout=None: Resp(self.NEW))
+        path = download_firmware("hi3516cv610:20s")
+        meta = json.loads(path.with_name(path.name + ".meta").read_text())
+        assert meta == {"etag": '"abc"', "last_modified": "Mon, 26 Oct 2026 17:31:42 GMT",
+                        "size": 4096}
+
+    def test_a_hand_seeded_blob_is_not_checked(self, tmp_path, monkeypatch):
+        # No published image (bare hi3516cv610 needs a variant): the seeded
+        # blob is all there is, and nothing upstream to compare it with.
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        seeded = get_cache_dir() / "u-boot-hi3516cv610-universal.bin"
+        seeded.write_bytes(b"\x00" * 4096)
+        seen = self._remote(monkeypatch, etag='"x"', size=1)
+        calls = self._fetch(monkeypatch)
+        assert download_firmware("hi3516cv610") == seeded
+        assert not seen and not calls
+
+    def test_a_stale_v500_donor_survives_a_failed_refresh(self, tmp_path, monkeypatch):
+        from defib.firmware import download_v500_donor
+
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        donor = get_cache_dir() / "u-boot-gk7205v500-nor.bin"
+        donor.write_bytes(self.OLD)
+        self._remote(monkeypatch, size=1)  # differs: stale
+        self._fetch(monkeypatch, fail=True)
+        assert download_v500_donor("gk7205v500") == donor
+        assert donor.read_bytes() == self.OLD
