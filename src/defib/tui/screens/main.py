@@ -183,7 +183,8 @@ class MainScreen(Screen[None]):
             hint.update("")
             status.update("")
         elif has_firmware(chip):
-            cached = get_cached_path(chip)
+            # A status line, redrawn often: no release round trip here.
+            cached = get_cached_path(chip, check_release=False)
             if cached:
                 dl_btn.label = f"Re-download U-Boot for {chip}"
                 dl_btn.disabled = False

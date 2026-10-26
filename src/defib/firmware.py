@@ -20,7 +20,9 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import json
 import urllib.request
+from email.utils import parsedate_to_datetime
 from collections.abc import Callable
 from pathlib import Path
 
@@ -308,8 +310,97 @@ def _is_stale(path: Path) -> bool:
     return check is not None and not check(path.read_bytes())
 
 
-def get_cached_path(chip: str, flash_type: str | None = None) -> Path | None:
+# A published image is cached once and was then reused for good, so a camera
+# whose boot image OpenIPC later fixed kept being installed with the broken
+# one (defib#148: the hi3516cv610 20s image gained a WP# fix a day after a
+# user had cached it). Each download now records the asset's validators in a
+# sidecar, and a cached copy is checked against the release before use.
+
+
+def _meta_path(path: Path) -> Path:
+    return path.with_name(path.name + ".meta")
+
+
+def _validators(headers: object) -> dict[str, object]:
+    get = getattr(headers, "get")
+    size = get("Content-Length")
+    return {
+        "etag": get("ETag"),
+        "last_modified": get("Last-Modified"),
+        "size": int(size) if size and str(size).isdigit() else None,
+    }
+
+
+def _write_meta(path: Path, validators: dict[str, object]) -> None:
+    try:
+        _meta_path(path).write_text(json.dumps(validators))
+    except OSError:
+        pass  # without it the next run compares sizes and dates instead
+
+
+def _read_meta(path: Path) -> dict[str, object] | None:
+    try:
+        data = json.loads(_meta_path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _remote_validators(url: str) -> dict[str, object] | None:
+    """The published asset's ETag, Last-Modified and size, from a HEAD request,
+    or None when they cannot be had (offline, rate-limited, anything else)."""
+    try:
+        req = urllib.request.Request(
+            url, method="HEAD", headers={"User-Agent": "defib/0.1"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return _validators(resp.headers)
+    except Exception as e:  # noqa: BLE001 - any failure means "unknown"
+        logger.debug("Could not check %s: %s", url, e)
+        return None
+
+
+def _is_current(path: Path, remote: dict[str, object] | None) -> bool:
+    """Whether a cached copy still matches the published asset.
+
+    Unknown counts as current: offline, the cache is all there is. With the
+    sidecar a download left, the ETag (else Last-Modified) decides. A copy
+    cached before sidecars existed is current only if its size matches and
+    it is newer than the published file.
+    """
+    if remote is None:
+        return True
+    meta = _read_meta(path)
+    if meta is not None:
+        for key in ("etag", "last_modified"):
+            if remote.get(key) and meta.get(key):
+                return remote[key] == meta[key]
+    size = remote.get("size")
+    if isinstance(size, int) and size != path.stat().st_size:
+        return False
+    modified = remote.get("last_modified")
+    if isinstance(modified, str):
+        try:
+            if parsedate_to_datetime(modified).timestamp() > path.stat().st_mtime:
+                return False
+        except (TypeError, ValueError):
+            pass
+    return True
+
+
+def get_cached_path(
+    chip: str,
+    flash_type: str | None = None,
+    *,
+    check_release: bool = True,
+) -> Path | None:
     """Get the path to cached firmware, or None if not cached.
+
+    A cached copy of a published image that no longer matches the release
+    counts as not cached, so the caller downloads it again: every install,
+    burn and recovery path asks here first and downloads only on None.
+    ``check_release=False`` skips that network round trip for callers that
+    only display what is cached.
 
     A registered classic board variant must never fall back to the chip-wide
     universal cache entry: doing so could select incompatible DDR init data.
@@ -326,12 +417,21 @@ def get_cached_path(chip: str, flash_type: str | None = None) -> Path | None:
         variant is not None and name in CLASSIC_UBOOT_VARIANTS
     ):
         candidates.append(_legacy_cache_name(chip))
+    published = asset_name(chip, flash_type)
     for candidate in candidates:
         if not candidate:
             continue
         path = _cached_file(candidate)
-        if path is not None and not _is_stale(path):
-            return path
+        if path is None or _is_stale(path):
+            continue
+        # Only the published asset itself has a release to match: a legacy
+        # or hand-seeded blob has nothing upstream.
+        if check_release and candidate == published:
+            url = firmware_url(chip, flash_type)
+            if url is not None and not _is_current(path, _remote_validators(url)):
+                logger.info("Published %s changed since it was cached", candidate)
+                return None
+        return path
     return None
 
 
@@ -406,25 +506,27 @@ def download_firmware(
             return cached
         raise ValueError(_unavailable_message(chip))
 
-    # Check cache
+    name = asset_name(chip, flash_type)
+    assert name is not None  # firmware_url() is None otherwise
+
+    # Check cache (get_cached_path() also checks it against the release)
     cached = get_cached_path(chip, flash_type)
     if cached is not None:
         logger.info("Using cached firmware: %s", cached)
         return cached
 
     # Download
-    name = asset_name(chip, flash_type)
-    assert name is not None  # firmware_url() is None otherwise
     dest = get_cache_dir() / name
     # A stale entry is about to be replaced, and _download() deletes dest
     # when it fails; keep its bytes to put back if we turn out to be offline.
     stale = _cached_file(name)
     stale_data = stale.read_bytes() if stale is not None else None
+    stale_times = (stale.stat().st_atime, stale.stat().st_mtime) if stale else None
     try:
         return _download(url, dest, on_progress)
     except ConnectionError:
         if stale_data is not None:
-            dest.write_bytes(stale_data)
+            _restore(dest, stale_data, stale_times)
             logger.warning(
                 "Download of %s failed; using the cached copy, which predates "
                 "a fix this chip may need",
@@ -449,6 +551,17 @@ def download_firmware(
         raise
 
 
+def _restore(
+    dest: Path, data: bytes, times: tuple[float, float] | None,
+) -> None:
+    """Put back the copy a failed refresh replaced, with its own timestamps:
+    a copy cached before sidecars is judged by its mtime, and a fresh one
+    would make it look newer than the release it is not."""
+    dest.write_bytes(data)
+    if times is not None:
+        os.utime(dest, times)
+
+
 def _download(
     url: str,
     dest: Path,
@@ -460,7 +573,9 @@ def _download(
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "defib/0.1"})
         with urllib.request.urlopen(req, timeout=30) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
+            validators = _validators(resp.headers)
+            size = validators["size"]
+            total = size if isinstance(size, int) else 0
             data = bytearray()
             while True:
                 chunk = resp.read(8192)
@@ -474,6 +589,7 @@ def _download(
             raise ConnectionError(f"Download too small ({len(data)} bytes)")
 
         dest.write_bytes(data)
+        _write_meta(dest, validators)
         logger.info("Downloaded %d bytes to %s", len(data), dest)
         return dest
 
@@ -481,7 +597,9 @@ def _download(
         # Clean up partial download
         if dest.exists():
             dest.unlink()
-        if isinstance(e, (ValueError, ConnectionError)):
+        # Every failure is a ConnectionError, which is what the callers'
+        # rollback catches: anything else would leave dest deleted.
+        if isinstance(e, ConnectionError):
             raise
         raise ConnectionError(f"Failed to download firmware: {e}") from e
 
@@ -503,7 +621,19 @@ def download_v500_donor(chip: str) -> Path:
     """
     name = f"u-boot-{_strip_variant(chip).lower()}-nor.bin"
     dest = get_cache_dir() / name
-    if dest.exists():
+    url = f"{OPENIPC_BASE_URL}/{name}"
+    if dest.exists() and _is_current(dest, _remote_validators(url)):
         logger.info("Using cached V500 donor: %s", dest)
         return dest
-    return _download(f"{OPENIPC_BASE_URL}/{name}", dest)
+    # _download() deletes dest when it fails: keep a stale donor's bytes, it
+    # still carries the agent.
+    stale_data = dest.read_bytes() if dest.exists() else None
+    stale_times = (dest.stat().st_atime, dest.stat().st_mtime) if stale_data else None
+    try:
+        return _download(url, dest)
+    except ConnectionError:
+        if stale_data is None:
+            raise
+        _restore(dest, stale_data, stale_times)
+        logger.warning("Download of %s failed; using the cached copy", name)
+        return dest
