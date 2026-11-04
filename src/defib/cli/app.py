@@ -45,6 +45,9 @@ def burn(
     loader: str = typer.Option("", "--loader", help="USB-recovery chips: RKBOOT container (MiniLoaderAll.bin), instead of --ddr/--usbplug"),
     wait: float = typer.Option(30.0, "--wait", help="USB-recovery chips: seconds to wait for the board to enumerate"),
     usb_path: str = typer.Option("", "--usb-path", help="USB-recovery chips: pin to one physical port path (e.g. 1-4.2); required when several Rockchip boards are attached"),
+    nic: str = typer.Option("", "--nic", help="Novatek: recover over Ethernet on this interface (DHCP + TFTP; needs root)"),
+    host_ip: str = typer.Option("", "--host-ip", help="Novatek over Ethernet: this host's IP (default: the NIC's own, else 192.168.1.10)"),
+    device_ip: str = typer.Option("", "--device-ip", help="Novatek over Ethernet: the IP the board is given (default: .251 on the host's /24)"),
 ) -> None:
     """Wake a dead device so its flash can be written.
 
@@ -56,7 +59,83 @@ def burn(
     into MaskROM on its own at power-up, so --power-cycle is all it takes.
     """
     import asyncio
-    asyncio.run(_burn_async(chip, file, port, send_break, terminal, power_cycle, poe_port_override, output, debug, ddr, usbplug, loader, wait, usb_path, flash_type="nand" if nand else "nor"))
+    asyncio.run(_burn_async(chip, file, port, send_break, terminal, power_cycle, poe_port_override, output, debug, ddr, usbplug, loader, wait, usb_path, flash_type="nand" if nand else "nor", nic=nic, host_ip=host_ip, device_ip=device_ip))
+
+
+async def _burn_novatek_eth(
+    chip: str, firmware_path: str, flash_type: str, port: str, nic: str,
+    host_ip: str, device_ip: str, power_controller: object, poe_port: str | None,
+    output: str,
+) -> None:
+    """Novatek over Ethernet: answer the ROM's DHCP and TFTP, as a blank
+    flash's auto-boot ends there (defib.recovery.novatek_eth)."""
+    import contextlib
+    import ipaddress
+    import json as json_mod
+    from pathlib import Path
+
+    from rich.console import Console
+
+    from defib.network.ip_manager import nic_ipv4, temporary_ip
+    from defib.power.base import PowerController
+    from defib.recovery.events import LogEvent
+    from defib.recovery.novatek_eth import recover_over_ethernet
+    from defib.transport.serial_platform import create_transport
+
+    console = Console()
+
+    def on_log(event: LogEvent) -> None:
+        if output == "json":
+            print(json_mod.dumps({"event": "log", "level": event.level,
+                                  "message": event.message}), flush=True)
+        elif output == "human":
+            color = "red" if event.level == "error" else "dim"
+            console.print(f"[{color}]{event.message}[/{color}]")
+
+    own_ip = await nic_ipv4(nic)
+    assign = not host_ip and own_ip is None
+    host_ip = host_ip or own_ip or "192.168.1.10"
+    if not device_ip:
+        net = ipaddress.ip_network(f"{host_ip}/24", strict=False)
+        device_ip = str(net.network_address + (252 if host_ip.endswith(".251") else 251))
+    transport = None
+    try:
+        transport = await create_transport(port)
+    except Exception as e:
+        on_log(LogEvent(level="warn", message=f"No console on {port} ({e}): not stopping autoboot"))
+    power = power_controller if isinstance(power_controller, PowerController) else None
+    # Vectis drives power through the console's own link: closing a
+    # connection of its own would cut the board's power
+    from defib.power.vectis import VectisController
+    if isinstance(power, VectisController):
+        if transport is None:
+            on_log(LogEvent(level="error", message="Vectis power needs the console on --port"))
+            raise typer.Exit(1)
+        power.attach_transport(transport)
+    try:
+        async with contextlib.AsyncExitStack() as stack:
+            if assign:
+                await stack.enter_async_context(temporary_ip(nic, host_ip))
+            result = await recover_over_ethernet(
+                chip, Path(firmware_path).read_bytes(), nic, host_ip, device_ip,
+                flash_type=flash_type, transport=transport, power=power,
+                poe_port=poe_port, on_log=on_log,
+            )
+    finally:
+        if power is not None:
+            await power.close()
+        if transport is not None:
+            await transport.close()
+    if output == "json":
+        print(json_mod.dumps({"event": "result", "success": result.success,
+                              "error": result.error, "elapsed_ms": result.elapsed_ms}))
+    elif output == "human":
+        if result.success:
+            console.print(f"[green]U-Boot is up from RAM[/green] ({result.elapsed_ms / 1000:.1f} s)")
+        else:
+            console.print(f"[red]Failed:[/red] {result.error}")
+    if not result.success:
+        raise typer.Exit(1)
 
 
 async def _burn_async(
@@ -64,6 +143,7 @@ async def _burn_async(
     power_cycle: bool, poe_port_override: str, output: str, debug: bool,
     ddr: str = "", usbplug: str = "", loader: str = "", wait: float = 30.0,
     usb_path: str = "", flash_type: str = "nor",
+    nic: str = "", host_ip: str = "", device_ip: str = "",
 ) -> None:
     import json as json_mod
     import logging
@@ -182,6 +262,14 @@ async def _burn_async(
             poe_port = ""
             if output == "human":
                 console.print(f"Power: [cyan]{power_controller.name()}[/cyan]")
+
+    from defib.protocol.novatek import Novatek
+    if nic and Novatek.matches(chip):
+        await _burn_novatek_eth(
+            chip, firmware_path, flash_type, port, nic, host_ip, device_ip,
+            power_controller, poe_port, output,
+        )
+        return
 
     # Detect rack-pod power early: the pod runs the entire HiSilicon SPL
     # upload locally over its UART, so we MUST NOT have a TCP client on

@@ -202,6 +202,18 @@ async def remove_ip(interface: str, ip: str, netmask: str = "255.255.255.0") -> 
         logger.info("Successfully removed %s from %s", ip, interface)
 
 
+async def nic_ipv4(interface: str) -> str | None:
+    """The first IPv4 address on ``interface`` (Linux), or None."""
+    if not sys.platform.startswith("linux"):
+        return None
+    code, out, _ = await _run_command(["ip", "-4", "-o", "addr", "show", "dev", interface])
+    for line in out.splitlines() if code == 0 else []:
+        words = line.split()
+        if "inet" in words:
+            return words[words.index("inet") + 1].split("/")[0]
+    return None
+
+
 @asynccontextmanager
 async def temporary_ip(
     interface: str,

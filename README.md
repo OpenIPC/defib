@@ -54,8 +54,25 @@ defib burn -c gk7205v200 -f u-boot.bin --output json
 
 ## Novatek
 
-NT98560/561/562/566, NT98321/323 and NT98532/533 are recovered over UART
-with no U-Boot of their own in flash, and nothing written to it:
+NT98560/561/562/566, NT98321/323 and NT98532/533 get OpenIPC U-Boot started
+from RAM, with nothing written to flash.
+
+**Over Ethernet** (XM and other boards with the boot straps at flash): with no
+valid loader in flash, the mask ROM falls through to Ethernet boot. defib
+answers its DHCP and serves the loader and the pack over TFTP; the serial
+console is only used to stop U-Boot's autoboot.
+
+```bash
+sudo defib burn -c nt98562 -p /dev/ttyUSB0 --nic eth0   # then power the board on
+```
+
+defib's DHCP answers only the ROM's and the loader's `00:00:00:xx:xx:xx`
+MACs, at once and by broadcast, so it can share a network with a DHCP
+server. It needs root for ports 67 and 69 (stop any TFTP server on this host
+first). `--host-ip` defaults to the NIC's own address (else 192.168.1.10 is
+added for the run) and `--device-ip` to `.251` on that /24.
+
+**Over UART**, with the boot straps at UART:
 
 ```bash
 defib burn -c nt98566 -p /dev/ttyUSB0          # or --nand for a SPI NAND board
