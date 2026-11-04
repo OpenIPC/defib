@@ -1,8 +1,11 @@
 """Novatek boot recovery protocol: NT9856x, NT9832x, NT9853x.
 
-Boot source UART (BS = 0xC on NT9856x and NT9853x, 4 on NT9832x), or the
-mask ROM's auto-boot once flash, SD, Ethernet and USB have all failed. Two
-stages over one link at 115200 8N1, in one command format:
+The mask ROM takes UART downloads when the boot straps say UART (BS = 0xC
+on NT9856x and NT9853x, 4 on NT9832x). Its auto-boot from a blank flash
+ends at Ethernet in practice (NT9856x ROM code Application Note, 1.3 and
+1.4.3): it reaches UART only after Ethernet gets no DHCP offer and USB has
+timed out, about 100 s. Two stages over one link at 115200 8N1, in one
+command format:
 
 1. The ROM takes a *write loader* (``wrloader.bin``), the SDK's loader built
    ``STORAGEEXT=Uart``, into SRAM: IS_NVT, OPEN_DEVICE, WRLOADER, WAIT_DONE.
@@ -13,10 +16,12 @@ stages over one link at 115200 8N1, in one command format:
    flash.
 
 Stage 2 is the SDK's loader source (``Include/scsi_op.h``,
-``Project/Model/Src/UART/uart_upgrade.c``). No SDK document describes stage 1:
-it was read out of Novatek's ``FwUpgrade.exe``, and has not been run against
-silicon. The loader's image names its own SRAM address, so the table below
-only guards against a loader built for another die.
+``Project/Model/Src/UART/uart_upgrade.c``), and has run on an NT98562: its
+ROM booted ``wrloader.bin`` over Ethernet, and this code took the write
+loader to an OpenIPC U-Boot prompt. Stage 1 follows the NA51089 ROM's own
+UART handler, read from a dump of it: 0xC0 commands only, every 16 bytes
+taken as a command with no resync, the payload included. It has not run on
+silicon, for want of a board with the straps at UART.
 
 Both stages come from ``novatek-recovery.tar.gz`` on OpenIPC/u-boot's
 ``novatek`` release, one ``recovery-<soc>-<flash>/`` folder per target.
@@ -70,6 +75,7 @@ DIE_SRAM: dict[int, int] = {
 OPSET = 0xC0
 OP_OPEN_DEVICE = 0x01
 OP_WRLOADER = 0x02
+OP_ADDR_WRITE = 0x03
 OP_MEM_WRITE = 0x04
 OP_IS_NVT = 0x81
 OP_WAIT_DONE = 0x82
@@ -90,8 +96,14 @@ WRITE_PIECE = 0x1000
 # takes the data: small enough that one fits in the reply timeout.
 PACK_CHUNK = 0x1000
 
-HANDSHAKE_TIMEOUT = 60.0
+# With no loader in flash the ROM tries SD, Ethernet (6 DHCP tries of 5 s)
+# and USB (30 s) before UART: about 100 s a round, and the UART window is 30 s
+HANDSHAKE_TIMEOUT = 180.0
 HANDSHAKE_INTERVAL = 0.25
+# What the ROM prints once Ethernet boot has a DHCP lease and has asked the
+# lease's next-server for loader.bin: it then waits for TFTP with no timeout
+# and never gets to UART
+ROM_STUCK_ON_TFTP = b"S3S4"
 REPLY_TIMEOUT = 30.0
 # FwUpgrade.exe's wait for the write loader to bring the DDR up
 LOADER_START_DELAY = 3.0
@@ -103,6 +115,34 @@ def build_cdb(op: int, addr: int = 0, size: int = 0) -> bytes:
     total = sum(w + i for i, w in enumerate(struct.unpack("<8H", cdb)))
     struct.pack_into("<H", cdb, CDB_SIZE - 2, -total & 0xFFFF)
     return bytes(cdb)
+
+
+def _rom_takes_as_command(chunk: bytes | bytearray) -> bool:
+    """What the ROM's WRLOADER receive loop matches each 16 bytes against,
+    payload included: IS_NVT, OPEN_DEVICE and WAIT_DONE by their first word,
+    ADDR_READ, ADDR_WRITE and WRLOADER by their first halfword."""
+    word = int.from_bytes(chunk[:4], "little")
+    half = word & 0xFFFF
+    return word in (0x81C0, 0x01C0, 0x82C0) or half in (0x83C0, 0x03C0, 0x02C0)
+
+
+def defuse_loader(loader: bytes) -> tuple[bytes, list[tuple[int, int]]]:
+    """The loader padded to 16 bytes, with every 16 bytes the ROM would run
+    as a command zeroed, and the words to write back over them.
+
+    The mask ROM stores the WRLOADER payload but still decodes each 16 bytes
+    of it as a command: NT98562's loader has a WRLOADER at +0x910, which
+    would move the rest of the stream elsewhere."""
+    image = bytearray(loader.ljust(-(-len(loader) // CDB_SIZE) * CDB_SIZE, b"\0"))
+    patches: list[tuple[int, int]] = []
+    for off in range(0, len(image), CDB_SIZE):
+        if _rom_takes_as_command(image[off:off + CDB_SIZE]):
+            patches += [
+                (off + i, int.from_bytes(image[off + i:off + i + 4], "little"))
+                for i in range(0, CDB_SIZE, 4)
+            ]
+            image[off:off + CDB_SIZE] = bytes(CDB_SIZE)
+    return bytes(image), patches
 
 
 def load_recovery_set(
@@ -220,6 +260,17 @@ class Novatek(BootProtocol):
                     transport, OP_IS_NVT, reply=4, timeout=HANDSHAKE_INTERVAL,
                 )
             except TransportError:
+                if ROM_STUCK_ON_TFTP in self._rx:
+                    return HandshakeResult(
+                        success=False,
+                        message="The Novatek ROM took a DHCP lease and waits for "
+                        "loader.bin over TFTP; it never reaches UART. "
+                        "Keep the board off DHCP",
+                    )
+                del self._rx[:-CDB_SIZE * 2]
+                # The ROM takes every 16 bytes as a command and never
+                # resyncs: a byte between tries walks all 16 alignments
+                await transport.write(b"\0")
                 continue
             word = struct.unpack("<I", got)[0]
             break
@@ -264,7 +315,10 @@ class Novatek(BootProtocol):
                 f"the write loader is linked at 0x{base:08x}, "
                 f"this die's SRAM is at 0x{want or 0:08x}"
             )
-        await self._command(transport, OP_WRLOADER, base, len(loader), loader)
+        image, patches = defuse_loader(loader)
+        await self._command(transport, OP_WRLOADER, base, len(image), image)
+        for off, word in patches:
+            await self._command(transport, OP_ADDR_WRITE, base + off, word)
         _emit(on_progress, ProgressEvent(
             stage=Stage.SPL, bytes_sent=len(loader), bytes_total=len(loader),
         ))

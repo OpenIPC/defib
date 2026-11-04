@@ -19,6 +19,7 @@ from defib.protocol.base import ProtocolError
 from defib.protocol.novatek import (
     DIE_SRAM,
     NOVATEK_SOCS,
+    OP_ADDR_WRITE,
     OP_GET_TMP_ADDR,
     OP_IS_NVT,
     OP_MEM_WRITE,
@@ -28,6 +29,7 @@ from defib.protocol.novatek import (
     OP_WRLOADER,
     Novatek,
     build_cdb,
+    defuse_loader,
     load_recovery_set,
 )
 from defib.protocol.registry import find_protocol
@@ -87,10 +89,6 @@ class FakeDevice(Transport):
                 continue
             op = cdb[1]
             addr, size = struct.unpack_from("<II", cdb, 2)
-            if op == OP_IS_NVT and self.boot_after:
-                self.boot_after -= 1
-                del self.rx[:16]
-                continue
             if op in (OP_WRLOADER, OP_MEM_WRITE) and len(self.rx) < 16 + size:
                 return
             del self.rx[:16]
@@ -101,8 +99,20 @@ class FakeDevice(Transport):
                 self._answer(cdb)
             elif op == OP_WRLOADER:
                 assert self.in_rom
-                self.sram[addr] = bytes(self.rx[:size])
+                data = bytes(self.rx[:size])
+                # The ROM decodes every 16 bytes of the payload as well
+                for off in range(0, size, 16):
+                    word = int.from_bytes(data[off:off + 4], "little")
+                    assert word not in (0x81C0, 0x01C0, 0x82C0), hex(off)
+                    assert word & 0xFFFF not in (0x83C0, 0x03C0, 0x02C0), hex(off)
+                self.sram[addr] = data
                 del self.rx[:size]
+                self._answer(cdb)
+            elif op == OP_ADDR_WRITE:
+                assert self.in_rom
+                (base, image), = self.sram.items()
+                at = addr - base
+                self.sram[base] = image[:at] + size.to_bytes(4, "little") + image[at + 4:]
                 self._answer(cdb)
             elif op == OP_WAIT_DONE and self.in_rom:
                 self._answer(cdb)
@@ -133,6 +143,9 @@ class FakeDevice(Transport):
         return bytes(self.tx.popleft() for _ in range(n))
 
     async def write(self, data: bytes) -> None:
+        if self.boot_after:     # not at UART yet: nothing is read
+            self.boot_after -= len(data) == 16
+            return
         self.rx += data
 
     async def flush_input(self) -> None:
@@ -199,6 +212,20 @@ class TestMatching:
         )
 
 
+class TestDefuse:
+    def test_pads_and_patches(self):
+        loader = bytes(16) + b"\xc0\x81\x00\x00" + b"\x11" * 12 + b"\x22" * 5
+        image, patches = defuse_loader(loader)
+        assert len(image) == 48
+        assert image[16:32] == bytes(16)
+        assert patches[0] == (16, 0x81C0)
+        assert patches[1] == (20, 0x11111111)
+
+    def test_leaves_a_clean_loader_alone(self):
+        image, patches = defuse_loader(loader_image())
+        assert image == loader_image() and not patches
+
+
 class TestArchive:
     def test_picks_the_flash(self):
         loader, pack = load_recovery_set(bundle(), "nt98562", "nand")
@@ -233,10 +260,11 @@ class TestRecovery:
         loader, pack = loader_image(), bytes(range(256)) * 40
         dev, proto = FakeDevice(boot_after=3), self.protocol()
         assert (await proto.handshake(dev)).chip_id == NA51089
+        misaligned = dev.bad_sums
         result = await proto.send_firmware(dev, bundle(loader, pack))
         assert result.success, result.error
         assert result.stages_completed[-1] == Stage.COMPLETE
-        assert dev.bad_sums == 0
+        assert dev.bad_sums == misaligned
         assert dev.sram == {SRAM: loader}
         assert dev.ops[:4] == [OP_IS_NVT, OP_OPEN_DEVICE, OP_WRLOADER, OP_WAIT_DONE]
         assert dev.ops[-2:] == [OP_UBOOT, OP_WAIT_DONE]
@@ -259,6 +287,11 @@ class TestRecovery:
         assert "bring the DDR up" in result.message
         assert OP_OPEN_DEVICE not in dev.ops
 
+    async def test_a_stray_byte_is_walked_past(self):
+        dev, proto = FakeDevice(), self.protocol()
+        dev.rx += b"\x55" * 5     # line noise the ROM took as a command's start
+        assert (await proto.handshake(dev)).chip_id == NA51089
+
     async def test_an_unknown_die_is_refused(self):
         dev, proto = FakeDevice(word=0x12345678), self.protocol()
         result = await proto.handshake(dev)
@@ -273,6 +306,17 @@ class TestRecovery:
         assert result.success, result.error
         assert dev.ops.count(OP_WRLOADER) == 1
         assert dev.sram == {SRAM: loader}
+
+    async def test_a_loader_chunk_the_rom_would_run_is_written_back(self):
+        loader = bytearray(loader_image())
+        loader[0x910:0x914] = b"\xc0\x02\x9f\xe5"
+        loader = bytes(loader)
+        dev, proto = FakeDevice(), self.protocol()
+        await proto.handshake(dev)
+        result = await proto.send_firmware(dev, bundle(loader))
+        assert result.success, result.error
+        assert dev.sram == {SRAM: loader}
+        assert dev.ops.count(OP_ADDR_WRITE) == 4
 
     async def test_a_loader_past_the_rom_limit_is_refused(self):
         dev, proto = FakeDevice(), self.protocol()

@@ -87,7 +87,8 @@ five CI jobs in `.github/workflows/ci.yml` run (`test`, `fuzz`, `lint`,
    - `HiSiliconCV6xx` — `hi3516cv608/610/613`, `hi3516dv500`, `hi3519dv500`; multi-stage
    - `Novatek` — `nt98560/561/562/566`, `nt98321/323`, `nt98532/533`; 16-byte commands,
      ROM then write loader. No profile JSON; its "firmware" is one archive for every
-     SoC, so the session calls `set_target()`. Stage 1 is from FwUpgrade.exe, not silicon.
+     SoC, so the session calls `set_target()`. UART needs the straps at UART: a blank
+     flash's auto-boot stops at Ethernet once DHCP answers.
 
    The V500 and CV6xx chips are hardcoded frozensets and **deliberately have no
    profile JSON** — their DDR/SPL data lives in the protocol class. That is the
