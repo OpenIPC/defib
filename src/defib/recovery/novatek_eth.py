@@ -107,7 +107,7 @@ async def recover_over_ethernet(
         return failed(f"DHCP: {e}", [])
     try:
         tftp, served = await start_tftp_server(
-            bind_addr=host_ip, files={ETH_LOADER: loader, name: pack}, done_count=2,
+            bind_addr=host_ip, files={ETH_LOADER: loader, name: pack}, done_file=name,
         )
     except Exception as e:
         dhcp.close()

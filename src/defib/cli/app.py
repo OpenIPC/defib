@@ -116,6 +116,8 @@ async def _burn_novatek_eth(
     finally:
         if power is not None:
             await power.close()
+        if transport is not None:
+            await transport.close()
     if output == "json":
         print(json_mod.dumps({"event": "result", "success": result.success,
                               "error": result.error, "elapsed_ms": result.elapsed_ms}))
@@ -124,8 +126,6 @@ async def _burn_novatek_eth(
             console.print(f"[green]U-Boot is up from RAM[/green] ({result.elapsed_ms / 1000:.1f} s)")
         else:
             console.print(f"[red]Failed:[/red] {result.error}")
-    if transport is not None:
-        await transport.close()
     if not result.success:
         raise typer.Exit(1)
 

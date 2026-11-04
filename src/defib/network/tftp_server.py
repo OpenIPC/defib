@@ -17,7 +17,7 @@ import errno
 import logging
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -63,6 +63,7 @@ class TFTPTransfer:
     """State for an active TFTP transfer."""
     addr: tuple[str, int]
     data: bytes
+    filename: str = ""
     blocksize: int = DEFAULT_BLOCKSIZE
     block_num: int = 0
     complete: bool = False
@@ -76,6 +77,7 @@ class TFTPServerStats:
     bytes_sent: int = 0
     transfers_complete: int = 0
     errors: int = 0
+    files_complete: list[str] = field(default_factory=list)
 
 
 class TFTPServerProtocol(asyncio.DatagramProtocol):
@@ -94,8 +96,10 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
         *,
         files: dict[str, bytes] | None = None,
         done_count: int = 1,
+        done_file: str | None = None,
     ) -> None:
         self._files = files or {}
+        self._done_file = done_file
         self._default_data = file_data
         self._filename = filename
         self._on_progress = on_progress
@@ -173,7 +177,9 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
             except ValueError:
                 pass
 
-        transfer = TFTPTransfer(addr=addr, data=serve_data, blocksize=blocksize)
+        transfer = TFTPTransfer(
+            addr=addr, data=serve_data, filename=filename, blocksize=blocksize,
+        )
         self._transfers[addr] = transfer
 
         # Send OACK whenever the blksize option was accepted, including an
@@ -212,10 +218,14 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
 
             if transfer.complete:
                 self.stats.transfers_complete += 1
+                self.stats.files_complete.append(transfer.filename)
                 self.stats.bytes_sent += len(transfer.data)
                 logger.info("Transfer complete to %s:%d (%d bytes)", addr[0], addr[1], len(transfer.data))
                 del self._transfers[addr]
-                if self.stats.transfers_complete >= self._done_count:
+                if self._done_file is not None:
+                    if transfer.filename == self._done_file:
+                        self._done_event.set()
+                elif self.stats.transfers_complete >= self._done_count:
                     self._done_event.set()
                 return
 
@@ -372,6 +382,7 @@ async def start_tftp_server(
     *,
     files: dict[str, bytes] | None = None,
     done_count: int = 1,
+    done_file: str | None = None,
 ) -> tuple[asyncio.DatagramTransport, TFTPServerProtocol]:
     """Start an async TFTP server.
 
@@ -383,6 +394,7 @@ async def start_tftp_server(
         on_progress: Callback(bytes_sent, bytes_total) for progress.
         files: Dict mapping filenames to data for multi-file mode.
         done_count: Number of completed transfers before done_event fires.
+        done_file: Fire done_event when this file has been sent instead.
 
     Returns:
         Tuple of (transport, protocol) for the running server.
@@ -390,7 +402,7 @@ async def start_tftp_server(
     loop = asyncio.get_running_loop()
     protocol = TFTPServerProtocol(
         file_data, filename, on_progress,
-        files=files, done_count=done_count,
+        files=files, done_count=done_count, done_file=done_file,
     )
 
     try:

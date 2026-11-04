@@ -76,6 +76,7 @@ class DHCPServerProtocol(asyncio.DatagramProtocol):
     ) -> None:
         self._client_ip = client_ip
         self._server_ip = server_ip
+        self._server_id = socket.inet_aton(server_ip)
         self._netmask = netmask
         self._bootfile = bootfile
         self._accept = accept
@@ -92,7 +93,11 @@ class DHCPServerProtocol(asyncio.DatagramProtocol):
         mac = data[28:34]
         if not self._accept(mac):
             return
-        kind = _options(data[240:]).get(53, b"\0")[0]
+        opts = _options(data[240:])
+        kind = opts.get(53, b"\0")[0]
+        # A REQUEST naming another server took that server's offer
+        if kind == REQUEST and opts.get(54, self._server_id) != self._server_id:
+            return
         reply = {DISCOVER: OFFER, REQUEST: ACK}.get(kind)
         if reply is None or self._transport is None:
             return

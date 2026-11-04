@@ -76,3 +76,10 @@ def test_other_clients_are_left_to_the_network():
 def test_the_pack_name():
     assert pack_name("nt98562") == "FW98562T.BIN"
     assert pack_name("NT98323:x") == "FW98323T.BIN"
+
+
+def test_a_request_to_another_server_is_left_alone():
+    proto, sent = server()
+    request = bootrequest(REQUEST)[:-1] + bytes([54, 4]) + socket.inet_aton("10.0.0.1") + b"\xff"
+    proto.datagram_received(request, ("0.0.0.0", 68))
+    assert not sent.packets
