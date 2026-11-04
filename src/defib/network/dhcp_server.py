@@ -1,10 +1,12 @@
 """A minimal DHCP server for boot ROMs that load over TFTP.
 
 It answers only the clients a predicate picks by MAC, so it can run on a
-network that has its own DHCP server, and it answers at once and by
-broadcast: a ROM takes the first offer it can read, and one with no IP yet
-drops a unicast reply. Every client gets the same address, the server as
-next-server and a boot file name; DISCOVER gets OFFER, REQUEST gets ACK.
+network that has its own DHCP server, and it answers at once: a ROM takes
+the first offer whose xid matches. Replies are broadcast, which reaches a
+client that has no address yet whatever its stack does with unicast. Every
+client gets the same address, the server as next-server (siaddr, which a
+Novatek ROM also names in its REQUEST) and a boot file name; DISCOVER gets
+OFFER, REQUEST gets ACK.
 """
 
 from __future__ import annotations
