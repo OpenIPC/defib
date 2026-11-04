@@ -83,3 +83,18 @@ def test_a_request_to_another_server_is_left_alone():
     request = bootrequest(REQUEST)[:-1] + bytes([54, 4]) + socket.inet_aton("10.0.0.1") + b"\xff"
     proto.datagram_received(request, ("0.0.0.0", 68))
     assert not sent.packets
+
+
+def test_the_server_the_rom_took_comes_off_its_console():
+    from defib.recovery.novatek_eth import offer_server
+
+    console = b"S1RI\r\naOfIP 0AD8807F SRV 0AD88001\r\nMSK FFFFFF00\r\nbS2"
+    assert offer_server(console) == "10.216.128.1"
+    assert offer_server(b"NPIp>K9S1K2HE") is None
+
+
+def test_the_latest_offer_counts():
+    from defib.recovery.novatek_eth import offer_server
+
+    console = b"OfIP 0AD8807F SRV 0AD88001\r\n...OfIP C0A84DFB SRV C0A84D01\r\n"
+    assert offer_server(console) == "192.168.77.1"
