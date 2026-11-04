@@ -53,16 +53,17 @@ ROM_OFFER = re.compile(rb"OfIP ([0-9A-F]{8}) SRV ([0-9A-F]{8})")
 
 
 def offer_server(console: bytes) -> str | None:
-    """The next-server of the offer the ROM took, from its console."""
-    m = ROM_OFFER.search(console)
-    return str(ipaddress.IPv4Address(int(m.group(2), 16))) if m else None
+    """The next-server of the latest offer the ROM took, from its console."""
+    found = ROM_OFFER.findall(console)
+    return str(ipaddress.IPv4Address(int(found[-1][1], 16))) if found else None
 
 
-async def _drain(transport: Transport, seen: bytearray) -> None:
+async def _drain(transport: Transport, seen: bytearray, stop: asyncio.Event) -> None:
     """Keep the console read while the board fetches: a UART nobody reads
     stalls an emulated board (QEMU), and what the ROM prints says which
-    server it took."""
-    while True:
+    server it took.  It stops between reads, so no read of its is still
+    running on a serial port when the prompt is looked for."""
+    while not stop.is_set():
         try:
             seen += await transport.read(4096, timeout=0.2)
         except TransportTimeout:
@@ -74,9 +75,15 @@ def is_novatek_boot_mac(mac: bytes) -> bool:
     return mac[:3] == b"\0\0\0"
 
 
-async def _catch_prompt(transport: Transport, timeout: float) -> tuple[bool, bytes]:
-    """Ctrl-C until U-Boot's prompt shows, past its autoboot."""
-    seen = bytearray()
+async def _catch_prompt(
+    transport: Transport, timeout: float, seen: bytearray | None = None,
+) -> tuple[bool, bytes]:
+    """Ctrl-C until U-Boot's prompt shows, past its autoboot; seen is what
+    the console has already shown."""
+    seen = seen if seen is not None else bytearray()
+    if any(p in seen for p in PROMPTS):
+        await transport.write(b"\r")
+        return True, bytes(seen)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         await transport.write(b"\x03")
@@ -139,13 +146,18 @@ async def recover_over_ethernet(
     log(f"Serving {ETH_LOADER} and {name} on {nic} ({host_ip}); the board gets {device_ip}")
 
     try:
+        if transport is not None:
+            await transport.flush_input()       # nothing from an earlier boot
         if power is not None and poe_port is not None:
             log("Power-cycling the board")
             await power.power_cycle(poe_port)
         else:
             log("Waiting for the board: power it on now")
         console = bytearray()
-        reader = asyncio.ensure_future(_drain(transport, console)) if transport else None
+        stop = asyncio.Event()
+        reader = None
+        if transport is not None:
+            reader = asyncio.ensure_future(_drain(transport, console, stop))
         waiter = asyncio.ensure_future(served.wait_for_completion(timeout=fetch_timeout))
         try:
             while not waiter.done():
@@ -160,9 +172,11 @@ async def recover_over_ethernet(
                         [],
                     )
         finally:
+            waiter.cancel()
+            stop.set()
             if reader:
-                reader.cancel()
-        if waiter.cancelled() or not waiter.result():
+                await asyncio.gather(reader, return_exceptions=True)
+        if not waiter.done() or waiter.cancelled() or not waiter.result():
             return failed(
                 f"The board fetched nothing in {fetch_timeout:.0f} s: is it on {nic}, "
                 "with no valid loader in flash?",
@@ -171,7 +185,7 @@ async def recover_over_ethernet(
         log(f"{ETH_LOADER} and {name} sent; U-Boot is starting from RAM")
         done = [Stage.SPL, Stage.UBOOT]
         if transport is not None:
-            ok, seen = await _catch_prompt(transport, timeout=15.0)
+            ok, seen = await _catch_prompt(transport, timeout=15.0, seen=console)
             if not ok:
                 tail = seen[-200:].decode("latin1", "replace")
                 return failed(
