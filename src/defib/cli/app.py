@@ -104,6 +104,14 @@ async def _burn_novatek_eth(
     except Exception as e:
         on_log(LogEvent(level="warn", message=f"No console on {port} ({e}): not stopping autoboot"))
     power = power_controller if isinstance(power_controller, PowerController) else None
+    # Vectis drives power through the console's own link: closing a
+    # connection of its own would cut the board's power
+    from defib.power.vectis import VectisController
+    if isinstance(power, VectisController):
+        if transport is None:
+            on_log(LogEvent(level="error", message="Vectis power needs the console on --port"))
+            raise typer.Exit(1)
+        power.attach_transport(transport)
     try:
         async with contextlib.AsyncExitStack() as stack:
             if assign:
