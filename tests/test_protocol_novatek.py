@@ -212,6 +212,15 @@ class TestArchive:
         with pytest.raises(ProtocolError, match="not a recovery archive"):
             load_recovery_set(b"u-boot", "nt98562")
 
+    def test_a_truncated_archive(self):
+        data = bundle()
+        with pytest.raises(ProtocolError, match="not a recovery archive"):
+            load_recovery_set(data[:len(data) // 2], "nt98562")
+
+    def test_an_empty_pack(self):
+        with pytest.raises(ProtocolError, match="empty file"):
+            load_recovery_set(bundle(pack=b""), "nt98562")
+
 
 @pytest.mark.asyncio
 class TestRecovery:
@@ -249,6 +258,29 @@ class TestRecovery:
         assert not result.success
         assert "bring the DDR up" in result.message
         assert OP_OPEN_DEVICE not in dev.ops
+
+    async def test_an_unknown_die_is_refused(self):
+        dev, proto = FakeDevice(word=0x12345678), self.protocol()
+        result = await proto.handshake(dev)
+        assert not result.success
+        assert OP_OPEN_DEVICE not in dev.ops
+
+    async def test_a_64k_loader_is_one_command(self):
+        loader = loader_image(size=0x10000)
+        dev, proto = FakeDevice(), self.protocol()
+        await proto.handshake(dev)
+        result = await proto.send_firmware(dev, bundle(loader))
+        assert result.success, result.error
+        assert dev.ops.count(OP_WRLOADER) == 1
+        assert dev.sram == {SRAM: loader}
+
+    async def test_a_loader_past_the_rom_limit_is_refused(self):
+        dev, proto = FakeDevice(), self.protocol()
+        await proto.handshake(dev)
+        result = await proto.send_firmware(dev, bundle(loader_image(size=0x10001)))
+        assert not result.success
+        assert "more than the ROM" in result.error
+        assert not dev.sram
 
     async def test_a_loader_for_another_sram_is_refused(self):
         dev, proto = FakeDevice(), self.protocol()

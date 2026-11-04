@@ -34,6 +34,7 @@ import logging
 import struct
 import tarfile
 import time
+import zlib
 from typing import Callable
 
 from defib.protocol.base import BootProtocol, ProtocolError
@@ -80,7 +81,11 @@ CDB_STATUS = 13
 # What identifies a reply as the echo of its command: all but status and sum
 CDB_ECHO = 13
 
+# The largest write loader the ROM takes, in one WRLOADER command
 ROM_CHUNK = 0x10000
+# Pieces a command's data is written in: 64 KiB is 5.7 s at 115200, past the
+# serial transport's write timeout
+WRITE_PIECE = 0x1000
 # A reply is the only sign of progress, and the loader sends it before it
 # takes the data: small enough that one fits in the reply timeout.
 PACK_CHUNK = 0x1000
@@ -106,27 +111,29 @@ def load_recovery_set(
     """``(wrloader.bin, pack)`` of a chip from novatek-recovery.tar.gz."""
     folder = f"recovery-{chip.split(':', 1)[0].lower()}-{flash_type}"
     try:
-        tar = tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz")
-    except tarfile.TarError as e:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            files = {
+                m.name.removeprefix("./"): m for m in tar.getmembers() if m.isfile()
+            }
+
+            def read(path: str) -> bytes:
+                f = tar.extractfile(files[path])
+                assert f is not None
+                return f.read()
+
+            wrloader = f"{folder}/wrloader.bin"
+            packs = [
+                n for n in files
+                if n.startswith(f"{folder}/FW") and n.upper().endswith("T.BIN")
+            ]
+            if wrloader not in files or len(packs) != 1:
+                raise ProtocolError(f"the recovery archive has no UART set {folder}")
+            loader, pack = read(wrloader), read(packs[0])
+    except (tarfile.TarError, EOFError, OSError, zlib.error) as e:
         raise ProtocolError(f"not a recovery archive: {e}") from e
-    with tar:
-        files = {
-            m.name.removeprefix("./"): m for m in tar.getmembers() if m.isfile()
-        }
-
-        def read(path: str) -> bytes:
-            f = tar.extractfile(files[path])
-            assert f is not None
-            return f.read()
-
-        wrloader = f"{folder}/wrloader.bin"
-        packs = [
-            n for n in files
-            if n.startswith(f"{folder}/FW") and n.upper().endswith("T.BIN")
-        ]
-        if wrloader not in files or len(packs) != 1:
-            raise ProtocolError(f"the recovery archive has no UART set {folder}")
-        return read(wrloader), read(packs[0])
+    if not loader or not pack:
+        raise ProtocolError(f"the recovery archive has an empty file in {folder}")
+    return loader, pack
 
 
 def _emit(callback: Callable[[ProgressEvent], None] | None, event: ProgressEvent) -> None:
@@ -174,7 +181,9 @@ class Novatek(BootProtocol):
         together, then the echo and any reply are read. The loader's own
         messages can come in between on the same UART."""
         cdb = build_cdb(op, addr, size)
-        await transport.write(cdb + data)
+        await transport.write(cdb + data[:WRITE_PIECE])
+        for off in range(WRITE_PIECE, len(data), WRITE_PIECE):
+            await transport.write(data[off:off + WRITE_PIECE])
         await transport.flush_output()
         deadline = time.monotonic() + timeout
         while True:
@@ -220,11 +229,11 @@ class Novatek(BootProtocol):
             )
         self.chip_word = word
         want = NOVATEK_DIES.get(self._chip)
-        if want is not None and word in DIE_SRAM and word != want:
+        if word != want:
             return HandshakeResult(
                 success=False, chip_id=word,
                 message=f"This is die 0x{word:08x}, not the {self._chip}'s "
-                f"0x{want:08x}: its loader would not bring the DDR up",
+                f"0x{want or 0:08x}: its loader would not bring the DDR up",
             )
         await self._command(transport, OP_OPEN_DEVICE)
         _emit(on_progress, ProgressEvent(
@@ -242,23 +251,23 @@ class Novatek(BootProtocol):
         """Stage 1: the write loader to the ROM."""
         if len(loader) < 8:
             raise ProtocolError("the write loader is too short")
+        if len(loader) > ROM_CHUNK:
+            raise ProtocolError(
+                f"the write loader is {len(loader)} bytes, "
+                f"more than the ROM's 0x{ROM_CHUNK:x}"
+            )
         # Its header's second word is the SRAM base it is linked for
         base = struct.unpack_from("<I", loader, 4)[0]
         want = DIE_SRAM.get(self.chip_word)
-        if want is not None and base != want:
+        if base != want:
             raise ProtocolError(
                 f"the write loader is linked at 0x{base:08x}, "
-                f"this die's SRAM is at 0x{want:08x}"
+                f"this die's SRAM is at 0x{want or 0:08x}"
             )
-        for off in range(0, len(loader), ROM_CHUNK):
-            part = loader[off:off + ROM_CHUNK]
-            await self._command(
-                transport, OP_WRLOADER, base + off, len(loader), part,
-            )
-            _emit(on_progress, ProgressEvent(
-                stage=Stage.SPL, bytes_sent=off + len(part),
-                bytes_total=len(loader),
-            ))
+        await self._command(transport, OP_WRLOADER, base, len(loader), loader)
+        _emit(on_progress, ProgressEvent(
+            stage=Stage.SPL, bytes_sent=len(loader), bytes_total=len(loader),
+        ))
         await self._command(transport, OP_WAIT_DONE)
         await asyncio.sleep(LOADER_START_DELAY)
 
