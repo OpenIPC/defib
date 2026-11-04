@@ -246,12 +246,11 @@ class RecoverySession:
                     ))
                 handshake = await protocol.handshake(transport, on_progress)
 
-            # If non-frame-blast handshake failed and we can retry, try again
+            # A failed handshake retries; after the last one the loop runs
+            # out and its else reports the failure
             if not handshake.success:
                 last_attempt_error = f"handshake: {handshake.message}"
-                if attempt < attempts:
-                    continue
-                break
+                continue
 
             # Handshake OK (or deferred for frame-blast).  Send firmware.
             if on_log:

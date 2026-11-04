@@ -318,3 +318,16 @@ def test_every_die_has_its_sram():
     from defib.protocol.novatek import NOVATEK_DIES
 
     assert set(NOVATEK_DIES.values()) == set(DIE_SRAM)
+
+
+@pytest.mark.asyncio
+async def test_a_silent_board_fails_the_session(tmp_path, monkeypatch):
+    monkeypatch.setattr("defib.protocol.novatek.HANDSHAKE_TIMEOUT", 0.05)
+    monkeypatch.setattr("defib.protocol.novatek.HANDSHAKE_INTERVAL", 0.01)
+    path = tmp_path / "novatek-recovery.tar.gz"
+    path.write_bytes(bundle())
+    session = RecoverySession(chip="nt98562", firmware_path=str(path))
+    result = await session.run(FakeDevice(boot_after=10**6))
+    assert not result.success
+    assert "No answer" in (result.error or "")
+
