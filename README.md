@@ -52,6 +52,27 @@ defib network -f firmware.bin --nic eth0
 defib burn -c gk7205v200 -f u-boot.bin --output json
 ```
 
+## Novatek
+
+NT98560/561/562/566, NT98321/323 and NT98532/533 are recovered over UART
+with no U-Boot of their own in flash, and nothing written to it:
+
+```bash
+defib burn -c nt98566 -p /dev/ttyUSB0          # or --nand for a SPI NAND board
+```
+
+Power the board on with the boot straps at UART (BS = 0xC; 4 on NT9832x), or
+with no valid loader in flash, where the ROM reaches UART by itself after
+flash, SD, Ethernet and USB. defib sends the write loader to the mask ROM, then
+the pack to the write loader, which starts OpenIPC U-Boot from RAM. Both come
+from `novatek-recovery.tar.gz` on OpenIPC/u-boot's `novatek` release, or `-f`.
+
+**Not yet run on real hardware.** The ROM stage comes from disassembling
+Novatek's FwUpgrade.exe; the rest was tested against QEMU with the real loaders.
+The ROM's UART may not be the console: NT98533's ROM guide says UART1, while
+its write loader serves UART0, and A revisions of the NT9832x use UART1.
+The NT9852x family has no UART boot in its SDK.
+
 ## Full Firmware Install (UART + TFTP)
 
 Flash a complete OpenIPC release (U-Boot + kernel + rootfs) in one command:

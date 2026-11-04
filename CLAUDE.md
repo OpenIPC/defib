@@ -78,13 +78,16 @@ five CI jobs in `.github/workflows/ci.yml` run (`test`, `fuzz`, `lint`,
    `create_transport()`/`normalize_port_name()` in `serial_platform.py` route the
    `socket://`, `tcp://`, `rfc2217://` and `rack://` URL schemes.
 
-2. **Protocol** (`src/defib/protocol/`) — three boot ROM dialects, all inheriting
+2. **Protocol** (`src/defib/protocol/`) — four boot ROM dialects, all inheriting
    `BootProtocol`, registered via the `@register` decorator and exposed as entry
    points in pyproject.toml:
    - `HiSiliconStandard` — matches **any chip that has a profile JSON**, i.e. all
      113; classic init_bootmode handshake
    - `HiSiliconV500` — `gk7205v500/510/530`, `xm7205v500/510/530`; different handshake
    - `HiSiliconCV6xx` — `hi3516cv608/610/613`, `hi3516dv500`, `hi3519dv500`; multi-stage
+   - `Novatek` — `nt98560/561/562/566`, `nt98321/323`, `nt98532/533`; 16-byte commands,
+     ROM then write loader. No profile JSON; its "firmware" is one archive for every
+     SoC, so the session calls `set_target()`. Stage 1 is from FwUpgrade.exe, not silicon.
 
    The V500 and CV6xx chips are hardcoded frozensets and **deliberately have no
    profile JSON** — their DDR/SPL data lives in the protocol class. That is the
