@@ -88,7 +88,9 @@ five CI jobs in `.github/workflows/ci.yml` run (`test`, `fuzz`, `lint`,
    - `Novatek` — `nt98560/561/562/566`, `nt98321/323`, `nt98532/533`; 16-byte commands,
      ROM then write loader. No profile JSON; its "firmware" is one archive for every
      SoC, so the session calls `set_target()`. UART needs the straps at UART: a blank
-     flash's auto-boot stops at Ethernet once DHCP answers.
+     flash's auto-boot stops at Ethernet once DHCP answers. That Ethernet path is
+     `burn --nic`: `recovery/novatek_eth.py`, with `network/dhcp_server.py` answering
+     only the ROM's `00:00:00:xx:xx:xx` MACs and TFTP serving `loader.bin` + the pack.
 
    The V500 and CV6xx chips are hardcoded frozensets and **deliberately have no
    profile JSON** — their DDR/SPL data lives in the protocol class. That is the
@@ -164,7 +166,8 @@ Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
 - **Web** (`web/`) — WebSerial browser UI: standalone HTML/JS, no build step,
   deployed to GitHub Pages. `src/defib/web/` is an empty placeholder package —
   there is no FastAPI server, and the `web` extra is vestigial.
-- **Network** (`src/defib/network/`) — multi-file TFTP server with
+- **Network** (`src/defib/network/`) — a minimal MAC-filtered DHCP server (Novatek
+  Ethernet recovery), multi-file TFTP server with
   filename-based partition routing, plus temporary static-IP management and
   U-Boot device discovery.
 - **Firmware** (`src/defib/firmware.py`) — downloads OpenIPC releases from

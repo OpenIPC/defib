@@ -146,9 +146,10 @@ def defuse_loader(loader: bytes) -> tuple[bytes, list[tuple[int, int]]]:
 
 
 def load_recovery_set(
-    archive: bytes, chip: str, flash_type: str = "nor",
+    archive: bytes, chip: str, flash_type: str = "nor", loader: str = "wrloader.bin",
 ) -> tuple[bytes, bytes]:
-    """``(wrloader.bin, pack)`` of a chip from novatek-recovery.tar.gz."""
+    """``(loader, pack)`` of a chip from novatek-recovery.tar.gz: the UART
+    write loader by default, or ``loader.bin``, the Ethernet one."""
     folder = f"recovery-{chip.split(':', 1)[0].lower()}-{flash_type}"
     try:
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
@@ -161,19 +162,19 @@ def load_recovery_set(
                 assert f is not None
                 return f.read()
 
-            wrloader = f"{folder}/wrloader.bin"
+            wrloader = f"{folder}/{loader}"
             packs = [
                 n for n in files
                 if n.startswith(f"{folder}/FW") and n.upper().endswith("T.BIN")
             ]
             if wrloader not in files or len(packs) != 1:
-                raise ProtocolError(f"the recovery archive has no UART set {folder}")
-            loader, pack = read(wrloader), read(packs[0])
+                raise ProtocolError(f"the recovery archive has no {loader} set {folder}")
+            image, pack = read(wrloader), read(packs[0])
     except (tarfile.TarError, EOFError, OSError, zlib.error) as e:
         raise ProtocolError(f"not a recovery archive: {e}") from e
-    if not loader or not pack:
+    if not image or not pack:
         raise ProtocolError(f"the recovery archive has an empty file in {folder}")
-    return loader, pack
+    return image, pack
 
 
 def _emit(callback: Callable[[ProgressEvent], None] | None, event: ProgressEvent) -> None:
@@ -265,7 +266,7 @@ class Novatek(BootProtocol):
                         success=False,
                         message="The Novatek ROM took a DHCP lease and waits for "
                         "loader.bin over TFTP; it never reaches UART. "
-                        "Keep the board off DHCP",
+                        "Recover it over Ethernet instead: --nic <interface>",
                     )
                 del self._rx[:-CDB_SIZE * 2]
                 # The ROM takes every 16 bytes as a command and never

@@ -232,7 +232,7 @@ class TestArchive:
         assert (loader, pack) == (b"nand" * 2, b"nandpack")
 
     def test_no_uart_set(self):
-        with pytest.raises(ProtocolError, match="no UART set"):
+        with pytest.raises(ProtocolError, match="no wrloader.bin set"):
             load_recovery_set(bundle(), "nt98525")
 
     def test_not_an_archive(self):
