@@ -19,7 +19,10 @@ U-Boot's autoboot at its prompt.
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import logging
+import re
 import time
 from collections.abc import Callable
 
@@ -43,6 +46,27 @@ PROMPTS = (b"OpenIPC #", b"=> ")
 def pack_name(chip: str) -> str:
     """The pack the Ethernet loader asks for: FW98562T.BIN for nt98562."""
     return f"FW{chip.split(':', 1)[0].lower().removeprefix('nt')}T.BIN"
+
+
+# The ROM's offer line, "OfIP <yiaddr> SRV <next-server>", in hex
+ROM_OFFER = re.compile(rb"OfIP ([0-9A-F]{8}) SRV ([0-9A-F]{8})")
+
+
+def offer_server(console: bytes) -> str | None:
+    """The next-server of the offer the ROM took, from its console."""
+    m = ROM_OFFER.search(console)
+    return str(ipaddress.IPv4Address(int(m.group(2), 16))) if m else None
+
+
+async def _drain(transport: Transport, seen: bytearray) -> None:
+    """Keep the console read while the board fetches: a UART nobody reads
+    stalls an emulated board (QEMU), and what the ROM prints says which
+    server it took."""
+    while True:
+        try:
+            seen += await transport.read(4096, timeout=0.2)
+        except TransportTimeout:
+            continue
 
 
 def is_novatek_boot_mac(mac: bytes) -> bool:
@@ -120,7 +144,25 @@ async def recover_over_ethernet(
             await power.power_cycle(poe_port)
         else:
             log("Waiting for the board: power it on now")
-        if not await served.wait_for_completion(timeout=fetch_timeout):
+        console = bytearray()
+        reader = asyncio.ensure_future(_drain(transport, console)) if transport else None
+        waiter = asyncio.ensure_future(served.wait_for_completion(timeout=fetch_timeout))
+        try:
+            while not waiter.done():
+                await asyncio.wait({waiter}, timeout=0.5)
+                server = offer_server(bytes(console))
+                if server and server != host_ip and not waiter.done():
+                    waiter.cancel()
+                    return failed(
+                        f"The ROM took {server}'s DHCP offer, not ours, and waits for "
+                        "loader.bin from it for good: power-cycle it to try again, "
+                        "or connect it to this host directly",
+                        [],
+                    )
+        finally:
+            if reader:
+                reader.cancel()
+        if waiter.cancelled() or not waiter.result():
             return failed(
                 f"The board fetched nothing in {fetch_timeout:.0f} s: is it on {nic}, "
                 "with no valid loader in flash?",
