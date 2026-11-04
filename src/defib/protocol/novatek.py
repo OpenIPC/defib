@@ -34,6 +34,7 @@ import logging
 import struct
 import tarfile
 import time
+import zlib
 from typing import Callable
 
 from defib.protocol.base import BootProtocol, ProtocolError
@@ -80,23 +81,38 @@ CDB_STATUS = 13
 # What identifies a reply as the echo of its command: all but status and sum
 CDB_ECHO = 13
 
-ROM_CHUNK = 0x10000
+# The most one ROM command takes (FwUpgrade.exe), and the largest loader
+LOADER_MAX = 0x10000
 # A reply is the only sign of progress, and the loader sends it before it
 # takes the data: small enough that one fits in the reply timeout.
 PACK_CHUNK = 0x1000
+# What goes to the transport at once: 64 KiB is 5.7 s at 115200, past its
+# 5 s write timeout on an adapter with little buffering
+WRITE_STEP = 0x400
 
 HANDSHAKE_TIMEOUT = 60.0
 HANDSHAKE_INTERVAL = 0.25
 REPLY_TIMEOUT = 30.0
 # FwUpgrade.exe's wait for the write loader to bring the DDR up
 LOADER_START_DELAY = 3.0
+# How long it may then take to answer; the quiet before each zero byte; the
+# quiet that ends its reply; its answer to the command that checks the sync
+LOADER_SYNC_TIMEOUT = 20.0
+LOADER_SYNC_GAP = 0.02
+LOADER_SYNC_SETTLE = 0.1
+LOADER_SYNC_REPLY = 2.0
+
+
+def cdb_sum(cdb: bytes) -> int:
+    """The Novatek sum of a command: its 16-bit words plus their indices."""
+    words: tuple[int, ...] = struct.unpack("<8H", cdb)
+    return sum(w + i for i, w in enumerate(words)) & 0xFFFF
 
 
 def build_cdb(op: int, addr: int = 0, size: int = 0) -> bytes:
-    """A 16-byte command: its words plus their indices sum to 0."""
+    """A 16-byte command, whose sum comes to 0."""
     cdb = bytearray(struct.pack("<BBII", OPSET, op, addr, size).ljust(CDB_SIZE, b"\0"))
-    total = sum(w + i for i, w in enumerate(struct.unpack("<8H", cdb)))
-    struct.pack_into("<H", cdb, CDB_SIZE - 2, -total & 0xFFFF)
+    struct.pack_into("<H", cdb, CDB_SIZE - 2, -cdb_sum(bytes(cdb)) & 0xFFFF)
     return bytes(cdb)
 
 
@@ -106,27 +122,30 @@ def load_recovery_set(
     """``(wrloader.bin, pack)`` of a chip from novatek-recovery.tar.gz."""
     folder = f"recovery-{chip.split(':', 1)[0].lower()}-{flash_type}"
     try:
-        tar = tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz")
-    except tarfile.TarError as e:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+            files = {
+                m.name.removeprefix("./"): m
+                for m in tar.getmembers() if m.isfile()
+            }
+
+            def read(path: str) -> bytes:
+                f = tar.extractfile(files[path])
+                assert f is not None
+                return f.read()
+
+            wrloader = f"{folder}/wrloader.bin"
+            packs = [
+                n for n in files
+                if n.startswith(f"{folder}/FW") and n.upper().endswith("T.BIN")
+            ]
+            if wrloader not in files or len(packs) != 1:
+                raise ProtocolError(f"the recovery archive has no UART set {folder}")
+            loader, pack = read(wrloader), read(packs[0])
+    except (tarfile.TarError, EOFError, OSError, zlib.error) as e:
         raise ProtocolError(f"not a recovery archive: {e}") from e
-    with tar:
-        files = {
-            m.name.removeprefix("./"): m for m in tar.getmembers() if m.isfile()
-        }
-
-        def read(path: str) -> bytes:
-            f = tar.extractfile(files[path])
-            assert f is not None
-            return f.read()
-
-        wrloader = f"{folder}/wrloader.bin"
-        packs = [
-            n for n in files
-            if n.startswith(f"{folder}/FW") and n.upper().endswith("T.BIN")
-        ]
-        if wrloader not in files or len(packs) != 1:
-            raise ProtocolError(f"the recovery archive has no UART set {folder}")
-        return read(wrloader), read(packs[0])
+    if not loader or not pack:
+        raise ProtocolError(f"the recovery archive's {folder} has an empty file")
+    return loader, pack
 
 
 def _emit(callback: Callable[[ProgressEvent], None] | None, event: ProgressEvent) -> None:
@@ -174,13 +193,20 @@ class Novatek(BootProtocol):
         together, then the echo and any reply are read. The loader's own
         messages can come in between on the same UART."""
         cdb = build_cdb(op, addr, size)
-        await transport.write(cdb + data)
+        message = cdb + data
+        for off in range(0, len(message), WRITE_STEP):
+            await transport.write(message[off:off + WRITE_STEP])
         await transport.flush_output()
         deadline = time.monotonic() + timeout
         while True:
             at = self._rx.find(cdb[:CDB_ECHO])
             if at >= 0 and len(self._rx) >= at + CDB_SIZE + reply:
-                break
+                # As FwUpgrade.exe checks: inside the echo of a misaligned
+                # frame the command reads the same, and the sum does not
+                if not cdb_sum(bytes(self._rx[at:at + CDB_SIZE])):
+                    break
+                del self._rx[:at + 1]
+                continue
             left = deadline - time.monotonic()
             if left <= 0:
                 raise TransportError(f"no answer to command 0x{op:02x}")
@@ -220,11 +246,12 @@ class Novatek(BootProtocol):
             )
         self.chip_word = word
         want = NOVATEK_DIES.get(self._chip)
-        if want is not None and word in DIE_SRAM and word != want:
+        if word != want:
             return HandshakeResult(
                 success=False, chip_id=word,
                 message=f"This is die 0x{word:08x}, not the {self._chip}'s "
-                f"0x{want:08x}: its loader would not bring the DDR up",
+                f"{'none' if want is None else f'0x{want:08x}'}: "
+                "its loader would not bring the DDR up",
             )
         await self._command(transport, OP_OPEN_DEVICE)
         _emit(on_progress, ProgressEvent(
@@ -240,8 +267,8 @@ class Novatek(BootProtocol):
         on_progress: Callable[[ProgressEvent], None] | None = None,
     ) -> None:
         """Stage 1: the write loader to the ROM."""
-        if len(loader) < 8:
-            raise ProtocolError("the write loader is too short")
+        if not 8 <= len(loader) <= LOADER_MAX:
+            raise ProtocolError(f"a write loader of {len(loader)} bytes")
         # Its header's second word is the SRAM base it is linked for
         base = struct.unpack_from("<I", loader, 4)[0]
         want = DIE_SRAM.get(self.chip_word)
@@ -250,17 +277,51 @@ class Novatek(BootProtocol):
                 f"the write loader is linked at 0x{base:08x}, "
                 f"this die's SRAM is at 0x{want:08x}"
             )
-        for off in range(0, len(loader), ROM_CHUNK):
-            part = loader[off:off + ROM_CHUNK]
-            await self._command(
-                transport, OP_WRLOADER, base + off, len(loader), part,
-            )
-            _emit(on_progress, ProgressEvent(
-                stage=Stage.SPL, bytes_sent=off + len(part),
-                bytes_total=len(loader),
-            ))
+        await self._command(transport, OP_WRLOADER, base, len(loader), loader)
+        _emit(on_progress, ProgressEvent(
+            stage=Stage.SPL, bytes_sent=len(loader), bytes_total=len(loader),
+        ))
         await self._command(transport, OP_WAIT_DONE)
         await asyncio.sleep(LOADER_START_DELAY)
+
+    async def sync_loader(self, transport: Transport) -> None:
+        """Get the write loader answering, and in step, with zero bytes.
+
+        It reads commands 16 bytes at a time and never looks for a start, so
+        one byte missed while it came up misaligns every command after it.
+        And it runs what it should refuse: a bad opset gets an error reply
+        that, written back over the frame, makes its checksum good, so the
+        frame is then executed, and a size in the wrong place has it taking
+        everything after as data. No command can go out before the framing
+        is known. An all-zero frame is harmless, op 0 of size 0, and its
+        error reply shows where a frame ended.
+        """
+        deadline = time.monotonic() + LOADER_SYNC_TIMEOUT
+        while True:
+            self._rx.clear()
+            while bytes(CDB_STATUS) + b"\x01" not in self._rx:
+                if time.monotonic() > deadline:
+                    raise TransportError("the write loader does not answer")
+                # One byte, and the next only once the line is quiet: a reply
+                # comes in pieces, and a byte sent into one shifts the framing
+                try:
+                    self._rx += await transport.read(4096, timeout=LOADER_SYNC_GAP)
+                except TransportTimeout:
+                    await transport.write(b"\0")
+            # The frame's second reply, and any byte that was on its way
+            while True:
+                try:
+                    await transport.read(4096, timeout=LOADER_SYNC_SETTLE)
+                except TransportTimeout:
+                    break
+            self._rx.clear()
+            try:
+                await self._command(
+                    transport, OP_IS_NVT, reply=4, timeout=LOADER_SYNC_REPLY,
+                )
+                return
+            except TransportError:
+                continue
 
     async def send_pack(
         self,
@@ -269,6 +330,7 @@ class Novatek(BootProtocol):
         on_progress: Callable[[ProgressEvent], None] | None = None,
     ) -> None:
         """Stage 2: the pack to the write loader, which starts U-Boot."""
+        await self.sync_loader(transport)
         tmp = struct.unpack("<I", await self._command(
             transport, OP_GET_TMP_ADDR, size=4, reply=4,
         ))[0]

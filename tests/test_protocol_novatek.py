@@ -26,8 +26,10 @@ from defib.protocol.novatek import (
     OP_UBOOT,
     OP_WAIT_DONE,
     OP_WRLOADER,
+    WRITE_STEP,
     Novatek,
     build_cdb,
+    cdb_sum,
     load_recovery_set,
 )
 from defib.protocol.registry import find_protocol
@@ -59,10 +61,15 @@ def archive(sets: dict[str, dict[str, bytes]]) -> bytes:
 class FakeDevice(Transport):
     """The ROM, until WAIT_DONE, then the write loader, on one byte stream."""
 
-    def __init__(self, word: int = NA51089, boot_after: int = 0, status: int = 0) -> None:
+    def __init__(
+        self, word: int = NA51089, boot_after: int = 0, status: int = 0,
+        lost: int = 0,
+    ) -> None:
+        self.lost = lost                # bytes the loader misses coming up
         self.word = word
         self.boot_after = boot_after    # IS_NVTs unanswered: not at UART yet
         self.status = status            # what UBOOT reports
+        self.skip = 0
         self.rx = bytearray()
         self.tx: deque[int] = deque()
         self.in_rom = True
@@ -71,22 +78,43 @@ class FakeDevice(Transport):
         self.dram: dict[int, bytes] = {}
         self.booted = False
         self.bad_sums = 0
+        self.bad_frames = 0
+        self.swallow = 0
 
     def _answer(self, cdb: bytes, status: int = 0, data: bytes = b"") -> None:
         reply = bytearray(cdb)
         reply[13] = status
+        struct.pack_into("<H", reply, 14, 0)
+        struct.pack_into("<H", reply, 14, -cdb_sum(bytes(reply)) & 0xFFFF)
         self.tx.extend(reply + data)
 
     def _pump(self) -> None:
         while len(self.rx) >= 16:
             cdb = bytes(self.rx[:16])
             words = struct.unpack("<8H", cdb)
-            if sum(w + i for i, w in enumerate(words)) & 0xFFFF:
-                self.bad_sums += 1
-                del self.rx[:16]
-                continue
             op = cdb[1]
             addr, size = struct.unpack_from("<II", cdb, 2)
+            if not self.in_rom and self.swallow:
+                n = min(self.swallow, len(self.rx))
+                del self.rx[:n]
+                self.swallow -= n
+                continue
+            if not self.in_rom and cdb[0] not in (0xC0, 0xE0, 0xF0):
+                # uart_upgrade_routine(): the error reply makes the frame's
+                # checksum good, and there is no return: uart_cmd() runs it
+                self.bad_frames += 1
+                self._answer(cdb, status=1)
+                del self.rx[:16]
+                self._answer(cdb, status=0)
+                if not op & 0x80:
+                    self.swallow = size
+                continue
+            if sum(w + i for i, w in enumerate(words)) & 0xFFFF:
+                self.bad_sums += 1
+                if not self.in_rom:
+                    self._answer(cdb, status=1)
+                del self.rx[:16]
+                continue
             if op == OP_IS_NVT and self.boot_after:
                 self.boot_after -= 1
                 del self.rx[:16]
@@ -108,6 +136,7 @@ class FakeDevice(Transport):
                 self._answer(cdb)
                 self.in_rom = False
                 self.tx.extend(NOISE)
+                self.skip = self.lost
             elif op == OP_WAIT_DONE:
                 self._answer(cdb)
                 self.booted = True
@@ -133,7 +162,9 @@ class FakeDevice(Transport):
         return bytes(self.tx.popleft() for _ in range(n))
 
     async def write(self, data: bytes) -> None:
-        self.rx += data
+        drop = min(self.skip, len(data))
+        self.skip -= drop
+        self.rx += data[drop:]
 
     async def flush_input(self) -> None:
         self.tx.clear()
@@ -212,6 +243,21 @@ class TestArchive:
         with pytest.raises(ProtocolError, match="not a recovery archive"):
             load_recovery_set(b"u-boot", "nt98562")
 
+    def test_truncated(self):
+        whole = archive({"recovery-nt98562-nor": {
+            "wrloader.bin": bytes(range(256)) * 400,
+            "FW98562T.BIN": bytes(reversed(range(256))) * 400,
+        }})
+        with pytest.raises(ProtocolError, match="not a recovery archive"):
+            load_recovery_set(whole[:len(whole) // 2], "nt98562")
+
+    def test_empty_pack(self):
+        empty = archive({"recovery-nt98562-nor": {
+            "wrloader.bin": b"loader", "FW98562T.BIN": b"",
+        }})
+        with pytest.raises(ProtocolError, match="empty"):
+            load_recovery_set(empty, "nt98562")
+
 
 @pytest.mark.asyncio
 class TestRecovery:
@@ -235,6 +281,67 @@ class TestRecovery:
         assert min(dev.dram) == TMP
         assert dev.booted
 
+    @pytest.mark.parametrize("lost", [1, 5, 7, 15])
+    async def test_bytes_the_loader_misses_coming_up(self, lost):
+        pack = bytes(range(256)) * 40
+        dev, proto = FakeDevice(lost=lost), self.protocol()
+        await proto.handshake(dev)
+        result = await proto.send_firmware(dev, bundle(pack=pack))
+        assert result.success, result.error
+        assert dev.swallow == 0
+        assert b"".join(dev.dram[a] for a in sorted(dev.dram)) == pack
+        assert dev.booted
+
+    async def test_a_loader_that_never_comes_up(self, monkeypatch):
+        monkeypatch.setattr("defib.protocol.novatek.LOADER_SYNC_TIMEOUT", 0.05)
+        monkeypatch.setattr("defib.protocol.novatek.LOADER_SYNC_GAP", 0.001)
+        dev, proto = FakeDevice(), self.protocol()
+        await proto.handshake(dev)
+        dev.in_rom = False
+        dev.skip = 10**9
+        proto.loader_running = True
+        result = await proto.send_firmware(dev, bundle())
+        assert not result.success
+        assert "does not answer" in result.error
+
+    async def test_no_command_goes_out_before_the_framing_is_known(self):
+        dev, proto = FakeDevice(lost=3), self.protocol()
+        dev.in_rom = False
+        dev.skip = 3
+        proto.loader_running = True
+        proto.chip_word = NA51089
+        written = bytearray()
+        real_write = dev.write
+
+        async def write(data: bytes) -> None:
+            written.extend(data)
+            await real_write(data)
+
+        dev.write = write  # type: ignore[method-assign]
+        await proto.sync_loader(dev)
+        assert dev.bad_frames > 0
+        assert dev.swallow == 0
+        assert written[-16:] == build_cdb(OP_IS_NVT)
+        assert not any(written[:-16])
+
+    async def test_a_misaligned_echo_is_not_a_reply(self):
+        # The loader's echo of a frame one byte late holds the command intact,
+        # and the byte where a status would be is the checksum's
+        dev, proto = FakeDevice(), self.protocol()
+        cdb = build_cdb(OP_IS_NVT)
+        dev.tx.extend(b"\0" + cdb[:15])
+        reply = bytearray(cdb)
+        dev.tx.extend(reply + struct.pack("<I", NA51089))
+        real_write = dev.write
+
+        async def write(data: bytes) -> None:
+            pass
+
+        dev.write = write  # type: ignore[method-assign]
+        got = await proto._command(dev, OP_IS_NVT, reply=4, timeout=1)
+        dev.write = real_write  # type: ignore[method-assign]
+        assert struct.unpack("<I", got)[0] == NA51089
+
     async def test_a_running_loader_skips_the_rom(self):
         dev, proto = FakeDevice(), self.protocol()
         dev.in_rom = False
@@ -242,6 +349,36 @@ class TestRecovery:
         await proto.handshake(dev)
         assert (await proto.send_firmware(dev, bundle())).success
         assert OP_WRLOADER not in dev.ops
+
+    async def test_a_64k_loader_goes_out_in_small_writes(self):
+        # NT9832x's: one 64 KiB write would outlast the serial transport's 5 s
+        loader = loader_image(size=0x10000)
+        dev, proto = FakeDevice(), self.protocol()
+        sizes = []
+        real_write = dev.write
+
+        async def write(data: bytes) -> None:
+            sizes.append(len(data))
+            await real_write(data)
+
+        dev.write = write  # type: ignore[method-assign]
+        await proto.handshake(dev)
+        assert (await proto.send_firmware(dev, bundle(loader))).success
+        assert dev.sram == {SRAM: loader}
+        assert max(sizes) <= WRITE_STEP
+
+    async def test_a_loader_past_64k_is_refused(self):
+        dev, proto = FakeDevice(), self.protocol()
+        await proto.handshake(dev)
+        result = await proto.send_firmware(dev, bundle(loader_image(size=0x10004)))
+        assert not result.success
+        assert not dev.sram
+
+    async def test_an_unknown_die_is_refused(self):
+        dev, proto = FakeDevice(word=0x12340000), self.protocol()
+        result = await proto.handshake(dev)
+        assert not result.success
+        assert OP_OPEN_DEVICE not in dev.ops
 
     async def test_another_die_is_refused(self):
         dev, proto = FakeDevice(word=0x81200000), self.protocol()
