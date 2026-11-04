@@ -194,6 +194,7 @@ async def _burn_async(
         session = RecoverySession(
             chip=chip, firmware_path=firmware_path,
             power_controller=power_controller, poe_port=poe_port,
+            flash_type=flash_type,
         )
     except (ValueError, FileNotFoundError) as e:
         if output == "json":

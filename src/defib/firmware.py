@@ -26,11 +26,19 @@ from email.utils import parsedate_to_datetime
 from collections.abc import Callable
 from pathlib import Path
 
+from defib.protocol.novatek import NOVATEK_SOCS
+
 logger = logging.getLogger(__name__)
 
 OPENIPC_BASE_URL = (
     "https://github.com/OpenIPC/firmware/releases/download/latest"
 )
+
+# Novatek recovery: one archive for every SoC, with each one's write loader
+# and pack in recovery-<chip>-<flash>/ (defib.protocol.novatek), on the
+# release OpenIPC/u-boot keeps for Novatek.
+NOVATEK_RECOVERY_ASSET = "novatek-recovery.tar.gz"
+NOVATEK_RELEASE_URL = "https://github.com/OpenIPC/u-boot/releases/download/novatek"
 
 # Chips that have pre-built u-boot-{chip}-universal.bin binaries on OpenIPC.
 # Boot-image SoCs are deliberately absent — see BOOT_IMAGE_VARIANTS below.
@@ -231,6 +239,9 @@ def asset_name(chip: str, flash_type: str | None = None) -> str | None:
     base, variant = _split_variant(chip)
     name = CHIP_TO_FIRMWARE.get(base.lower(), base.lower())
 
+    if name in NOVATEK_SOCS:
+        return NOVATEK_RECOVERY_ASSET
+
     if name in PER_FLASH_TYPE_UBOOT:
         if kind == "nand" and name in NOR_ONLY_UBOOT:
             return None
@@ -258,6 +269,8 @@ def asset_name(chip: str, flash_type: str | None = None) -> str | None:
 def firmware_url(chip: str, flash_type: str | None = None) -> str | None:
     """Get the OpenIPC download URL for a chip, or None if unavailable."""
     name = asset_name(chip, flash_type)
+    if name == NOVATEK_RECOVERY_ASSET:
+        return f"{NOVATEK_RELEASE_URL}/{name}"
     return f"{OPENIPC_BASE_URL}/{name}" if name else None
 
 

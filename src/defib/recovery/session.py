@@ -13,6 +13,7 @@ from typing import Callable
 from defib.power.base import PowerController
 from defib.profiles.loader import load_profile
 from defib.protocol.hisilicon_standard import HiSiliconStandard
+from defib.protocol.novatek import Novatek
 from defib.protocol.registry import find_protocol
 from defib.recovery.events import (
     HandshakeResult,
@@ -41,8 +42,10 @@ class RecoverySession:
         firmware_data: bytes | None = None,
         power_controller: PowerController | None = None,
         poe_port: str | None = None,
+        flash_type: str = "nor",
     ) -> None:
         self.chip = chip.lower()
+        self._flash_type = flash_type
         self._firmware_path = firmware_path
         self._firmware_data = firmware_data
         self._protocol_cls = find_protocol(self.chip)
@@ -86,6 +89,10 @@ class RecoverySession:
         start_time = time.monotonic()
 
         protocol = self._protocol_cls()
+
+        # One archive serves every Novatek SoC: say which set is this one's
+        if isinstance(protocol, Novatek):
+            protocol.set_target(self.chip, self._flash_type)
 
         # For standard protocol, load and attach the SoC profile. A board
         # variant's SPL_BLOB replaces the SPL carved from the U-Boot image:
@@ -239,12 +246,11 @@ class RecoverySession:
                     ))
                 handshake = await protocol.handshake(transport, on_progress)
 
-            # If non-frame-blast handshake failed and we can retry, try again
+            # A failed handshake retries; after the last one the loop runs
+            # out and its else reports the failure
             if not handshake.success:
                 last_attempt_error = f"handshake: {handshake.message}"
-                if attempt < attempts:
-                    continue
-                break
+                continue
 
             # Handshake OK (or deferred for frame-blast).  Send firmware.
             if on_log:

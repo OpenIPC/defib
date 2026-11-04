@@ -44,6 +44,7 @@ defib = "defib.cli.app:main"
 hisilicon_standard = "defib.protocol.hisilicon_standard:HiSiliconStandard"
 hisilicon_v500 = "defib.protocol.hisilicon_v500:HiSiliconV500"
 hisilicon_cv6xx = "defib.protocol.hisilicon_cv6xx:HiSiliconCV6xx"
+novatek = "defib.protocol.novatek:Novatek"
 
 [project.entry-points."defib.power"]
 routeros = "defib.power.routeros:RouterOSController"

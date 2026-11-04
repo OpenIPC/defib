@@ -174,8 +174,10 @@ def list_all_chips(profiles_dir: Path | None = None) -> list[str]:
     """List all chip names including hardcoded protocol-specific ones."""
     from defib.protocol.hisilicon_cv6xx import CV6XX_SOCS
     from defib.protocol.hisilicon_v500 import V500_SOCS
+    from defib.protocol.novatek import NOVATEK_SOCS
 
     chips = set(list_chips(profiles_dir))
     chips.update(V500_SOCS)
     chips.update(CV6XX_SOCS)
+    chips.update(NOVATEK_SOCS)
     return sorted(chips)
