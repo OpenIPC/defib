@@ -62,6 +62,9 @@ DEFAULT_PORT = 69
 # unless the server resends it.
 RETRANSMIT_TIMEOUT = 1.0
 MAX_RETRIES = 10
+# Transfers served at once. A recovery runs one or two; RRQs are not
+# authenticated, so past this a request (possibly forged) is not answered
+MAX_TRANSFERS = 8
 
 
 @dataclass
@@ -163,6 +166,13 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
             return
 
         logger.info("TFTP RRQ from %s:%d for '%s' (mode=%s)", addr[0], addr[1], filename, mode)
+
+        if addr not in self._transfers and len(self._transfers) >= MAX_TRANSFERS:
+            logger.warning(
+                "TFTP RRQ from %s:%d ignored: %d transfers already running",
+                addr[0], addr[1], len(self._transfers),
+            )
+            return
 
         # Resolve file data: try exact match, then basename, then default
         serve_data = self._resolve_file(filename)
