@@ -54,8 +54,14 @@ ERR_NO_SUCH_USER = 7
 DEFAULT_BLOCKSIZE = 512
 MAX_BLOCKSIZE = 65464
 DEFAULT_PORT = 69
-DEFAULT_TIMEOUT = 5.0
-MAX_RETRIES = 5
+# The server resends its last packet (DATA or OACK) when no ACK comes back
+# in time: RFC 1350 leaves that to both ends, and some clients never do
+# it. Novatek's mask ROM and Eth loader send each ACK once and then wait
+# for good, so one block lost or held on the way (a switch port bridged in
+# software was seen holding frames for up to 2 s) hangs the recovery
+# unless the server resends it.
+RETRANSMIT_TIMEOUT = 1.0
+MAX_RETRIES = 10
 
 
 @dataclass
@@ -68,6 +74,8 @@ class TFTPTransfer:
     block_num: int = 0
     complete: bool = False
     retries: int = 0
+    last_packet: bytes = b""
+    timer: asyncio.TimerHandle | None = None
 
 
 @dataclass
@@ -97,7 +105,11 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
         files: dict[str, bytes] | None = None,
         done_count: int = 1,
         done_file: str | None = None,
+        retransmit_timeout: float = RETRANSMIT_TIMEOUT,
+        max_retries: int = MAX_RETRIES,
     ) -> None:
+        self._retransmit_timeout = retransmit_timeout
+        self._max_retries = max_retries
         self._files = files or {}
         self._done_file = done_file
         self._default_data = file_data
@@ -116,6 +128,11 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self._transport = transport  # type: ignore[assignment]
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        for transfer in self._transfers.values():
+            self._cancel_timer(transfer)
+        self._transfers.clear()
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         if len(data) < 2:
@@ -180,6 +197,9 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
         transfer = TFTPTransfer(
             addr=addr, data=serve_data, filename=filename, blocksize=blocksize,
         )
+        old = self._transfers.get(addr)
+        if old is not None:
+            self._cancel_timer(old)
         self._transfers[addr] = transfer
 
         # Send OACK whenever the blksize option was accepted, including an
@@ -187,7 +207,7 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
         if blksize_negotiated:
             oack = struct.pack("!H", OPCODE_OACK)
             oack += b"blksize\x00" + str(blocksize).encode() + b"\x00"
-            self._send(addr, oack)
+            self._send_tracked(transfer, oack)
             logger.debug("Sent OACK with blksize=%d", blocksize)
         else:
             # Send first data block
@@ -206,11 +226,16 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
 
         if block_num == 0 and transfer.block_num == 0:
             # ACK for OACK — send first data block
+            transfer.retries = 0
             self._send_data_block(transfer)
             return
 
+        # Anything else is a duplicate of an ACK already acted on (a held
+        # block and its retransmit both arrive): answering it would send
+        # every later block twice (RFC 1350's Sorcerer's Apprentice).
         if block_num == transfer.block_num:
             transfer.retries = 0
+            self._cancel_timer(transfer)
 
             if self._on_progress:
                 sent = min(transfer.block_num * transfer.blocksize, len(transfer.data))
@@ -261,8 +286,9 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
             error_msg = data[4:].rstrip(b"\x00").decode("ascii", errors="replace")
             logger.warning("TFTP error from %s:%d: code=%d msg=%s", addr[0], addr[1], error_code, error_msg)
 
-        if addr in self._transfers:
-            del self._transfers[addr]
+        transfer = self._transfers.pop(addr, None)
+        if transfer is not None:
+            self._cancel_timer(transfer)
 
     def _send_data_block(self, transfer: TFTPTransfer) -> None:
         """Send the next data block for a transfer."""
@@ -271,10 +297,55 @@ class TFTPServerProtocol(asyncio.DatagramProtocol):
         block_data = transfer.data[offset:offset + transfer.blocksize]
 
         packet = struct.pack("!HH", OPCODE_DATA, transfer.block_num) + block_data
-        self._send(transfer.addr, packet)
+        self._send_tracked(transfer, packet)
 
         if len(block_data) < transfer.blocksize:
             transfer.complete = True
+
+    def _send_tracked(self, transfer: TFTPTransfer, packet: bytes) -> None:
+        """Send a packet the client must ACK, and resend it until it does."""
+        transfer.last_packet = packet
+        self._send(transfer.addr, packet)
+        self._arm_timer(transfer)
+
+    def _arm_timer(self, transfer: TFTPTransfer) -> None:
+        self._cancel_timer(transfer)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # driven by hand, with no event loop: nothing to time
+        transfer.timer = loop.call_later(
+            self._retransmit_timeout, self._retransmit, transfer,
+        )
+
+    @staticmethod
+    def _cancel_timer(transfer: TFTPTransfer) -> None:
+        if transfer.timer is not None:
+            transfer.timer.cancel()
+            transfer.timer = None
+
+    def _retransmit(self, transfer: TFTPTransfer) -> None:
+        transfer.timer = None
+        if self._transfers.get(transfer.addr) is not transfer:
+            return
+        if transfer.retries >= self._max_retries:
+            logger.warning(
+                "TFTP %s to %s:%d: no ACK for block %d after %d retransmits, "
+                "giving up", transfer.filename, transfer.addr[0],
+                transfer.addr[1], transfer.block_num, transfer.retries,
+            )
+            del self._transfers[transfer.addr]
+            self.stats.errors += 1
+            return
+        transfer.retries += 1
+        logger.info(
+            "TFTP %s to %s:%d: no ACK for block %d in %.1f s, resending (%d/%d)",
+            transfer.filename, transfer.addr[0], transfer.addr[1],
+            transfer.block_num, self._retransmit_timeout, transfer.retries,
+            self._max_retries,
+        )
+        self._send(transfer.addr, transfer.last_packet)
+        self._arm_timer(transfer)
 
     def _send_error(self, addr: tuple[str, int], code: int, msg: str) -> None:
         """Send a TFTP error packet."""
