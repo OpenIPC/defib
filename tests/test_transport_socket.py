@@ -118,3 +118,96 @@ async def test_bytes_waiting_sees_data_not_yet_read() -> None:
     finally:
         await transport.close()
         peer.close()
+
+
+async def test_read_loses_nothing_that_lands_on_its_timeout() -> None:
+    """Bytes that come in as a read() times out are the next read()'s.
+
+    wait_for(sock_recv()) threw them away: the receive had taken them from
+    the socket when the timeout cancelled it. A peer that answers once after
+    a long wait -- the Novatek ROM's WRLOADER echo -- was then never heard
+    (OpenIPC/qemu-bench#265). Here a byte is sent around the end of each
+    read's timeout, swept across it, and every byte must come out.
+    """
+    import socket
+    import threading
+
+    ours, peer = socket.socketpair()
+    transport = SocketTransport(ours)
+    timeout = 0.01
+    trials = 120
+    try:
+        got = bytearray()
+        for t in range(trials):
+            delay = timeout + (t % 21 - 10) * 50e-6
+            timer = threading.Timer(delay, peer.sendall, (bytes([t]),))
+            timer.start()
+            deadline = asyncio.get_running_loop().time() + 0.5
+            while len(got) <= t and asyncio.get_running_loop().time() < deadline:
+                try:
+                    got += await transport.read(16, timeout=timeout)
+                except TransportTimeout:
+                    pass
+            timer.join()
+        assert bytes(got) == bytes(range(trials))
+    finally:
+        await transport.close()
+        peer.close()
+
+
+async def test_timed_out_read_hands_its_bytes_to_the_next() -> None:
+    import socket
+
+    ours, peer = socket.socketpair()
+    transport = SocketTransport(ours)
+    try:
+        with pytest.raises(TransportTimeout):
+            await transport.read(4, timeout=0.05)
+        peer.sendall(b"echo-and-more")
+        assert await transport.read(4, timeout=1.0) == b"echo"
+        assert await transport.read(64, timeout=1.0) == b"-and-more"
+    finally:
+        await transport.close()
+        peer.close()
+
+
+async def test_flush_discards_a_timed_out_reads_bytes() -> None:
+    import socket
+
+    ours, peer = socket.socketpair()
+    transport = SocketTransport(ours)
+    try:
+        with pytest.raises(TransportTimeout):
+            await transport.read(4, timeout=0.05)
+        peer.sendall(b"stale")
+        await asyncio.sleep(0.05)
+        await transport.flush_input()
+        peer.sendall(b"fresh")
+        assert await transport.read(16, timeout=1.0) == b"fresh"
+    finally:
+        await transport.close()
+        peer.close()
+
+
+async def test_bytes_waiting_keeps_order_behind_a_timed_out_read() -> None:
+    import socket
+
+    ours, peer = socket.socketpair()
+    transport = SocketTransport(ours)
+    try:
+        with pytest.raises(TransportTimeout):
+            await transport.read(16, timeout=0.05)
+        peer.sendall(b"first")
+        for _ in range(100):
+            if await transport.bytes_waiting():
+                break
+            await asyncio.sleep(0.01)
+        peer.sendall(b"second")
+        await asyncio.sleep(0.05)
+        out = bytearray()
+        while len(out) < 11:
+            out += await transport.read(16, timeout=1.0)
+        assert bytes(out) == b"firstsecond"
+    finally:
+        await transport.close()
+        peer.close()
