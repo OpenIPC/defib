@@ -7,7 +7,7 @@ import socket as sock_mod
 
 import pytest
 
-from defib.transport.base import TransportTimeout
+from defib.transport.base import TransportError, TransportTimeout
 from defib.transport.socket import SocketTransport
 
 
@@ -211,3 +211,70 @@ async def test_bytes_waiting_keeps_order_behind_a_timed_out_read() -> None:
     finally:
         await transport.close()
         peer.close()
+
+
+async def test_overlapping_reads_never_get_the_same_bytes() -> None:
+    import socket
+
+    ours, peer = socket.socketpair()
+    transport = SocketTransport(ours)
+    try:
+        a = asyncio.create_task(transport.read(3, timeout=1.0))
+        b = asyncio.create_task(transport.read(3, timeout=1.0))
+        await asyncio.sleep(0.02)
+        peer.sendall(b"abcdef")
+        got = await asyncio.gather(a, b)
+        assert sorted(got) == [b"abc", b"def"]
+    finally:
+        await transport.close()
+        peer.close()
+
+
+async def test_flush_during_a_read_lets_it_wait_for_fresh_bytes() -> None:
+    import socket
+
+    ours, peer = socket.socketpair()
+    transport = SocketTransport(ours)
+    try:
+        reader = asyncio.create_task(transport.read(16, timeout=1.0))
+        await asyncio.sleep(0.02)
+        await transport.flush_input()
+        peer.sendall(b"fresh")
+        assert await reader == b"fresh"
+    finally:
+        await transport.close()
+        peer.close()
+
+
+async def test_bytes_waiting_survives_a_flush_while_it_yields() -> None:
+    import socket
+
+    ours, peer = socket.socketpair()
+    transport = SocketTransport(ours)
+    try:
+        with pytest.raises(TransportTimeout):
+            await transport.read(4, timeout=0.02)
+        poll = asyncio.create_task(transport.bytes_waiting())
+        await transport.flush_input()  # runs while the poll is suspended
+        assert await poll == 0
+    finally:
+        await transport.close()
+        peer.close()
+
+
+async def test_bytes_waiting_drops_a_receive_that_saw_eof() -> None:
+    import socket
+
+    ours, peer = socket.socketpair()
+    transport = SocketTransport(ours)
+    try:
+        with pytest.raises(TransportTimeout):
+            await transport.read(4, timeout=0.02)
+        peer.close()
+        for _ in range(10):
+            await transport.bytes_waiting()
+        assert transport._recv is None
+        with pytest.raises(TransportError):
+            await transport.read(4, timeout=0.5)
+    finally:
+        await transport.close()

@@ -66,12 +66,6 @@ class SocketTransport(Transport):
         return cls(s)
 
     async def read(self, size: int, timeout: float | None = None) -> bytes:
-        # Return from internal buffer first
-        if self._buf:
-            chunk = bytes(self._buf[:size])
-            del self._buf[:size]
-            return chunk
-
         # One receive, waited on with asyncio.wait(), which never cancels it.
         # wait_for(sock_recv()) did: when bytes came in the loop iteration in
         # which its timeout ran out, sock_recv had already taken them from
@@ -81,25 +75,41 @@ class SocketTransport(Transport):
         # seconds of 0.5 s polls, failed qemu-bench's recovery test that way
         # (OpenIPC/qemu-bench#265). Now a receive that is still waiting at
         # the timeout stays running, and the next read() gets its bytes.
-        if self._recv is None:
-            loop = asyncio.get_running_loop()
-            self._recv = asyncio.ensure_future(loop.sock_recv(self._sock, size))
-        recv = self._recv
-        done, _ = await asyncio.wait({recv}, timeout=timeout)
-        if not done:
-            raise TransportTimeout(f"Read timeout ({timeout}s)")
-        self._recv = None
-        try:
-            data = recv.result()
-        except OSError as e:
-            raise TransportError(f"Socket read error: {e}") from e
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        while True:
+            # Return from internal buffer first
+            if self._buf:
+                chunk = bytes(self._buf[:size])
+                del self._buf[:size]
+                return chunk
+            if self._recv is None:
+                self._recv = asyncio.ensure_future(
+                    loop.sock_recv(self._sock, size)
+                )
+            recv = self._recv
+            left = None if deadline is None else max(deadline - loop.time(), 0)
+            done, _ = await asyncio.wait({recv}, timeout=left)
+            if not done:
+                raise TransportTimeout(f"Read timeout ({timeout}s)")
+            if self._recv is not recv:
+                # Another read() took this receive's bytes (into _buf for
+                # what it did not need), or a flush dropped them: look again
+                continue
+            self._recv = None
+            if recv.cancelled():
+                raise TransportError("Socket read stopped: input flushed or closed")
+            try:
+                data = recv.result()
+            except OSError as e:
+                raise TransportError(f"Socket read error: {e}") from e
 
-        if not data:
-            raise TransportError("Socket closed by remote end")
+            if not data:
+                raise TransportError("Socket closed by remote end")
 
-        # It was started by an earlier read() that may have asked for more
-        self._buf += data[size:]
-        return bytes(data[:size])
+            # It was started by an earlier read() that may have asked for more
+            self._buf += data[size:]
+            return bytes(data[:size])
 
     async def write(self, data: bytes) -> None:
         loop = asyncio.get_event_loop()
@@ -152,12 +162,17 @@ class SocketTransport(Transport):
             # bytes first, or they would come out of order. Let it run.
             await asyncio.sleep(0)
             recv = self._recv
-            if recv.done() and not recv.cancelled() and not recv.exception():
-                got = recv.result()
-                if got:
+            if recv is not None and recv.done():
+                if recv.cancelled() or recv.exception() or not recv.result():
+                    # Failed or at EOF: drop it, and poll the socket as
+                    # before, which leaves the error to the next read()
+                    self._drop_recv()
+                else:
                     self._recv = None
-                    self._buf += got
-            return len(self._buf)
+                    self._buf += recv.result()
+                    return len(self._buf)
+            if self._recv is not None:
+                return len(self._buf)
         try:
             data = self._sock.recv(65536)
         except (BlockingIOError, InterruptedError):
