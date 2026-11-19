@@ -16,6 +16,9 @@ from defib.firmware import (
     get_cached_path,
     has_firmware,
     pad_to_size,
+    supports_nor_split,
+    uses_per_flash_type_uboot,
+    uses_ubi_nand,
 )
 
 
@@ -35,8 +38,8 @@ class TestFirmwareUrl:
         assert "hi3518ev200" in url
 
     def test_url_format(self):
-        url = firmware_url("hi3516cv200")
-        assert url == "https://github.com/OpenIPC/firmware/releases/download/latest/u-boot-hi3516cv200-universal.bin"
+        url = firmware_url("hi3520dv200")
+        assert url == "https://github.com/OpenIPC/firmware/releases/download/latest/u-boot-hi3520dv200-universal.bin"
 
 
 class TestHasFirmware:
@@ -58,7 +61,7 @@ class TestAvailableFirmware:
         assert len(AVAILABLE_FIRMWARE | PER_FLASH_TYPE_UBOOT) >= 20
 
     def test_common_chips_included(self):
-        for chip in ["hi3516cv200", "hi3518ev200"]:
+        for chip in ["hi3520dv200", "hi3536dv100"]:
             assert chip in AVAILABLE_FIRMWARE
 
     def test_per_flash_type_socs_are_not_universal(self):
@@ -185,16 +188,16 @@ class TestLegacyCacheSeeding:
 
 class TestClassicChipsUnchanged:
     def test_universal_naming_preserved(self):
-        assert asset_name("hi3516cv200") == "u-boot-hi3516cv200-universal.bin"
+        assert asset_name("hi3520dv200") == "u-boot-hi3520dv200-universal.bin"
 
     def test_flash_type_does_not_rename_universal_images(self):
-        assert asset_name("hi3516cv200", "nand") == "u-boot-hi3516cv200-universal.bin"
+        assert asset_name("hi3520dv200", "nand") == "u-boot-hi3520dv200-universal.bin"
 
     def test_variant_still_ignored_for_classic_socs(self):
         assert asset_name("hi3516ev300:emmc") == asset_name("hi3516ev300")
 
     def test_alias_still_applied(self):
-        assert asset_name("hi3518ev201") == "u-boot-hi3518ev200-universal.bin"
+        assert asset_name("hi3518ev201") == "u-boot-hi3518ev200-nor.bin"
 
     def test_chips_present_in_release_are_offered(self):
         # Shipped u-boot-*-universal.bin assets that the set used to omit.
@@ -211,8 +214,12 @@ class TestClassicBoardVariants:
             "u-boot-hi3518ev100-ddr3-256m-universal.bin"
         )
 
-    def test_generic_hi3518ev100_stays_universal(self):
-        assert asset_name("hi3518ev100") == "u-boot-hi3518ev100-universal.bin"
+    def test_generic_hi3518ev100_takes_the_nor_build(self):
+        # The DS-I203 keeps its own image; the SoC itself moved to -nor.bin.
+        assert asset_name("hi3518ev100") == "u-boot-hi3518ev100-nor.bin"
+        assert not uses_per_flash_type_uboot("hi3518ev100:hiwatch-ds-i203")
+        assert not supports_nor_split("hi3518ev100:hiwatch-ds-i203")
+        assert supports_nor_split("hi3518ev100")
 
     def test_unknown_registered_classic_variant_is_rejected(self):
         assert "hi3518ev100" in CLASSIC_UBOOT_VARIANTS
@@ -275,11 +282,24 @@ class TestPerFlashTypeUBoot:
         "gk7205v500", "gk7205v510", "gk7205v530",
         "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
         "gk7201v200", "hi3516cv300",
+        "hi3516av300", "hi3516cv500", "hi3516dv300",
     )
-    NOR_ONLY = ("hi3516ev100",)
+    NOR_ONLY = ("hi3516ev100", "hi3516cv100", "hi3516cv200", "hi3518cv100",
+                "hi3518ev100", "hi3519v101")
+    LEGACY_NAND = ("hi3516av100", "hi3516av200", "hi3516dv100", "hi3518ev200")
 
     def test_set_matches_the_published_socs(self):
-        assert set(self.SOCS + self.NOR_ONLY) == PER_FLASH_TYPE_UBOOT
+        assert set(self.SOCS + self.NOR_ONLY + self.LEGACY_NAND) == PER_FLASH_TYPE_UBOOT
+
+    @pytest.mark.parametrize("soc", LEGACY_NAND)
+    def test_legacy_nand_keeps_its_universal_uboot(self, soc):
+        # NAND firmware published, no -nand.bin: NAND stays on the older
+        # layout behind the -universal U-Boot, NOR moves to -nor.bin.
+        assert asset_name(soc) == f"u-boot-{soc}-nor.bin"
+        assert asset_name(soc, "nand") == f"u-boot-{soc}-universal.bin"
+        assert uses_per_flash_type_uboot(soc)
+        assert not uses_ubi_nand(soc)
+        assert supports_nor_split(soc)
 
     @pytest.mark.parametrize("soc", NOR_ONLY)
     def test_nor_only_has_no_nand_build(self, soc):

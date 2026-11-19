@@ -64,7 +64,7 @@ async def run_install(request: InstallRequest) -> None:
         pad_to_size,
         nor_boot_area,
         supports_nor_split,
-        uses_per_flash_type_uboot,
+        uses_ubi_nand,
     )
     from defib.flashdump import get_ram_staging_addr, send_command
     from defib.network.ip_manager import list_interfaces_async, temporary_ip
@@ -159,7 +159,7 @@ async def run_install(request: InstallRequest) -> None:
     # u-boot-xmedia SoCs on NAND use the UBI-only layout: no kernel partition,
     # one UBI image from 0x100000 to the end of the chip, and a U-Boot whose
     # default environment already describes all of it.
-    ubi_layout = nand and uses_per_flash_type_uboot(chip)
+    ubi_layout = nand and uses_ubi_nand(chip)
     uboot_flash_type = "nand" if nand else "nor"
     tftp_stages = {"uboot", "rootfs"} if ubi_layout else {"uboot", "kernel", "rootfs"}
     needs_tftp = bool(stage_set & tftp_stages)

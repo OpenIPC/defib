@@ -17,7 +17,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { FRAME_BLAST_SOCS } = require('./protocol.js');
+const { FRAME_BLAST_SOCS, SPL_SRAM_LIMIT } = require('./protocol.js');
 
 const REPO_ROOT = path.join(__dirname, '..');
 const DATA_DIR = path.join(REPO_ROOT, 'src', 'defib', 'profiles', 'data');
@@ -102,5 +102,21 @@ describe('web PROFILES vs CLI profile data', () => {
         `protocol.js still has no frame-blast implementation — either implement ` +
         `it or drop the data`);
     }
+  });
+});
+
+describe('SPL SRAM windows', () => {
+  // The Web UI caps a -nor SPL at the window the CLI profile sets
+  // (SRAMLIMIT); its inline PROFILES carry none, so protocol.js keeps them.
+  it('SPL_SRAM_LIMIT names every CLI SRAMLIMIT, with the same value', () => {
+    const fromCli = {};
+    for (const f of fs.readdirSync(DATA_DIR).filter((n) => n.endsWith('.json'))) {
+      const raw = fs.readFileSync(path.join(DATA_DIR, f), 'utf8').trim();
+      if (!raw.startsWith('{')) continue;
+      const p = JSON.parse(raw);
+      if (p.SRAMLIMIT) fromCli[f.replace(/\.json$/, '')] = parseInt(p.SRAMLIMIT, 16);
+    }
+    assert.ok(Object.keys(fromCli).length > 0);
+    assert.deepEqual(SPL_SRAM_LIMIT, fromCli);
   });
 });

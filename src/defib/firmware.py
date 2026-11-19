@@ -43,11 +43,7 @@ NOVATEK_RELEASE_URL = "https://github.com/OpenIPC/u-boot/releases/download/novat
 # Chips that have pre-built u-boot-{chip}-universal.bin binaries on OpenIPC.
 # Boot-image SoCs are deliberately absent — see BOOT_IMAGE_VARIANTS below.
 AVAILABLE_FIRMWARE: set[str] = {
-    "hi3516av100", "hi3516av200", "hi3516av300",
-    "hi3516cv100", "hi3516cv200", "hi3516cv500",
-    "hi3516dv100", "hi3516dv300",
-    "hi3518av100", "hi3518cv100", "hi3518ev100", "hi3518ev200",
-    "hi3519v101", "hi3520dv200", "hi3536cv100", "hi3536dv100",
+    "hi3518av100", "hi3520dv200", "hi3536cv100", "hi3536dv100",
     "t40a", "t40n", "t40xp",
 }
 
@@ -59,24 +55,48 @@ AVAILABLE_FIRMWARE: set[str] = {
 # default environment, so a NOR image must never be installed on NAND or vice
 # versa. The old u-boot-{chip}-universal.bin of these SoCs came from retired
 # per-SoC repositories (u-boot-hi3516ev200, u-boot-gk7205v200); it is never
-# downloaded for them again. hi3516cv300/hi3516ev100 still have a
-# u-boot-*-universal.bin (U-Boot 2010.06), which knows no split layout.
+# downloaded for them again. hi3516cv300/hi3516ev100 and the classic
+# HiSilicon parts below them still have a u-boot-*-universal.bin (U-Boot
+# 2010.06 or the vendor's), which knows no split layout.
+#
+# The classic HiSilicon parts (CV100 to CV500 generations) moved here when
+# OpenIPC/firmware made the split NOR layout their standard: their
+# OpenIPC/u-boot NOR build finds the kernel and rootfs on the flash, and the
+# site installs nothing else on them (OpenIPC/website#596).
+CLASSIC_SPLIT_SOCS: frozenset[str] = frozenset({
+    "hi3516av100", "hi3516av200", "hi3516av300",
+    "hi3516cv100", "hi3516cv200", "hi3516cv500",
+    "hi3516dv100", "hi3516dv300",
+    "hi3518cv100", "hi3518ev100", "hi3518ev200",
+    "hi3519v101",
+})
+
 PER_FLASH_TYPE_UBOOT: frozenset[str] = frozenset({
     "hi3516ev200", "hi3516ev300", "hi3518ev300", "hi3516dv200",
     "gk7205v500", "gk7205v510", "gk7205v530",
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
     "gk7201v200",
     "hi3516cv300", "hi3516ev100",
+}) | CLASSIC_SPLIT_SOCS
+
+# Of those, the SoCs whose NAND keeps the older layout (boot, env, kernel,
+# ubi) behind their -universal U-Boot: they publish NAND firmware but no
+# -nand.bin, so the NOR build's move does not take NAND with it.
+LEGACY_NAND_UBOOT: frozenset[str] = frozenset({
+    "hi3516av100", "hi3516av200", "hi3516dv100", "hi3518ev200",
 })
 
 # Of those, the SoCs with no NAND build published: asking for one finds none.
-NOR_ONLY_UBOOT: frozenset[str] = frozenset({"hi3516ev100"})
+NOR_ONLY_UBOOT: frozenset[str] = frozenset({
+    "hi3516ev100",
+    "hi3516cv100", "hi3516cv200", "hi3518cv100", "hi3518ev100", "hi3519v101",
+})
 
 # Of those, the SoCs whose old u-boot-*-universal.bin must never stand in for
 # the -nor build, even offline: it is U-Boot 2010.06, which knows no split
 # layout, and install writes the split firmware and loads that U-Boot's
 # default environment.
-NO_UNIVERSAL_FALLBACK: frozenset[str] = frozenset({"hi3516cv300", "hi3516ev100"})
+NO_UNIVERSAL_FALLBACK: frozenset[str] = frozenset({"hi3516cv300", "hi3516ev100"}) | CLASSIC_SPLIT_SOCS
 
 # The firmware package a chip installs, where it is not the chip's own: one
 # hi3516cv6xx build serves the whole CV6xx family, and hi3516dv500 is the
@@ -106,7 +126,7 @@ NOR_SPLIT_SOCS: frozenset[str] = frozenset({
     # Split-only, like hi3516cv6xx: its kernel fills the 2 MiB slot, so no
     # fixed-slot package can ship beside the split one.
     "hi3516ev300",
-})
+}) | CLASSIC_SPLIT_SOCS
 
 # NOR boot area -- (boot partition size, env partition size) -- where it is
 # not OpenIPC's usual 256k(boot),64k(env), keyed by package board. The
@@ -202,10 +222,36 @@ def normalize_flash_type(flash_type: str | None) -> str:
     return normalized
 
 
+def _pinned_classic_variant(chip: str) -> bool:
+    """True for a board variant that boots its own CLASSIC_UBOOT_VARIANTS image.
+
+    Such a board (the HiWatch DS-I203's DDR3 hi3518ev100) keeps that
+    -universal U-Boot and the fixed slots it boots, whatever its SoC moved to.
+    """
+    base, variant = _split_variant(chip)
+    name = CHIP_TO_FIRMWARE.get(base.lower(), base.lower())
+    return variant is not None and variant in CLASSIC_UBOOT_VARIANTS.get(name, {})
+
+
 def uses_per_flash_type_uboot(chip: str) -> bool:
     """True for SoCs whose U-Boot is published per flash type (nor/nand)."""
+    if _pinned_classic_variant(chip):
+        return False
     base = _strip_variant(chip).lower()
     return CHIP_TO_FIRMWARE.get(base, base) in PER_FLASH_TYPE_UBOOT
+
+
+def uses_ubi_nand(chip: str) -> bool:
+    """True for SoCs whose NAND install is the UBI-only layout of a -nand.bin.
+
+    The per-flash-type SoCs, less those whose NAND keeps the older layout
+    behind their -universal U-Boot (LEGACY_NAND_UBOOT).
+    """
+    if _pinned_classic_variant(chip):
+        return False
+    base = _strip_variant(chip).lower()
+    name = CHIP_TO_FIRMWARE.get(base, base)
+    return name in PER_FLASH_TYPE_UBOOT and name not in LEGACY_NAND_UBOOT
 
 
 def package_board(chip: str) -> str:
@@ -217,6 +263,8 @@ def package_board(chip: str) -> str:
 
 def supports_nor_split(chip: str) -> bool:
     """True for SoCs whose firmware and NOR U-Boot use the split NOR layout."""
+    if _pinned_classic_variant(chip):
+        return False
     return package_board(chip) in NOR_SPLIT_SOCS
 
 
@@ -242,9 +290,16 @@ def asset_name(chip: str, flash_type: str | None = None) -> str | None:
     if name in NOVATEK_SOCS:
         return NOVATEK_RECOVERY_ASSET
 
+    classic_variants = CLASSIC_UBOOT_VARIANTS.get(name)
+    if variant is not None and classic_variants is not None:
+        # A board variant pins its own image; an unknown one names none.
+        return classic_variants.get(variant)
+
     if name in PER_FLASH_TYPE_UBOOT:
         if kind == "nand" and name in NOR_ONLY_UBOOT:
             return None
+        if kind == "nand" and name in LEGACY_NAND_UBOOT:
+            return f"u-boot-{name}-universal.bin"
         # Board variants (e.g. ``:emmc``) do not change the per-flash build.
         return f"u-boot-{name}-{kind}.bin"
 
@@ -256,10 +311,6 @@ def asset_name(chip: str, flash_type: str | None = None) -> str | None:
         if variant in variants:
             return f"boot-{name}-{variant}-nor.bin"
         return None
-
-    classic_variants = CLASSIC_UBOOT_VARIANTS.get(name)
-    if variant is not None and classic_variants is not None:
-        return classic_variants.get(variant)
 
     if name in AVAILABLE_FIRMWARE:
         return f"u-boot-{name}-universal.bin"

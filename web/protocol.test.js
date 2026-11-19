@@ -658,15 +658,52 @@ describe('detectSplSize', () => {
   });
 });
 
+describe('splUploadSize', () => {
+  const { splUploadSize } = require('./protocol.js');
+  const image = (gzipAt) => {
+    const fw = new Uint8Array(0x8000);
+    fw.set([0x1f, 0x8b, 0x08], gzipAt);
+    return fw;
+  };
+  it('caps a -nor SPL at the SRAM window the CLI profile names', () => {
+    // hi3516cv200's and hi3518ev200's -nor builds: payload at 0x4C00, window 0x3B00.
+    assert.equal(splUploadSize(image(0x4C00), 'hi3516cv200', 0x3B00), 0x3B00);
+    assert.equal(splUploadSize(image(0x4C00), 'hi3518ev200', 0x3B00), 0x3B00);
+    assert.equal(splUploadSize(image(0x4C00), 'hi3518ev201', 0x3B00), 0x3B00);
+  });
+  it('cuts a -nor SPL at its payload where no window is set', () => {
+    assert.equal(splUploadSize(image(0x52F0), 'hi3516cv500', 0x6000), 0x5000);
+    assert.equal(splUploadSize(image(0x7000), 'hi3519v101', 0x4F00), 0x7000);
+  });
+  it('sends the profile length for a -universal image', () => {
+    assert.equal(splUploadSize(image(0x4C00), 'hi3520dv200', 0x3B00), 0x3B00);
+    assert.equal(splUploadSize(image(0x7000), 'hi3536dv100', 0x4F00), 0x4F00);
+  });
+});
+
 describe('fwAssetName', () => {
   const { fwAssetName, parseReleaseAssets } = require('./protocol.js');
   it('names the -nor build for u-boot-xmedia SoCs, -universal otherwise', () => {
     assert.equal(fwAssetName('hi3516ev300'), 'u-boot-hi3516ev300-nor.bin');
     assert.equal(fwAssetName('gk7205v510'), 'u-boot-gk7205v510-nor.bin');
     assert.equal(fwAssetName('gk7205v300'), 'u-boot-gk7205v300-nor.bin');
-    assert.equal(fwAssetName('hi3516cv200'), 'u-boot-hi3516cv200-universal.bin');
+    assert.equal(fwAssetName('hi3520dv200'), 'u-boot-hi3520dv200-universal.bin');
     assert.equal(fwAssetName('hi3516cv300'), 'u-boot-hi3516cv300-nor.bin');
     assert.equal(fwAssetName('hi3516ev100'), 'u-boot-hi3516ev100-nor.bin');
+  });
+  it('takes the -nor build of the classic HiSilicon parts (OpenIPC/website#596)', () => {
+    for (const soc of ['hi3516av100', 'hi3516av200', 'hi3516av300', 'hi3516cv100',
+      'hi3516cv200', 'hi3516cv500', 'hi3516dv100', 'hi3516dv300',
+      'hi3518cv100', 'hi3518ev100', 'hi3518ev200', 'hi3519v101']) {
+      assert.equal(fwAssetName(soc), `u-boot-${soc}-nor.bin`);
+    }
+    assert.equal(fwAssetName('hi3520dv200'), 'u-boot-hi3520dv200-universal.bin');
+    const idx = parseReleaseAssets({ assets: [
+      { name: 'u-boot-hi3516cv100-universal.bin', size: 1, digest: null },
+      { name: 'u-boot-hi3516cv100-nor.bin', size: 2, digest: null },
+    ] });
+    assert.equal(idx.get('hi3516cv100').name, 'u-boot-hi3516cv100-nor.bin');
+    assert.equal(idx.size, 1);
   });
   it('takes the -nor build of hi3516cv300/ev100 over their 2010.06 universal', () => {
     const idx = parseReleaseAssets({ assets: [

@@ -422,6 +422,28 @@ class TestDetectSplSize:
         assert profile.spl_sram_limit == 0x3B00
         assert profile.spl_address + profile.spl_sram_limit == 0x04014000
 
+    def test_aliased_chips_share_the_sram_window_of_the_uboot_they_boot(self):
+        # hi3518ev201 boots hi3518ev200's U-Boot (CHIP_TO_FIRMWARE), whose
+        # -nor build puts its payload at 0x4C00: a profile at the same SPL
+        # address without the same SRAMLIMIT would send all of it into the
+        # 0x3B00 window (OpenIPC/firmware#2299).
+        from defib.firmware import CHIP_TO_FIRMWARE
+
+        checked = 0
+        for chip, fw in CHIP_TO_FIRMWARE.items():
+            if chip == fw:
+                continue
+            try:
+                own = load_profile(chip, PROFILES_DIR)
+                donor = load_profile(fw, PROFILES_DIR)
+            except Exception:
+                continue
+            if own.spl_address != donor.spl_address:
+                continue
+            checked += 1
+            assert own.spl_sram_limit == donor.spl_sram_limit, chip
+        assert checked > 0
+
     def test_profile_without_sram_limit_returns_none(self):
         # Chips without the optional SRAMLIMIT field continue to return None.
         profile = load_profile("hi3516ev300", PROFILES_DIR)

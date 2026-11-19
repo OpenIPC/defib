@@ -175,14 +175,22 @@ Backends: `spi_flash.c` (fmc100), `spi_flash_hisfc350.c` (V1-era parts),
   `u-boot-<chip>-universal.bin`; the SoCs in `PER_FLASH_TYPE_UBOOT` (the
   u-boot-xmedia ones: hi3516ev200/ev300, hi3518ev300, hi3516dv200,
   gk7205v500/v510/v530; and the OpenIPC/u-boot gk7202v300, gk7205v200/v300,
-  gk7605v100, gk7201v200, hi3516cv300, hi3516ev100 -- ev100 has no NAND build) publish `u-boot-<chip>-nor.bin` and `-nand.bin` instead, so
-  callers pass `flash_type` (NOR when unknown). On NAND those SoCs install the
+  gk7605v100, gk7201v200, hi3516cv300, hi3516ev100 -- ev100 has no NAND build;
+  and the classic HiSilicon parts in `CLASSIC_SPLIT_SOCS`: hi3516av100/av200/
+  av300, cv100/cv200/cv500, dv100/dv300, hi3518cv100/ev100/ev200, hi3519v101)
+  publish `u-boot-<chip>-nor.bin` and `-nand.bin` instead, so
+  callers pass `flash_type` (NOR when unknown). `NOR_ONLY_UBOOT` have no NAND
+  build; `LEGACY_NAND_UBOOT` (av100, av200, dv100, hi3518ev200) publish NAND
+  firmware without a `-nand.bin`, so NAND keeps their `-universal` U-Boot and
+  the legacy layout (`uses_ubi_nand`). A board variant in
+  `CLASSIC_UBOOT_VARIANTS` (the HiWatch DS-I203) keeps its pinned image and
+  the fixed slots whatever its SoC moved to. On NAND the others install the
   UBI-only layout (`NAND_UBI_LAYOUT` in `install/layout.py`: 768k boot, 256k
   env, rest ubi), whose mtdparts/bootcmd/bootargs come from the U-Boot default
   env; `NAND_LAYOUT` is the legacy split layout for other chips. The
   `NOR_SPLIT_SOCS` (gk7205v200 family, hi3516cv6xx, hi3519dv500,
   hi3516cv300/ev100, the hi3516ev200 family -- hi3516ev300 split-only --
-  the gk7205v500 family and gk7201v200; keyed by package board, `FIRMWARE_PACKAGE_BOARD`
+  the gk7205v500 family, gk7201v200 and `CLASSIC_SPLIT_SOCS`; keyed by package board, `FIRMWARE_PACKAGE_BOARD`
   maps cv608/cv610/cv613 to `hi3516cv6xx`, hi3516dv500 to `hi3519dv500` and
   gk7205v510/v530 to `gk7205v500`) install the split NOR
   package: one `firmware.bin.<board>` where the boot area ends (0x50000;
