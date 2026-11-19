@@ -374,6 +374,7 @@ const SPL_SRAM_LIMIT = {
   hi3516cv200: 0x3B00,
   hi3516dv100: 0x3B00,
   hi3518ev200: 0x3B00,
+  hi3518ev201: 0x3B00,
   hi3520dv200: 0x3B00,
 };
 
