@@ -284,6 +284,13 @@ const XMEDIA_SOCS = new Set([
   'gk7205v500', 'gk7205v510', 'gk7205v530',
   'gk7202v300', 'gk7205v200', 'gk7205v300', 'gk7605v100',
   'hi3516cv300', 'hi3516ev100',
+  // The classic HiSilicon parts, on OpenIPC/u-boot's NOR build since the
+  // split NOR layout became their standard (OpenIPC/website#596).
+  'hi3516av100', 'hi3516av200', 'hi3516av300',
+  'hi3516cv100', 'hi3516cv200', 'hi3516cv500',
+  'hi3516dv100', 'hi3516dv300',
+  'hi3518cv100', 'hi3518ev100', 'hi3518ev200',
+  'hi3519v101',
 ]);
 
 /** The published U-Boot a firmware name resolves to. */
@@ -356,6 +363,30 @@ function detectSplSize(firmware, profileMax, sramLimit = null) {
     }
   }
   return profileMax;
+}
+
+// The SRAM window behind the SPL load address, where the CLI profile sets one
+// (SRAMLIMIT in src/defib/profiles/data; the inline PROFILES carry none). A
+// detected payload boundary past it is capped, as defib does: the -nor builds
+// of hi3516cv200 and hi3518ev200 put theirs at 0x4C00 against a 0x3B00
+// window. profile-parity.test.js keeps this in step with the CLI.
+const SPL_SRAM_LIMIT = {
+  hi3516cv200: 0x3B00,
+  hi3516dv100: 0x3B00,
+  hi3518ev200: 0x3B00,
+  hi3520dv200: 0x3B00,
+};
+
+/**
+ * How much of a U-Boot image the Web UI sends as SPL: the payload boundary of
+ * a -nor build (detectSplSize), capped at the chip's SRAM window, and the
+ * profile's length for every other image.
+ */
+function splUploadSize(firmware, chip, profileMax) {
+  if (!XMEDIA_SOCS.has(fwNameForChip(chip))) return profileMax;
+  const base = String(chip).split(':', 1)[0];
+  const limit = SPL_SRAM_LIMIT[base] ?? SPL_SRAM_LIMIT[fwNameForChip(chip)] ?? null;
+  return detectSplSize(firmware, profileMax, limit);
 }
 
 /** "sha256:abc..." → "abc..." (lowercase hex), else null. */
@@ -473,7 +504,7 @@ if (typeof module !== 'undefined' && module.exports) {
     FRAME_BLAST_SOCS, needsFrameBlast,
     FW_RELEASE_API, FW_DIRECT_BASE, FW_ASSET_RE, FW_PROXIES,
     CHIP_FW_ALIAS, fwNameForChip, parseReleaseAssets, parseDigest,
-    XMEDIA_SOCS, fwAssetName, detectSplSize,
+    XMEDIA_SOCS, fwAssetName, detectSplSize, SPL_SRAM_LIMIT, splUploadSize,
     fwSourceUrls, bytesToHex, verifyFirmwareBytes,
     PROXY_WINDOW_SECONDS, proxySignatureMessage, hmacSha256Hex,
     buildOpenIpcProxyUrl,
