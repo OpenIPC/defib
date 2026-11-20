@@ -5,7 +5,12 @@ import struct
 import pytest
 
 from defib.protocol.crc import ACK_BYTE
-from defib.protocol.hisilicon_v500 import HiSiliconV500, V500_SOCS
+from defib.protocol.hisilicon_v500 import (
+    HiSiliconV500,
+    V500_CHIP_IDS,
+    V500_SOCS,
+    v500_member,
+)
 from defib.recovery.events import Stage
 from defib.transport.mock import MockTransport
 
@@ -20,6 +25,14 @@ class TestV500Matches:
 
     def test_no_match_cv6xx(self):
         assert not HiSiliconV500.matches("hi3516cv610")
+
+    def test_gk7206_registered(self):
+        # GK7206 shares the V500 bootrom protocol — verified on hardware, the
+        # ROM answered the handshake with chip id 0x72060110.
+        assert "gk7206" in V500_SOCS
+        assert HiSiliconV500.matches("gk7206")
+        assert V500_CHIP_IDS[0x72060110] == "7206"
+        assert v500_member("gk7206") == "7206"
 
 
 class TestV500Handshake:

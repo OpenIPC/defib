@@ -32,6 +32,14 @@ logger = logging.getLogger(__name__)
 V500_SOCS = frozenset([
     "gk7205v500", "gk7205v510", "gk7205v530",
     "xm7205v500", "xm7205v510", "xm7205v530",
+    # GK7206 (4K-class Goke) shares the V500 UART bootrom protocol — verified on
+    # hardware 2026-11-19: the ROM answered the V500 handshake with chip id
+    # 0x72060110. Recover with `burn -f <board's own u-boot>`: there is no
+    # published OpenIPC donor, and its aux/DDR-init area differs from gk7205v5x0,
+    # so the agent path (V500_AGENT_LOAD_ADDR is gk7205v500-specific) is not wired
+    # up for it yet. The board's own boot image sits at flash offset 0 (aux_len at
+    # 0x400); slice [0:total_boot_len@0x408] and pass it as the donor.
+    "gk7206",
 ])
 
 HANDSHAKE_TIMEOUT = 20.0  # seconds
@@ -39,10 +47,12 @@ HANDSHAKE_TIMEOUT = 20.0  # seconds
 # Chip ID in the handshake reply -> V500 family member.  0x72050510 was read
 # from a GK7205V510; the other two follow the same pattern and are unverified.
 # The xm7205v5x0 parts are the same silicon under another name.
+# 0x72060110 read from a GK7206 (XM "IPC_GK7206V11A") — verified on hardware.
 V500_CHIP_IDS = {
     0x72050500: "v500",
     0x72050510: "v510",
     0x72050530: "v530",
+    0x72060110: "7206",
 }
 
 
