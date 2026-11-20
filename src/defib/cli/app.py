@@ -1176,7 +1176,7 @@ def agent_upload(
     chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial device (/dev/ttyUSB0), tcp://host:port, rfc2217://host:port, or socket:///path"),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
-    file: str | None = typer.Option(None, "-f", "--file", help="CV6xx: composite boot file (GSL+DDR+U-Boot), required. V500: U-Boot image whose header and DDR-init code carry the agent (default: OpenIPC u-boot-<chip>-nor.bin download). Ignored for other protocols"),
+    file: str | None = typer.Option(None, "-f", "--file", help="CV6xx: composite boot file (GSL+DDR+U-Boot), required. V500: U-Boot image whose header and DDR-init code carry the agent (gk7205v5x0 default to the OpenIPC u-boot-<chip>-nor.bin download; gk7206 has no published donor, so -f is required — pass the board's own boot partition). Ignored for other protocols"),
     power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via configured controller (DEFIB_POWER_TYPE)"),
     poe_port_override: str = typer.Option("", "--poe-port", help="Explicit MikroTik ether port (e.g. ether3) — overrides comment-based auto-discovery. Requires --power-cycle."),
 ) -> None:
@@ -1533,8 +1533,8 @@ async def _agent_upload_v500(
     from defib.firmware import download_v500_donor
     from defib.power.base import PowerControllerError
     from defib.protocol.hisilicon_v500 import (
-        V500_AGENT_LOAD_ADDR, V500_BOOT_LOAD_ADDR, V500_CHIP_IDS, HiSiliconV500,
-        v500_member, wrap_v500_payload,
+        V500_AGENT_LOAD_ADDR, V500_BOOT_LOAD_ADDR, V500_CHIP_IDS,
+        V500_PUBLISHED_DONORS, HiSiliconV500, v500_member, wrap_v500_payload,
     )
     from defib.recovery.events import ProgressEvent, Stage
     from defib.transport.serial_platform import (
@@ -1553,6 +1553,12 @@ async def _agent_upload_v500(
     boot_base = V500_BOOT_LOAD_ADDR.get(member)
     if load_addr is None or boot_base is None:
         fail(f"No V500 agent load address is known for '{chip}'.")
+    if not donor_path and member not in V500_PUBLISHED_DONORS:
+        fail(
+            f"{chip} has no published OpenIPC donor image, so there is nothing to "
+            f"download. Pass -f/--file pointing at the board's own boot partition "
+            f"(e.g. its 16 MiB flash dump) to use as the V500 donor."
+        )
 
     try:
         donor_file = Path(donor_path) if donor_path else download_v500_donor(chip)

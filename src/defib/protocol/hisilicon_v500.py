@@ -123,6 +123,11 @@ V500_AGENT_LOAD_ADDR = {
     "7206": 0x40706000,
 }
 
+# Members OpenIPC publishes a NOR U-Boot for (usable as the agent donor via
+# download_v500_donor).  gk7206 has none, so its agent path needs an explicit
+# -f donor (the board's own boot partition).
+V500_PUBLISHED_DONORS = frozenset({"v500", "v510", "v530"})
+
 
 def v500_image_layout(image: bytes) -> tuple[int, int, int]:
     """``(aux_off, aux_len, boot_off)`` for a V500 boot image, from its header.

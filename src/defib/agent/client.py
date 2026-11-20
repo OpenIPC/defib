@@ -962,14 +962,27 @@ class FlashAgentClient:
     async def selfupdate(
         self,
         firmware: bytes,
-        load_addr: int = 0x41000000,
+        load_addr: int | None = None,
     ) -> bool:
         """Update the running agent with new firmware.
 
         Sends data to staging area with per-packet backpressure ACK,
         verifies CRC, agent copies via trampoline and jumps to new code.
         After jump, reconnects and verifies the binary matches.
+
+        ``load_addr`` must be where the new agent is linked. When omitted it is
+        resolved from the client's chip: V500 members link per
+        ``V500_AGENT_LOAD_ADDR`` (e.g. gk7206 at 0x40706000, gk7205v5x0 at
+        0x41007000); everything else keeps the historical 0x41000000 default.
         """
+        if load_addr is None:
+            from defib.protocol.hisilicon_v500 import (
+                V500_AGENT_LOAD_ADDR, v500_member,
+            )
+            member = v500_member(self._chip)
+            load_addr = V500_AGENT_LOAD_ADDR.get(member, 0x41000000) if member \
+                else 0x41000000
+
         self._clear_rx_buffers()
 
         crc = zlib.crc32(firmware) & 0xFFFFFFFF

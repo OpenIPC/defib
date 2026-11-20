@@ -110,6 +110,16 @@ async def test_explicit_donor_skips_the_chip_check(
     assert "stop here" in text
 
 
+async def test_gk7206_without_donor_asks_for_file(
+    fake_link: MockTransport, tmp_path: Path,
+) -> None:
+    # gk7206 has no published OpenIPC donor, so without -f there is nothing to
+    # download: bail with an actionable message before touching the device.
+    text = await _run(tmp_path, "gk7206")
+    assert "no published OpenIPC donor" in text and "-f" in text
+    assert b"\xfe\x00\xff\x01" not in fake_link.all_tx_data
+
+
 async def test_manual_handshake_times_out(
     fake_link: MockTransport, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
