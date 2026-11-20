@@ -261,26 +261,43 @@ class TestV500ImageLayout:
         assert v500_image_layout(donor) == (0x2800, 0x3800, 0x6000)
 
     def test_gk7206_wrap_keeps_head_and_aux_places_agent_at_0x6000(self):
+        # gk7206 loads the image at its natural base 0x40700000, so the agent
+        # links at 0x40706000 (= base + boot_off); pass that boot_base.
         from defib.protocol.hisilicon_v500 import wrap_v500_payload
         donor = _donor(aux_len=0x3800, entry=0x40706000)
         agent = b"\x00\x00\x00\xea" + b"\x33" * 500
-        image = wrap_v500_payload(donor, agent, 0x41006000)
+        image = wrap_v500_payload(donor, agent, 0x40706000, boot_base=0x40700000)
         # Everything up to the boot code (key + aux) is the donor, verbatim
         # except the two patched length fields at 0x404/0x408.
         assert image[:0x404] == donor[:0x404]
         assert image[0x40c:0x6000] == donor[0x40c:0x6000]
         assert image[0x6000:0x6000 + len(agent)] == agent
 
+    def test_per_member_boot_base_and_agent_addr_are_consistent(self):
+        from defib.protocol.hisilicon_v500 import (
+            V500_AGENT_LOAD_ADDR, V500_BOOT_LOAD_ADDR,
+        )
+        # gk7206's ROM jumps to the absolute entry field, so it loads at the
+        # natural base; v5x0 loads at 0x41000000. Agent addr = base + boot_off.
+        assert V500_BOOT_LOAD_ADDR["7206"] == 0x40700000
+        assert V500_AGENT_LOAD_ADDR["7206"] == 0x40706000  # base + 0x6000
+        assert V500_BOOT_LOAD_ADDR["v510"] == 0x41000000
+        assert V500_AGENT_LOAD_ADDR["v510"] == 0x41007000  # base + 0x7000
+
     @pytest.mark.asyncio
     async def test_gk7206_send_frames_head_sized_to_key_area(self):
-        """HEAD is the 0x2800 key area (not a fixed 8 KiB) and AUX lands at 0x2800."""
+        """HEAD is the 0x2800 key area (not a fixed 8 KiB), AUX at 0x2800, BOOT
+        at the gk7206 base 0x40700000."""
         from defib.protocol.hisilicon_v500 import wrap_v500_payload
         donor = _donor(aux_len=0x3800, entry=0x40706000)
-        image = wrap_v500_payload(donor, b"\x44" * 512, 0x41006000)
+        image = wrap_v500_payload(donor, b"\x44" * 512, 0x40706000, boot_base=0x40700000)
         transport = MockTransport()
         transport.enqueue_rx(ACK_BYTE * 500)
-        assert (await HiSiliconV500().send_firmware(transport, image)).success
+        ok = await HiSiliconV500().send_firmware(transport, image, boot_base=0x40700000)
+        assert ok.success
         sent = transport.all_tx_data
-        # HEAD stage announces 0x2800 bytes at address 0; AUX at address 0x2800.
+        # HEAD stage announces 0x2800 bytes at address 0; AUX at address 0x2800;
+        # BOOT at the gk7206 base 0x40700000.
         assert b"\xfe\x00\xff\x01" + struct.pack(">II", 0x2800, 0) in sent
         assert b"\xfe\x00\xff\x01" + struct.pack(">II", 0x3800, 0x2800) in sent
+        assert b"\xfe\x00\xff\x01" + struct.pack(">II", len(image), 0x40700000) in sent

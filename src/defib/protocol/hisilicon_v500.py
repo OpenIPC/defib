@@ -85,10 +85,16 @@ BOOT_LOAD_ADDR = 0x41000000
 # key area:
 #   boot_off = entry - V500_IMAGE_BASE   (0x7000 on v510, 0x6000 on gk7206)
 #   aux_off  = boot_off - aux_len        (0x2000 on v510, 0x2800 on gk7206)
-# After a UART download the bootrom runs the boot code in place at
-# BOOT_LOAD_ADDR + boot_off; the entry field's absolute value is not used on
-# this path (a probe reported pc=0x41007000, not the 0x40707000 it holds) —
-# only its low bits, the boot-code file offset, matter.
+# Where the bootrom runs the boot code after a UART download is PER MEMBER
+# (confirmed on hardware 2026-11-20):
+#   gk7205v5x0: at the download address + boot_off.  A probe reported
+#     pc=0x41007000 (BOOT loaded at 0x41000000), not the 0x40707000 the entry
+#     field holds — the entry field's absolute value is unused there.
+#   gk7206: at the entry field's ABSOLUTE value (0x40706000).  Loading BOOT at
+#     0x41000000 drew "Bootrom success" but the agent never ran (the ROM jumped
+#     to 0x40706000, where nothing was); loading it at the image's natural base
+#     0x40700000 (= V500_IMAGE_BASE), so the entry field lands on the agent, ran
+#     it.  So BOOT is loaded per member and the agent is linked at base+boot_off.
 V500_IMAGE_BASE = 0x40700000
 V500_AUX_AREA_LEN_OFF = 0x400
 V500_BOOT_CODE_LEN_OFF = 0x404
@@ -97,17 +103,24 @@ V500_ENTRY_OFF = 0x414
 V500_BOOT_TAIL_LEN = 0x200
 V500_BOOT_CODE_ALIGN = 0x400
 
-# Agent link address per family member (see agent/Makefile): BOOT_LOAD_ADDR +
-# boot_off.  boot_off is a property of that member's stock boot image (its aux
-# area differs in length), so the agent MUST be built for the matching address;
-# wrap_v500_payload rejects a donor whose layout puts the boot code elsewhere.
-#   gk7205v5x0 aux 0x5000 -> boot_off 0x7000 -> 0x41007000
-#   gk7206     aux 0x3800 -> boot_off 0x6000 -> 0x41006000
+# Address the bootrom loads the BOOT area to, per member.
+V500_BOOT_LOAD_ADDR = {
+    "v500": BOOT_LOAD_ADDR,   # 0x41000000; ROM runs boot code at +boot_off
+    "v510": BOOT_LOAD_ADDR,
+    "v530": BOOT_LOAD_ADDR,
+    "7206": V500_IMAGE_BASE,  # 0x40700000; ROM jumps to the absolute entry field
+}
+
+# Agent link address per member = V500_BOOT_LOAD_ADDR[member] + boot_off.  The
+# agent MUST be built for this (see agent/Makefile); wrap_v500_payload rejects a
+# mismatch.
+#   gk7205v5x0 boot_off 0x7000 -> 0x41007000
+#   gk7206     boot_off 0x6000 -> 0x40706000
 V500_AGENT_LOAD_ADDR = {
     "v500": 0x41007000,
     "v510": 0x41007000,
     "v530": 0x41007000,
-    "7206": 0x41006000,
+    "7206": 0x40706000,
 }
 
 
@@ -138,7 +151,8 @@ def v500_image_layout(image: bytes) -> tuple[int, int, int]:
     return aux_off, aux_len, boot_off
 
 
-def wrap_v500_payload(donor: bytes, payload: bytes, load_addr: int) -> bytes:
+def wrap_v500_payload(donor: bytes, payload: bytes, load_addr: int,
+                      boot_base: int = BOOT_LOAD_ADDR) -> bytes:
     """Put ``payload`` in the boot-code area of a V500 boot image.
 
     ``donor`` is a complete V500 boot image (OpenIPC's
@@ -147,13 +161,14 @@ def wrap_v500_payload(donor: bytes, payload: bytes, load_addr: int) -> bytes:
     area, params and aux (DDR init) area are kept verbatim; its boot code is
     replaced by ``payload`` and the two length fields are patched to match.
     The bootrom runs the boot code in place, so ``payload`` must be linked at
-    BOOT_LOAD_ADDR plus the donor's boot-code offset; ``load_addr`` is checked
-    against that to catch a mismatch before it turns into a silent hang.
+    ``boot_base`` (where the BOOT area is loaded for this member) plus the
+    donor's boot-code offset; ``load_addr`` is checked against that to catch a
+    mismatch before it turns into a silent hang.
     """
     aux_off, aux_len, boot_off = v500_image_layout(donor)
-    if BOOT_LOAD_ADDR + boot_off != load_addr:
+    if boot_base + boot_off != load_addr:
         raise ValueError(
-            f"donor boot code runs at 0x{BOOT_LOAD_ADDR + boot_off:08x}, but the "
+            f"donor boot code runs at 0x{boot_base + boot_off:08x}, but the "
             f"payload is linked at 0x{load_addr:08x}"
         )
     code = bytearray(payload)
@@ -341,6 +356,7 @@ class HiSiliconV500(BootProtocol):
         transport: Transport,
         firmware: bytes,
         on_progress: Callable[[ProgressEvent], None] | None = None,
+        boot_base: int = BOOT_LOAD_ADDR,
     ) -> RecoveryResult:
         stages: list[Stage] = []
 
@@ -382,9 +398,11 @@ class HiSiliconV500(BootProtocol):
         # Brief pause between AUX and BOOT
         await asyncio.sleep(0.1)
 
-        # Full boot image
+        # Full boot image, loaded at this member's base.  On gk7206 the ROM
+        # jumps to the image's absolute entry field, so the base must be the
+        # image's natural base (0x40700000) for the boot code to land there.
         if not await self._send_data_to_bootrom(
-            transport, firmware, BOOT_LOAD_ADDR,
+            transport, firmware, boot_base,
             Stage.BOOT_IMAGE, on_progress,
         ):
             return RecoveryResult(

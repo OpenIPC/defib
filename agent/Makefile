@@ -63,15 +63,18 @@ else ifeq ($(SOC),gk7206)
   # GK7206 (Goke 4K, Cortex-A7 MP2, xmorca).  Control-plane peripherals
   # match the V4-common block / gk7205v300 (UART0 0x12040000, CRG
   # 0x12010000, DDR at 0x40000000).  The agent rides in the boot-code area
-  # of a V500 boot image (wrap_v500_payload).  gk7206's key/HEAD area is
-  # 0x2800 and its aux (DDR init) 0x3800, so the boot code — and this agent —
-  # runs at BOOT_LOAD_ADDR + 0x6000 = 0x41006000 (gk7205v5x0 is 0x41007000).
-  # Load it there on the manual vendor-U-Boot path too: "tftp 0x41006000;
-  # go 0x41006000".  BOOTROM is the 64 KiB HiSilicon mask ROM at 0x04000000,
+  # of a V500 boot image (wrap_v500_payload).  gk7206's ROM jumps to the boot
+  # image's ABSOLUTE entry field (0x40706000), so defib loads the image at its
+  # natural base 0x40700000 and this agent must link at 0x40706000 = base +
+  # boot_off (key 0x2800 + aux 0x3800 = 0x6000).  (Loading at 0x41000000 like
+  # gk7205v5x0 drew "Bootrom success" but the agent never ran — the ROM jumped
+  # to 0x40706000 where nothing was; verified on hardware 2026-11-20.)  Load it
+  # at 0x40706000 on the manual vendor-U-Boot path too: "tftp 0x40706000;
+  # go 0x40706000".  BOOTROM is the 64 KiB HiSilicon mask ROM at 0x04000000,
   # opened to CMD_READ (it reads zero at runtime — hidden post-boot).
   UART_BASE      = 0x12040000
   UART_CLOCK     = 24000000
-  LOAD_ADDR      = 0x41006000
+  LOAD_ADDR      = 0x40706000
   FLASH_MEM      = 0x14000000
   FMC_BASE       = 0x10000000
   RAM_BASE       = 0x40000000

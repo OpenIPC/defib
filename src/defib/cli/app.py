@@ -1533,8 +1533,8 @@ async def _agent_upload_v500(
     from defib.firmware import download_v500_donor
     from defib.power.base import PowerControllerError
     from defib.protocol.hisilicon_v500 import (
-        V500_AGENT_LOAD_ADDR, V500_CHIP_IDS, HiSiliconV500, v500_member,
-        wrap_v500_payload,
+        V500_AGENT_LOAD_ADDR, V500_BOOT_LOAD_ADDR, V500_CHIP_IDS, HiSiliconV500,
+        v500_member, wrap_v500_payload,
     )
     from defib.recovery.events import ProgressEvent, Stage
     from defib.transport.serial_platform import (
@@ -1548,14 +1548,16 @@ async def _agent_upload_v500(
             console.print(f"[red]{message}[/red]")
         raise typer.Exit(1)
 
-    load_addr = V500_AGENT_LOAD_ADDR.get(v500_member(chip) or "")
-    if load_addr is None:
+    member = v500_member(chip) or ""
+    load_addr = V500_AGENT_LOAD_ADDR.get(member)
+    boot_base = V500_BOOT_LOAD_ADDR.get(member)
+    if load_addr is None or boot_base is None:
         fail(f"No V500 agent load address is known for '{chip}'.")
 
     try:
         donor_file = Path(donor_path) if donor_path else download_v500_donor(chip)
         wrapped = wrap_v500_payload(
-            donor_file.read_bytes(), agent_data, load_addr,
+            donor_file.read_bytes(), agent_data, load_addr, boot_base,
         )
     except (OSError, ValueError, ConnectionError) as e:
         fail(f"Cannot build the V500 boot image: {e}")
@@ -1635,7 +1637,7 @@ async def _agent_upload_v500(
                 f"wrong DDR init. Re-run with -c gk7205{detected}."
             )
 
-        result = await protocol.send_firmware(transport, wrapped, on_progress)
+        result = await protocol.send_firmware(transport, wrapped, on_progress, boot_base)
         if not result.success:
             fail(f"Upload failed: {result.error}")
 
