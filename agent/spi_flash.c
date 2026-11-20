@@ -11,7 +11,33 @@
 #include "spi_flash.h"
 #include "protocol.h"  /* for crc32() */
 
-/* FMC register offsets */
+/* FMC register offsets.  The Goke "lotus,fmc" on xmorca (gk7206) is the same
+ * HiFMC V100 IP but with a shuffled register map, a control block at FMC_BASE
+ * 0x10000010 (set in the Makefile), and VERSION 0x200 instead of 0x100.  Select
+ * it with -DFMC_REGS_LOTUS.  Offsets per qemu-bench hisi-fmc.c
+ * fmc100_to_canonical() (= lotus kernel drivers/mtd/fmc100/fmc100_reg.h),
+ * verified on hardware (VERSION at 0x100000C4 reads 0x200). */
+#ifdef FMC_REGS_LOTUS
+#define FMC_CFG             0x08
+#define FMC_GLOBAL_CFG      0x0C
+#define FMC_SPI_TIMING_CFG  0x00
+#define FMC_INT             0x10
+#define FMC_INT_CLR         0x28
+#define FMC_CMD             0x2C
+#define FMC_ADDRH           0x20
+#define FMC_ADDRL           0x24
+#define FMC_OP_CFG          0x38
+#define FMC_DATA_NUM        0x30
+#define FMC_OP              0x34
+#define FMC_DMA_LEN         0x48
+#define FMC_DMA_SADDR_D0    0x44
+#define FMC_DMA_SADDR_OOB   0x54
+#define FMC_OP_CTRL         0x60
+#define FMC_STATUS          0xA4
+#define FMC_VERSION         0xB4
+#define FMC_ECC_ERR_NUM0_BUF0 0xC0    /* NAND-only; lotus offset unverified */
+#define FMC_EXPECTED_VERSION 0x200
+#else
 #define FMC_CFG             0x00
 #define FMC_GLOBAL_CFG      0x04
 #define FMC_SPI_TIMING_CFG  0x08
@@ -30,6 +56,8 @@
 #define FMC_STATUS          0xAC
 #define FMC_VERSION         0xBC
 #define FMC_ECC_ERR_NUM0_BUF0 0xC0
+#define FMC_EXPECTED_VERSION 0x100
+#endif
 
 /* FMC_CFG bits */
 #define FMC_CFG_OP_MODE_NORMAL  (1 << 0)
@@ -65,13 +93,19 @@
 /* FMC_INT bits */
 #define FMC_INT_OP_DONE  (1 << 0)
 
-/* FMC_OP bits */
+/* FMC_OP bits.  lotus fmc100 swaps ADDR_EN (bit1) and READ_STATUS (bit6); the
+ * rest match HiFMC V100. */
 #define FMC_OP_REG_OP_START (1 << 0)
-#define FMC_OP_READ_STATUS  (1 << 1)
 #define FMC_OP_READ_DATA    (1 << 2)
 #define FMC_OP_WRITE_DATA   (1 << 5)
-#define FMC_OP_ADDR_EN      (1 << 6)
 #define FMC_OP_CMD1_EN      (1 << 7)
+#ifdef FMC_REGS_LOTUS
+#define FMC_OP_READ_STATUS  (1 << 6)
+#define FMC_OP_ADDR_EN      (1 << 1)
+#else
+#define FMC_OP_READ_STATUS  (1 << 1)
+#define FMC_OP_ADDR_EN      (1 << 6)
+#endif
 
 /* SPI NOR commands */
 #define SPI_CMD_READ_ID       0x9F
@@ -141,6 +175,18 @@
 /* SPI timing: TCSH=6 [15:12], TCSS=6 [11:8], TSHSL=0xF [7:0] */
 #define SPI_TIMING_VAL      ((6 << 12) | (6 << 8) | 0xF)  /* 0x660F */
 
+/* Programming the timing register.  On the lotus fmc100 the timing register
+ * uses a different format from HiFMC V100: writing 0x660F to it (reads back
+ * 0x0F) breaks memory-mapped XIP reads, which then return the stale register
+ * buffer instead of flash.  The bootrom already programmed a working value
+ * (0xf6 observed on the IVG-K8), so preserve it — verified on hardware that
+ * leaving the timing alone restores correct XIP reads. */
+#ifdef FMC_REGS_LOTUS
+#define FMC_SET_TIMING()    do { } while (0)
+#else
+#define FMC_SET_TIMING()    (fmc_reg(FMC_SPI_TIMING_CFG) = SPI_TIMING_VAL)
+#endif
+
 /* Flash size from JEDEC ID byte 2 */
 static uint32_t detect_size(uint8_t id2) {
     if (id2 >= 0x14 && id2 <= 0x1A)
@@ -192,7 +238,7 @@ static void fmc_enter_normal(void) {
 #endif
 
     fmc_reg(FMC_CFG) = 0x1821;  /* OP_MODE_NORMAL | bootrom defaults */
-    fmc_reg(FMC_SPI_TIMING_CFG) = SPI_TIMING_VAL;
+    FMC_SET_TIMING();
     fmc_reg(FMC_INT_CLR) = 0xFF;
     fmc_reg(FMC_GLOBAL_CFG) = 0;  /* Disable all write protection */
 }
@@ -214,7 +260,7 @@ static void fmc_enter_boot(void) {
 
     /* Soft reset clears FMC registers — reconfigure for proper boot mode.
      * Without this, the memory window at FLASH_MEM wraps at 1MB. */
-    fmc_reg(FMC_SPI_TIMING_CFG) = SPI_TIMING_VAL;
+    FMC_SET_TIMING();
     fmc_reg(FMC_INT_CLR) = 0xFF;
 }
 
@@ -469,11 +515,11 @@ int flash_init(flash_info_t *info) {
     crg &= ~FMC_SOFT_RESET;
     REG_FMC_CRG = crg;
 
-    /* Verify FMC IP version */
-    if (fmc_reg(FMC_VERSION) != 0x100) return -1;
+    /* Verify FMC IP version (0x100 on HiFMC V100, 0x200 on lotus fmc100) */
+    if (fmc_reg(FMC_VERSION) != FMC_EXPECTED_VERSION) return -1;
 
     /* Set SPI timing parameters */
-    fmc_reg(FMC_SPI_TIMING_CFG) = SPI_TIMING_VAL;
+    FMC_SET_TIMING();
 
     /* Clear pending interrupts */
     fmc_reg(FMC_INT_CLR) = 0xFF;
@@ -682,8 +728,18 @@ int flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
         fmc_reg(FMC_CMD) = 0x03;  /* SPI READ */
         fmc_reg(FMC_ADDRL) = addr;
         fmc_reg(FMC_DATA_NUM) = chunk;
+#ifdef FMC_REGS_LOTUS
+        /* lotus fmc100: OP_CFG is OEN only (no ADDR_NUM field), and the READ op
+         * is 0x187 = START|ADDR_EN|READ_DATA|CMD1 plus bit8 — taken from the
+         * stock XM U-Boot's fmc100 op_reg (OpenIPC/… uboot, XmSpiNor driver).
+         * The HiFMC encoding (ADDR_NUM<<4, no bit8) completes the op but reads
+         * back garbage on this controller. */
+        fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | (3u << 7);  /* OEN + 3 addr bytes@[9:7] */
+        fmc_reg(FMC_OP) = 0x187;
+#else
         fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(3);
         fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
+#endif
         if (fmc_wait_ready())
             stalled = 1;
 
@@ -883,32 +939,20 @@ uint32_t flash_crc32(uint32_t addr, uint32_t len) {
         return c;
     }
 
-    /* Use register-based reads to compute CRC32 over flash region.
-     * Boot mode memory window wraps at 1MB on some SoCs. */
-    fmc_enter_normal();
-    volatile uint8_t *iobuf = (volatile uint8_t *)(FLASH_MEM);
+    /* NOR: CRC via the same register-mode flash_read() the CMD_READ path uses,
+     * so the result matches and the lotus fmc100 read quirks live in one place
+     * (the old duplicated read op here used the HiFMC encoding and wrapped at
+     * 1MB / read garbage on lotus). */
+    uint8_t buf[256];
     uint32_t c = 0;
-
     while (len > 0) {
         uint32_t chunk = len > 256 ? 256 : len;
-        fmc_reg(FMC_CMD) = 0x03;  /* SPI READ */
-        fmc_reg(FMC_ADDRL) = addr;
-        fmc_reg(FMC_DATA_NUM) = chunk;
-        fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(3);
-        fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
-        fmc_wait_ready();
-
-        /* CRC the I/O buffer contents in place */
-        uint8_t tmp[256];
-        for (uint32_t i = 0; i < chunk; i++)
-            tmp[i] = iobuf[i];
-        c = crc32(c, tmp, chunk);
-
+        flash_read(addr, buf, chunk);
+        c = crc32(c, buf, chunk);
         addr += chunk;
         len -= chunk;
+        proto_drain_fifo();
     }
-
-    fmc_enter_boot();
     return c;
 }
 
