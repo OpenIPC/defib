@@ -69,7 +69,15 @@
 #define OP_CFG_OEN_EN       (1 << 13)
 #define OP_CFG_FM_CS(n)     ((n) << 11)
 #define OP_CFG_CS(n)        ((n) << 11)
+/* Address-byte count field position differs by controller: HiFMC V100 puts it
+ * at bits [5:4]; the lotus fmc100 puts it at bits [9:7] (per the stock XM
+ * U-Boot fmc100 op_reg).  Using the wrong one makes every address-bearing op
+ * (read/erase/program) misfire. */
+#ifdef FMC_REGS_LOTUS
+#define OP_CFG_ADDR_NUM(n)  (((n) & 0x7) << 7)
+#else
 #define OP_CFG_ADDR_NUM(n)  ((n) << 4)  /* 3 or 4 byte address */
+#endif
 #define OP_CFG_DUMMY_NUM(n) ((n) & 0xF) /* dummy bytes between address and data */
 #define OP_CFG_MEM_IF_TYPE(t) (((t) & 0x7) << 7)
 
@@ -94,14 +102,17 @@
 #define FMC_INT_OP_DONE  (1 << 0)
 
 /* FMC_OP bits.  lotus fmc100 swaps ADDR_EN (bit1) and READ_STATUS (bit6); the
- * rest match HiFMC V100. */
+ * rest match HiFMC V100.  On lotus an address-bearing op also needs bit8 set
+ * (an addressed-op enable; the stock XM U-Boot's fmc100 read op is 0x187 =
+ * START|ADDR_EN|READ_DATA|CMD1|bit8).  Folding bit8 into ADDR_EN makes every
+ * addressed op (read/erase/program) carry it. */
 #define FMC_OP_REG_OP_START (1 << 0)
 #define FMC_OP_READ_DATA    (1 << 2)
 #define FMC_OP_WRITE_DATA   (1 << 5)
 #define FMC_OP_CMD1_EN      (1 << 7)
 #ifdef FMC_REGS_LOTUS
 #define FMC_OP_READ_STATUS  (1 << 6)
-#define FMC_OP_ADDR_EN      (1 << 1)
+#define FMC_OP_ADDR_EN      ((1 << 1) | (1 << 8))
 #else
 #define FMC_OP_READ_STATUS  (1 << 1)
 #define FMC_OP_ADDR_EN      (1 << 6)
@@ -698,6 +709,25 @@ static uint8_t nand_read(uint32_t row, uint32_t column,
     return stalled ? 0xFF : status;
 }
 
+/* One register-mode NOR READ (SPI 0x03) of up to 256 bytes at `addr` into
+ * `buf`.  The caller must already be in normal mode (fmc_enter_normal); this
+ * does NOT switch modes, so a bulk read or CRC pays the mode-switch + soft-reset
+ * cost once, not per chunk.  Uses the controller-aware address encoding
+ * (OP_CFG_ADDR_NUM, FMC_OP_ADDR_EN), so it is correct on both HiFMC V100 and
+ * the lotus fmc100 (where it composes to OP_CFG 0x2180, OP 0x187). */
+static int fmc_nor_read_chunk(uint32_t addr, uint8_t *buf, uint32_t chunk) {
+    volatile uint8_t *iobuf = (volatile uint8_t *)(FLASH_MEM);
+    fmc_reg(FMC_CMD) = 0x03;  /* SPI READ */
+    fmc_reg(FMC_ADDRL) = addr;
+    fmc_reg(FMC_DATA_NUM) = chunk;
+    fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(3);
+    fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
+    int stalled = fmc_wait_ready() ? 1 : 0;
+    for (uint32_t i = 0; i < chunk; i++)
+        buf[i] = iobuf[i];
+    return stalled;
+}
+
 int flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
     int stalled = 0;
     if (current_flash_type == FLASH_TYPE_NAND) {
@@ -718,34 +748,14 @@ int flash_read(uint32_t addr, uint8_t *buf, uint32_t len) {
         return stalled ? -1 : 0;
     }
 
-    /* NOR: register-based reads (normal mode) instead of memory window.
-     * The boot mode memory window wraps at 1MB on some SoCs. */
+    /* NOR: register-based reads (normal mode) instead of the memory window,
+     * which wraps at 1 MiB on some SoCs (lotus fmc100 included).  One mode
+     * switch for the whole request, the per-chunk op in fmc_nor_read_chunk(). */
     fmc_enter_normal();
-    volatile uint8_t *iobuf = (volatile uint8_t *)(FLASH_MEM);
-
     while (len > 0) {
         uint32_t chunk = len > 256 ? 256 : len;
-        fmc_reg(FMC_CMD) = 0x03;  /* SPI READ */
-        fmc_reg(FMC_ADDRL) = addr;
-        fmc_reg(FMC_DATA_NUM) = chunk;
-#ifdef FMC_REGS_LOTUS
-        /* lotus fmc100: OP_CFG is OEN only (no ADDR_NUM field), and the READ op
-         * is 0x187 = START|ADDR_EN|READ_DATA|CMD1 plus bit8 — taken from the
-         * stock XM U-Boot's fmc100 op_reg (OpenIPC/… uboot, XmSpiNor driver).
-         * The HiFMC encoding (ADDR_NUM<<4, no bit8) completes the op but reads
-         * back garbage on this controller. */
-        fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | (3u << 7);  /* OEN + 3 addr bytes@[9:7] */
-        fmc_reg(FMC_OP) = 0x187;
-#else
-        fmc_reg(FMC_OP_CFG) = OP_CFG_OEN_EN | OP_CFG_CS(0) | OP_CFG_ADDR_NUM(3);
-        fmc_reg(FMC_OP) = FMC_OP_CMD1_EN | FMC_OP_ADDR_EN | FMC_OP_READ_DATA | FMC_OP_REG_OP_START;
-#endif
-        if (fmc_wait_ready())
+        if (fmc_nor_read_chunk(addr, buf, chunk))
             stalled = 1;
-
-        for (uint32_t i = 0; i < chunk; i++)
-            buf[i] = iobuf[i];
-
         buf += chunk;
         addr += chunk;
         len -= chunk;
@@ -939,20 +949,23 @@ uint32_t flash_crc32(uint32_t addr, uint32_t len) {
         return c;
     }
 
-    /* NOR: CRC via the same register-mode flash_read() the CMD_READ path uses,
-     * so the result matches and the lotus fmc100 read quirks live in one place
-     * (the old duplicated read op here used the HiFMC encoding and wrapped at
-     * 1MB / read garbage on lotus). */
+    /* NOR: CRC via the same register-mode read op the CMD_READ path uses, so
+     * the result matches and the lotus fmc100 encoding lives in one place
+     * (fmc_nor_read_chunk).  One mode switch for the whole region — not one per
+     * 256-byte chunk — so a 16 MiB checksum doesn't soft-reset the controller
+     * tens of thousands of times. */
+    fmc_enter_normal();
     uint8_t buf[256];
     uint32_t c = 0;
     while (len > 0) {
         uint32_t chunk = len > 256 ? 256 : len;
-        flash_read(addr, buf, chunk);
+        fmc_nor_read_chunk(addr, buf, chunk);
         c = crc32(c, buf, chunk);
         addr += chunk;
         len -= chunk;
         proto_drain_fifo();
     }
+    fmc_enter_boot();
     return c;
 }
 
