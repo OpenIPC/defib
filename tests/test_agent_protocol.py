@@ -648,6 +648,29 @@ class TestSelfUpdate:
         cmd, data = await recv_packet(transport, timeout=1.0)
         assert cmd == RSP_ACK and data[0] == ACK_OK
 
+    @pytest.mark.parametrize("chip,expected_addr", [
+        ("gk7206", 0x40706000),      # V500 member, agent linked off 0x40700000
+        ("gk7205v510", 0x41007000),  # V500 member, agent linked off 0x41000000
+        ("", 0x41000000),            # unknown chip -> historical default
+    ])
+    @pytest.mark.asyncio
+    async def test_selfupdate_default_addr_resolves_from_chip(self, chip, expected_addr):
+        """Without an explicit load_addr, selfupdate targets the chip's agent
+        link address, not a blanket 0x41000000 (which would misfire on gk7206)."""
+        from defib.agent.client import FlashAgentClient
+        port = FakePort()
+        transport = FakeTransport(port)
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_OK])))  # ready
+        port.feed(make_device_packet(RSP_ACK, bytes([ACK_OK])))  # verified
+        client = FlashAgentClient(transport, chip)
+        assert await client.selfupdate(b"\x11" * 64)
+        # Decode the first frame (COBS packets are 0x00-delimited) — its payload
+        # is <load_addr:u32><size:u32><crc:u32>.
+        first_frame = port.tx_data.split(b"\x00")[0]
+        cmd, data = parse_packet(first_frame)
+        assert cmd == CMD_SELFUPDATE
+        assert struct.unpack("<I", data[:4])[0] == expected_addr
+
 
 # ---------------------------------------------------------------------------
 # Tests: WRITE command (host→device data transfer)

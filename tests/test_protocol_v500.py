@@ -5,7 +5,12 @@ import struct
 import pytest
 
 from defib.protocol.crc import ACK_BYTE
-from defib.protocol.hisilicon_v500 import HiSiliconV500, V500_SOCS
+from defib.protocol.hisilicon_v500 import (
+    HiSiliconV500,
+    V500_CHIP_IDS,
+    V500_SOCS,
+    v500_member,
+)
 from defib.recovery.events import Stage
 from defib.transport.mock import MockTransport
 
@@ -20,6 +25,14 @@ class TestV500Matches:
 
     def test_no_match_cv6xx(self):
         assert not HiSiliconV500.matches("hi3516cv610")
+
+    def test_gk7206_registered(self):
+        # GK7206 shares the V500 bootrom protocol — verified on hardware, the
+        # ROM answered the handshake with chip id 0x72060110.
+        assert "gk7206" in V500_SOCS
+        assert HiSiliconV500.matches("gk7206")
+        assert V500_CHIP_IDS[0x72060110] == "7206"
+        assert v500_member("gk7206") == "7206"
 
 
 class TestV500Handshake:
@@ -138,9 +151,11 @@ class TestV500FirmwareTransfer:
     async def test_send_firmware_with_acks(self):
         transport = MockTransport()
 
-        # Build minimal V500 firmware with AUX size at offset 1024
+        # Minimal V500 firmware: aux 0x1000, entry 0x40704000 -> boot at file
+        # 0x4000, so key/HEAD 0x3000 and aux 0x3000..0x4000, all within 0x8000.
         firmware = bytearray(32768)
-        struct.pack_into("<I", firmware, 1024, 4096)  # AUX size = 4096
+        struct.pack_into("<6I", firmware, 0x400, 0x1000, 0x800, 0xa00,
+                         0x12345678, 0x12345678, 0x40704000)
 
         # Lots of ACKs for all frames
         transport.enqueue_rx(ACK_BYTE * 500)
@@ -154,13 +169,19 @@ class TestV500FirmwareTransfer:
         assert Stage.BOOT_IMAGE in result.stages_completed
 
 
-def _donor(aux_len: int = 0x5000, code_len: int = 0x800) -> bytes:
-    from defib.protocol.hisilicon_v500 import V500_BOOT_TAIL_LEN, V500_KEY_AREA_LEN
+def _donor(aux_len: int = 0x5000, code_len: int = 0x800,
+           entry: int = 0x40707000) -> bytes:
+    """A V500 boot image.  ``entry`` (the header's load-address field) fixes
+    the boot-code file offset = entry - 0x40700000; the key/HEAD area is then
+    boot_off - aux_len.  Defaults model gk7205v5x0 (key 0x2000, boot 0x7000);
+    pass entry=0x40706000, aux_len=0x3800 to model gk7206 (key 0x2800)."""
+    from defib.protocol.hisilicon_v500 import V500_BOOT_TAIL_LEN, V500_IMAGE_BASE
 
-    total = V500_KEY_AREA_LEN + aux_len + code_len + V500_BOOT_TAIL_LEN
+    boot_off = entry - V500_IMAGE_BASE
+    total = boot_off + code_len + V500_BOOT_TAIL_LEN
     image = bytearray(b"\xa5" * total)
     struct.pack_into("<6I", image, 0x400, aux_len, code_len,
-                     code_len + V500_BOOT_TAIL_LEN, 0x12345678, 0x12345678, 0x40707000)
+                     code_len + V500_BOOT_TAIL_LEN, 0x12345678, 0x12345678, entry)
     return bytes(image)
 
 
@@ -170,7 +191,7 @@ class TestWrapV500Payload:
 
         donor = _donor()
         agent = b"\x00\x00\x00\xea" + b"\x11" * 1000
-        image = wrap_v500_payload(donor, agent, V500_AGENT_LOAD_ADDR)
+        image = wrap_v500_payload(donor, agent, V500_AGENT_LOAD_ADDR["v500"])
 
         # Header, params and aux (DDR init) area come from the donor.
         assert image[:0x400] == donor[:0x400]
@@ -187,10 +208,12 @@ class TestWrapV500Payload:
 
         with pytest.raises(ValueError, match="linked at 0x40707000"):
             wrap_v500_payload(_donor(), b"\x00" * 16, 0x40707000)
-        # A donor with a different aux area moves the code, so the same
-        # agent no longer fits.
+        # A gk7206-shaped donor (entry 0x40706000) runs its boot code at
+        # 0x41006000, so a gk7205v5x0 agent linked at 0x41007000 no longer fits.
         with pytest.raises(ValueError, match="runs at 0x41006000"):
-            wrap_v500_payload(_donor(aux_len=0x4000), b"\x00" * 16, 0x41007000)
+            wrap_v500_payload(
+                _donor(aux_len=0x3800, entry=0x40706000), b"\x00" * 16, 0x41007000,
+            )
 
     @pytest.mark.parametrize("aux_len", [0, 0x123, 0x100000])
     def test_rejects_implausible_donor(self, aux_len):
@@ -198,7 +221,7 @@ class TestWrapV500Payload:
 
         donor = bytearray(_donor())
         struct.pack_into("<I", donor, 0x400, aux_len)
-        with pytest.raises(ValueError, match="aux-area length"):
+        with pytest.raises(ValueError, match="not plausible"):
             wrap_v500_payload(bytes(donor), b"\x00" * 16, 0x41007000)
 
     def test_rejects_short_donor(self):
@@ -212,7 +235,7 @@ class TestWrapV500Payload:
         """HEAD carries the patched lengths, so the bootrom loads only the agent."""
         from defib.protocol.hisilicon_v500 import V500_AGENT_LOAD_ADDR, wrap_v500_payload
 
-        image = wrap_v500_payload(_donor(), b"\x22" * 2048, V500_AGENT_LOAD_ADDR)
+        image = wrap_v500_payload(_donor(), b"\x22" * 2048, V500_AGENT_LOAD_ADDR["v500"])
         transport = MockTransport()
         transport.enqueue_rx(ACK_BYTE * 500)
         result = await HiSiliconV500().send_firmware(transport, image)
@@ -220,3 +243,61 @@ class TestWrapV500Payload:
         sent = transport.all_tx_data
         # The BOOT stage HEAD frame announces the wrapped size at 0x41000000.
         assert b"\xfe\x00\xff\x01" + struct.pack(">II", len(image), 0x41000000) in sent
+
+
+class TestV500ImageLayout:
+    """The key/aux boundaries are derived from the header, not assumed, because
+    gk7205v5x0 and gk7206 differ (key 0x2000 vs 0x2800)."""
+
+    def test_v5x0_layout(self):
+        from defib.protocol.hisilicon_v500 import v500_image_layout
+        # entry 0x40707000, aux 0x5000 -> key 0x2000, aux 0x2000..0x7000.
+        assert v500_image_layout(_donor()) == (0x2000, 0x5000, 0x7000)
+
+    def test_gk7206_layout(self):
+        from defib.protocol.hisilicon_v500 import v500_image_layout
+        # entry 0x40706000, aux 0x3800 -> key 0x2800, aux 0x2800..0x6000.
+        donor = _donor(aux_len=0x3800, entry=0x40706000)
+        assert v500_image_layout(donor) == (0x2800, 0x3800, 0x6000)
+
+    def test_gk7206_wrap_keeps_head_and_aux_places_agent_at_0x6000(self):
+        # gk7206 loads the image at its natural base 0x40700000, so the agent
+        # links at 0x40706000 (= base + boot_off); pass that boot_base.
+        from defib.protocol.hisilicon_v500 import wrap_v500_payload
+        donor = _donor(aux_len=0x3800, entry=0x40706000)
+        agent = b"\x00\x00\x00\xea" + b"\x33" * 500
+        image = wrap_v500_payload(donor, agent, 0x40706000, boot_base=0x40700000)
+        # Everything up to the boot code (key + aux) is the donor, verbatim
+        # except the two patched length fields at 0x404/0x408.
+        assert image[:0x404] == donor[:0x404]
+        assert image[0x40c:0x6000] == donor[0x40c:0x6000]
+        assert image[0x6000:0x6000 + len(agent)] == agent
+
+    def test_per_member_boot_base_and_agent_addr_are_consistent(self):
+        from defib.protocol.hisilicon_v500 import (
+            V500_AGENT_LOAD_ADDR, V500_BOOT_LOAD_ADDR,
+        )
+        # gk7206's ROM jumps to the absolute entry field, so it loads at the
+        # natural base; v5x0 loads at 0x41000000. Agent addr = base + boot_off.
+        assert V500_BOOT_LOAD_ADDR["7206"] == 0x40700000
+        assert V500_AGENT_LOAD_ADDR["7206"] == 0x40706000  # base + 0x6000
+        assert V500_BOOT_LOAD_ADDR["v510"] == 0x41000000
+        assert V500_AGENT_LOAD_ADDR["v510"] == 0x41007000  # base + 0x7000
+
+    @pytest.mark.asyncio
+    async def test_gk7206_send_frames_head_sized_to_key_area(self):
+        """HEAD is the 0x2800 key area (not a fixed 8 KiB), AUX at 0x2800, BOOT
+        at the gk7206 base 0x40700000."""
+        from defib.protocol.hisilicon_v500 import wrap_v500_payload
+        donor = _donor(aux_len=0x3800, entry=0x40706000)
+        image = wrap_v500_payload(donor, b"\x44" * 512, 0x40706000, boot_base=0x40700000)
+        transport = MockTransport()
+        transport.enqueue_rx(ACK_BYTE * 500)
+        ok = await HiSiliconV500().send_firmware(transport, image, boot_base=0x40700000)
+        assert ok.success
+        sent = transport.all_tx_data
+        # HEAD stage announces 0x2800 bytes at address 0; AUX at address 0x2800;
+        # BOOT at the gk7206 base 0x40700000.
+        assert b"\xfe\x00\xff\x01" + struct.pack(">II", 0x2800, 0) in sent
+        assert b"\xfe\x00\xff\x01" + struct.pack(">II", 0x3800, 0x2800) in sent
+        assert b"\xfe\x00\xff\x01" + struct.pack(">II", len(image), 0x40700000) in sent

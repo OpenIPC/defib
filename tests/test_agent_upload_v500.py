@@ -20,8 +20,10 @@ from defib.transport.mock import MockTransport
 
 
 def _write_donor(tmp_path: Path) -> Path:
+    # gk7205v5x0-shaped: aux 0x5000, entry 0x40707000 -> boot code at 0x7000.
     image = bytearray(b"\xa5" * (0x7000 + 0x800 + 0x200))
-    struct.pack_into("<3I", image, 0x400, 0x5000, 0x800, 0xa00)
+    struct.pack_into("<6I", image, 0x400, 0x5000, 0x800, 0xa00,
+                     0x12345678, 0x12345678, 0x40707000)
     path = tmp_path / "donor.bin"
     path.write_bytes(bytes(image))
     return path
@@ -106,6 +108,16 @@ async def test_explicit_donor_skips_the_chip_check(
     monkeypatch.setattr(HiSiliconV500, "send_firmware", send)
     text = await _run(tmp_path, "gk7205v500", donor=True)
     assert "stop here" in text
+
+
+async def test_gk7206_without_donor_asks_for_file(
+    fake_link: MockTransport, tmp_path: Path,
+) -> None:
+    # gk7206 has no published OpenIPC donor, so without -f there is nothing to
+    # download: bail with an actionable message before touching the device.
+    text = await _run(tmp_path, "gk7206")
+    assert "no published OpenIPC donor" in text and "-f" in text
+    assert b"\xfe\x00\xff\x01" not in fake_link.all_tx_data
 
 
 async def test_manual_handshake_times_out(
