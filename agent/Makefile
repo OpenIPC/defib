@@ -72,11 +72,14 @@ else ifeq ($(SOC),gk7206)
   # at 0x40706000 on the manual vendor-U-Boot path too: "tftp 0x40706000;
   # go 0x40706000".  BOOTROM is the 64 KiB HiSilicon mask ROM at 0x04000000,
   # opened to CMD_READ (it reads zero at runtime — hidden post-boot).
+  # Flash controller is the Goke "lotus,fmc": same HiFMC V100 IP but a shuffled
+  # register map, control block at 0x10000010, VERSION 0x200 (FMC_LOTUS).
   UART_BASE      = 0x12040000
   UART_CLOCK     = 24000000
   LOAD_ADDR      = 0x40706000
   FLASH_MEM      = 0x14000000
-  FMC_BASE       = 0x10000000
+  FMC_BASE       = 0x10000010
+  FMC_LOTUS      = 1
   RAM_BASE       = 0x40000000
   WDT_BASE       = 0x12030000
   CRG_BASE       = 0x12010000
@@ -270,6 +273,7 @@ CFLAGS = -mcpu=$(CPU_TYPE) -marm -O2 -ffreestanding -nostdlib \
          $(if $(UART_CKSEL_REG),-DUART_CKSEL_REG=$(UART_CKSEL_REG) -DUART_CKSEL_BIT=$(UART_CKSEL_BIT)) \
          $(if $(FMC_CRG_OFFSET),-DFMC_CRG_OFFSET=$(FMC_CRG_OFFSET)) \
          $(if $(FMC_CRG_CLK_BIT),-DFMC_CRG_CLK_BIT=$(FMC_CRG_CLK_BIT)) \
+         $(if $(FMC_LOTUS),-DFMC_REGS_LOTUS=1) \
          $(if $(SPI_PIN_BASE),-DSPI_PIN_BASE=$(SPI_PIN_BASE)) \
          $(if $(SPI_PINS_CV6XX),-DSPI_PINS_CV6XX=1) \
          $(if $(SPI_PINS_SKIP),-DSPI_PINS_SKIP=1) \
