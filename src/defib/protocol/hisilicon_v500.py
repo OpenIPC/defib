@@ -34,11 +34,12 @@ V500_SOCS = frozenset([
     "xm7205v500", "xm7205v510", "xm7205v530",
     # GK7206 (4K-class Goke) shares the V500 UART bootrom protocol — verified on
     # hardware 2026-11-19: the ROM answered the V500 handshake with chip id
-    # 0x72060110. Recover with `burn -f <board's own u-boot>`: there is no
-    # published OpenIPC donor, and its aux/DDR-init area differs from gk7205v5x0,
-    # so the agent path (V500_AGENT_LOAD_ADDR is gk7205v500-specific) is not wired
-    # up for it yet. The board's own boot image sits at flash offset 0 (aux_len at
-    # 0x400); slice [0:total_boot_len@0x408] and pass it as the donor.
+    # 0x72060110. Its boot image has a different key/aux layout from gk7205v5x0
+    # (key 0x2800 vs 0x2000, boot code at file 0x6000 vs 0x7000); the layout is
+    # now derived from the header (v500_image_layout), so the agent path works
+    # with the board's own boot partition as the donor (there is no published
+    # OpenIPC donor). The HEAD/aux send-framing for gk7206 still needs an
+    # on-hardware confirm against the ROM's "Verify key" check.
     "gk7206",
 ])
 
@@ -67,52 +68,97 @@ MAX_NAK_RETRIES = 10
 BOOT_LOAD_ADDR = 0x41000000
 
 
-# V500 boot image layout (u-boot-xmedia include/configs/xm72050500.h):
-#   0x0000  key area (8 KiB; RSA key fields, zero when unsigned)
-#   0x0400  params: aux-area length, boot-code length, total boot length
-#           (= code + 0x200 tail), aux/boot encryption flags, boot entry
-#   0x2000  aux area (DDR init/training code), aux-area-length bytes
-#   then    boot code
-# After a UART download the bootrom runs the boot code in place, at
-# BOOT_LOAD_ADDR + its file offset; the entry field in the params is not
-# used on this path (a probe placed there reported pc=0x41007000, not the
-# 0x40707000 the field holds).
-V500_KEY_AREA_LEN = 0x2000
+# V500 boot image layout (two members decoded byte-for-byte from stock flash:
+# gk7205v510 and gk7206):
+#   0x0000  key/HEAD area: XIP branch, then the params + reg-init table + a
+#           cleartext DDR-profile name. RSA key fields live here on signed
+#           parts and are zero when unsigned; neither member carries a
+#           high-entropy block, so "Verify key fail" is a plaintext-header
+#           check, not a signature check.
+#   0x0400  params: [0]=aux-area length, [1]=boot-code length,
+#           [2]=total boot length (= code + 0x200 tail), ...,
+#           [5]=entry = V500_IMAGE_BASE + boot-code file offset.
+#   aux_off aux area (DDR init/training code), aux-area-length bytes.
+#   boot_off boot code.
+# The key-area length is NOT a constant: gk7205v5x0 carries 0x2000, gk7206
+# 0x2800.  Derive the boundaries from the header instead of assuming a fixed
+# key area:
+#   boot_off = entry - V500_IMAGE_BASE   (0x7000 on v510, 0x6000 on gk7206)
+#   aux_off  = boot_off - aux_len        (0x2000 on v510, 0x2800 on gk7206)
+# After a UART download the bootrom runs the boot code in place at
+# BOOT_LOAD_ADDR + boot_off; the entry field's absolute value is not used on
+# this path (a probe reported pc=0x41007000, not the 0x40707000 it holds) —
+# only its low bits, the boot-code file offset, matter.
+V500_IMAGE_BASE = 0x40700000
 V500_AUX_AREA_LEN_OFF = 0x400
 V500_BOOT_CODE_LEN_OFF = 0x404
 V500_TOTAL_BOOT_LEN_OFF = 0x408
+V500_ENTRY_OFF = 0x414
 V500_BOOT_TAIL_LEN = 0x200
 V500_BOOT_CODE_ALIGN = 0x400
-# Where agent/Makefile links the gk7205v500 agent: BOOT_LOAD_ADDR + key area
-# + the 20 KiB aux area every published V500 U-Boot carries.
-V500_AGENT_LOAD_ADDR = 0x41007000
+
+# Agent link address per family member (see agent/Makefile): BOOT_LOAD_ADDR +
+# boot_off.  boot_off is a property of that member's stock boot image (its aux
+# area differs in length), so the agent MUST be built for the matching address;
+# wrap_v500_payload rejects a donor whose layout puts the boot code elsewhere.
+#   gk7205v5x0 aux 0x5000 -> boot_off 0x7000 -> 0x41007000
+#   gk7206     aux 0x3800 -> boot_off 0x6000 -> 0x41006000
+V500_AGENT_LOAD_ADDR = {
+    "v500": 0x41007000,
+    "v510": 0x41007000,
+    "v530": 0x41007000,
+    "7206": 0x41006000,
+}
+
+
+def v500_image_layout(image: bytes) -> tuple[int, int, int]:
+    """``(aux_off, aux_len, boot_off)`` for a V500 boot image, from its header.
+
+    The boundaries are read from the header, not assumed: the key/HEAD area is
+    0x2000 bytes on gk7205v5x0 but 0x2800 on gk7206, so a fixed key-area size
+    would place the aux and boot code wrongly on one of them.
+    """
+    if len(image) < V500_ENTRY_OFF + 4:
+        raise ValueError("image is too short to be a V500 boot image")
+    aux_len = struct.unpack_from("<I", image, V500_AUX_AREA_LEN_OFF)[0]
+    entry = struct.unpack_from("<I", image, V500_ENTRY_OFF)[0]
+    boot_off = entry - V500_IMAGE_BASE
+    aux_off = boot_off - aux_len
+    if (aux_len == 0 or aux_len % V500_BOOT_CODE_ALIGN
+            or boot_off <= 0 or boot_off % V500_BOOT_CODE_ALIGN):
+        raise ValueError(
+            f"V500 header is not plausible: aux-area length 0x{aux_len:x}, "
+            f"entry 0x{entry:08x} -> boot offset 0x{boot_off:x}"
+        )
+    if not 0 < aux_off < boot_off <= len(image):
+        raise ValueError(
+            f"V500 header is not plausible: aux offset 0x{aux_off:x}, boot "
+            f"offset 0x{boot_off:x}, image 0x{len(image):x} bytes"
+        )
+    return aux_off, aux_len, boot_off
 
 
 def wrap_v500_payload(donor: bytes, payload: bytes, load_addr: int) -> bytes:
     """Put ``payload`` in the boot-code area of a V500 boot image.
 
-    ``donor`` is a complete V500 U-Boot image (e.g. OpenIPC's
-    ``u-boot-gk7205v500-nor.bin``). Its key area, params and aux (DDR init)
-    area are kept verbatim; its boot code is replaced by ``payload`` and the
-    two length fields are patched to match. The bootrom runs the boot code
-    in place, so ``payload`` must be linked at BOOT_LOAD_ADDR plus the
-    donor's boot-code offset; ``load_addr`` is checked against that to catch
-    a mismatch before it turns into a silent hang on the board.
+    ``donor`` is a complete V500 boot image (OpenIPC's
+    ``u-boot-gk7205v510-nor.bin``, or the board's own boot partition — the
+    gk7206 has no published donor, so its own flash is used). Its key/HEAD
+    area, params and aux (DDR init) area are kept verbatim; its boot code is
+    replaced by ``payload`` and the two length fields are patched to match.
+    The bootrom runs the boot code in place, so ``payload`` must be linked at
+    BOOT_LOAD_ADDR plus the donor's boot-code offset; ``load_addr`` is checked
+    against that to catch a mismatch before it turns into a silent hang.
     """
-    if len(donor) < V500_TOTAL_BOOT_LEN_OFF + 4:
-        raise ValueError("donor is too short to be a V500 boot image")
-    aux_len = struct.unpack_from("<I", donor, V500_AUX_AREA_LEN_OFF)[0]
-    code_pos = V500_KEY_AREA_LEN + aux_len
-    if aux_len == 0 or aux_len % V500_BOOT_CODE_ALIGN or code_pos > len(donor):
-        raise ValueError(f"donor aux-area length 0x{aux_len:x} is not plausible")
-    if BOOT_LOAD_ADDR + code_pos != load_addr:
+    aux_off, aux_len, boot_off = v500_image_layout(donor)
+    if BOOT_LOAD_ADDR + boot_off != load_addr:
         raise ValueError(
-            f"donor boot code runs at 0x{BOOT_LOAD_ADDR + code_pos:08x}, but the "
+            f"donor boot code runs at 0x{BOOT_LOAD_ADDR + boot_off:08x}, but the "
             f"payload is linked at 0x{load_addr:08x}"
         )
     code = bytearray(payload)
     code += b"\x00" * (-len(code) % V500_BOOT_CODE_ALIGN)
-    image = bytearray(donor[:code_pos]) + code + b"\x00" * V500_BOOT_TAIL_LEN
+    image = bytearray(donor[:boot_off]) + code + b"\x00" * V500_BOOT_TAIL_LEN
     struct.pack_into("<I", image, V500_BOOT_CODE_LEN_OFF, len(code))
     struct.pack_into("<I", image, V500_TOTAL_BOOT_LEN_OFF, len(code) + V500_BOOT_TAIL_LEN)
     return bytes(image)
@@ -298,13 +344,20 @@ class HiSiliconV500(BootProtocol):
     ) -> RecoveryResult:
         stages: list[Stage] = []
 
-        # HEAD area: first 8KB
-        head_area_len = 8192
-        head_area_data = firmware[0:head_area_len]
-        head_area_addr = 0
+        # The key/HEAD and aux boundaries come from the header: the key area is
+        # 0x2000 on gk7205v5x0 but 0x2800 on gk7206, so a fixed 8 KiB HEAD would
+        # truncate the key area and misplace the aux on the gk7206.
+        try:
+            aux_off, aux_len, _boot_off = v500_image_layout(firmware)
+        except ValueError as e:
+            return RecoveryResult(
+                success=False, stages_completed=stages,
+                error=f"Not a V500 boot image: {e}",
+            )
 
+        # HEAD area: the key/HEAD block, up to the aux area.
         if not await self._send_data_to_bootrom(
-            transport, head_area_data, head_area_addr,
+            transport, firmware[0:aux_off], 0,
             Stage.HEAD_AREA, on_progress,
         ):
             return RecoveryResult(
@@ -313,13 +366,11 @@ class HiSiliconV500(BootProtocol):
             )
         stages.append(Stage.HEAD_AREA)
 
-        # AUX area: size read from offset 1024 (4B LE)
-        aux_offset = 8192
-        aux_len = struct.unpack("<I", firmware[1024:1028])[0]
-        aux_data = firmware[aux_offset:aux_offset + aux_len]
+        # AUX area: DDR-init code the bootrom runs before loading the boot code.
+        aux_data = firmware[aux_off:aux_off + aux_len]
 
         if not await self._send_data_to_bootrom(
-            transport, aux_data, aux_offset,
+            transport, aux_data, aux_off,
             Stage.AUX_AREA, on_progress,
         ):
             return RecoveryResult(

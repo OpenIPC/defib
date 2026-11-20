@@ -165,6 +165,7 @@ _CHIP_TO_AGENT = {
     "gk7205v500": "gk7205v500",
     "gk7205v510": "gk7205v500",    # V500 family, same memory map
     "gk7205v530": "gk7205v500",
+    "gk7206": "gk7206",            # V500 protocol, but key/aux layout differs
 }
 
 

@@ -20,8 +20,10 @@ from defib.transport.mock import MockTransport
 
 
 def _write_donor(tmp_path: Path) -> Path:
+    # gk7205v5x0-shaped: aux 0x5000, entry 0x40707000 -> boot code at 0x7000.
     image = bytearray(b"\xa5" * (0x7000 + 0x800 + 0x200))
-    struct.pack_into("<3I", image, 0x400, 0x5000, 0x800, 0xa00)
+    struct.pack_into("<6I", image, 0x400, 0x5000, 0x800, 0xa00,
+                     0x12345678, 0x12345678, 0x40707000)
     path = tmp_path / "donor.bin"
     path.write_bytes(bytes(image))
     return path

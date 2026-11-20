@@ -1548,10 +1548,14 @@ async def _agent_upload_v500(
             console.print(f"[red]{message}[/red]")
         raise typer.Exit(1)
 
+    load_addr = V500_AGENT_LOAD_ADDR.get(v500_member(chip) or "")
+    if load_addr is None:
+        fail(f"No V500 agent load address is known for '{chip}'.")
+
     try:
         donor_file = Path(donor_path) if donor_path else download_v500_donor(chip)
         wrapped = wrap_v500_payload(
-            donor_file.read_bytes(), agent_data, V500_AGENT_LOAD_ADDR,
+            donor_file.read_bytes(), agent_data, load_addr,
         )
     except (OSError, ValueError, ConnectionError) as e:
         fail(f"Cannot build the V500 boot image: {e}")
