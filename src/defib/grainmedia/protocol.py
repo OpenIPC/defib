@@ -183,6 +183,6 @@ def check_inquiry(data: bytes) -> str:
     if len(data) < INQUIRY_LENGTH or not data.startswith(INQUIRY_PREFIX):
         raise GrainMediaError("the device does not identify itself as a Grain Media updater")
     product = data[16:32].decode("ascii", "replace").strip("\0 ")
-    if product.startswith("GM") and product != "GM8126":
-        raise GrainMediaError(f"the device is a {product}, not a GM8126")
+    if product != "GM8126":
+        raise GrainMediaError(f"the device says it is {product!r}, not a GM8126")
     return product

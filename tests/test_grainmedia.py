@@ -189,7 +189,7 @@ class TestBootImage:
         (b"\xff" * 0x40000, "no GM8126 system header"),
         (boot_image()[:0x2000], "ends inside"),
         (boot_image()[:0x1000] + b"\0" * 0x8000, "nsboot image header"),
-    ])
+    ], ids=["empty", "erased", "truncated", "no-nsboot"])
     def test_bad(self, image, match):
         with pytest.raises(p.GrainMediaError, match=match):
             p.validate_boot_image(image)
@@ -199,7 +199,7 @@ class TestRecovery:
     async def test_identify(self):
         assert await GrainMediaRecovery(FakeUpdater()).identify() == "GM8126"
 
-    @pytest.mark.parametrize("product", [b"GM8136", b"GM8180"])
+    @pytest.mark.parametrize("product", [b"GM8136", b"Camera"])
     async def test_another_soc_is_refused(self, product):
         fake = FakeUpdater()
         fake.inquiry = fake.inquiry.replace(b"GM8126", product)
@@ -221,6 +221,12 @@ class TestRecovery:
     @pytest.mark.parametrize("size", [4 * MIB, 8 * MIB, 16 * MIB])
     async def test_size_from_the_wrap(self, size):
         assert await GrainMediaRecovery(FakeUpdater(size, chip_image(size))).detect_size() == size
+
+    async def test_a_second_boot_loader_is_not_the_end(self):
+        image = bytearray(chip_image(16 * MIB))
+        image[8 * MIB:8 * MIB + 0x40000] = image[:0x40000]
+        recovery = GrainMediaRecovery(FakeUpdater(16 * MIB, bytes(image)))
+        assert await recovery.detect_size() == 16 * MIB
 
     async def test_an_erased_chip_has_no_size(self):
         assert await GrainMediaRecovery(FakeUpdater()).detect_size() is None
@@ -360,7 +366,7 @@ class TestCommands:
         ({"stages": ("kernel",), "wipe_env": True}, "needs the env stage"),
         ({"skip_stages": ("rootfs-data",), "wipe_rootfs_data": True}, "rootfs-data stage"),
         ({"nor_size": 4}, "more than"),
-        ({"nor_size": 16}, "repeats"),
+        ({"nor_size": 16}, "chip, not"),
         ({"nor_size": 32}, "16 MiB"),
     ])
     async def test_install_refusals_write_nothing(self, board, tmp_path, kw, match):
@@ -416,6 +422,41 @@ class TestCommands:
         with pytest.raises(p.GrainMediaError, match="and the flash"):
             await self.restore(tmp_path / "in.bin")
         assert not [e for e in board.log if e[0] != "geometry"]
+
+    async def test_size_below_the_chip_is_refused(self, board, tmp_path):
+        board.size = 16 * MIB
+        board.flash[:] = chip_image(16 * MIB)
+        with pytest.raises(p.GrainMediaError, match="chip, not"):
+            await cli.install(self.request(tmp_path, nor_size=8))
+        assert not list(tmp_path.glob("gm8126-backup-*"))
+
+    async def test_failed_backup_leaves_no_file(self, board, tmp_path, monkeypatch):
+        async def fail(*_: object) -> int:
+            raise device.GrainMediaUsbError("unplugged")
+
+        monkeypatch.setattr(GrainMediaRecovery, "dump", fail)
+        with pytest.raises(p.GrainMediaError, match="unplugged"):
+            await cli.install(self.request(tmp_path))
+        assert not list(tmp_path.glob("gm8126-backup-*"))
+        assert not [e for e in board.log if e[0] != "geometry"]
+
+    def test_reserved_names_differ(self, board, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli.time, "strftime", lambda _: "now")
+        assert len({cli._reserve_backup("gm8126") for _ in range(3)}) == 3
+
+    def test_power_errors_are_reported(self, board, tmp_path, monkeypatch):
+        from typer.testing import CliRunner
+
+        from defib.cli.app import app
+        from defib.power.base import PowerControllerError
+
+        def broken() -> None:
+            raise PowerControllerError("no such controller")
+
+        monkeypatch.setattr("defib.power.factory.power_controller_from_env", broken)
+        result = CliRunner().invoke(app, ["dump-flash", "-c", "gm8126", "--power-cycle",
+                                          "--output-mode", "json"])
+        assert result.exit_code == 1 and "no such controller" in result.output
 
     async def test_backups_never_replace_each_other(self, board, tmp_path):
         (tmp_path / "in.bin").write_bytes(bytes(board.flash))

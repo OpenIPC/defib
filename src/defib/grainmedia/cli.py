@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -69,14 +70,18 @@ async def open_target(
 ) -> AsyncIterator[GrainMediaRecovery]:
     """Catch the board, check what it is and set it up for reading."""
     if power_cycle:
+        from defib.power.base import PowerControllerError
         from defib.power.factory import power_controller_from_env
 
-        controller = power_controller_from_env()
-        report.log(f"Power-cycling via {controller.name()}...")
         try:
-            await controller.power_cycle(poe_port)
-        finally:
-            await controller.close()
+            controller = power_controller_from_env()
+            report.log(f"Power-cycling via {controller.name()}...")
+            try:
+                await controller.power_cycle(poe_port)
+            finally:
+                await controller.close()
+        except PowerControllerError as e:
+            raise GrainMediaError(f"power cycle failed: {e}") from e
     found = await wait_for_device(
         load_profile(chip).usb_recovery_ids, timeout=wait, usb_path=usb_path or None
     )
@@ -120,9 +125,9 @@ async def resolve_size(recovery: GrainMediaRecovery, size: int, report: Reporter
             "give it (--size on dump-flash, --nor-size on install; "
             "restore takes it from the dump)"
         )
-    if size and detected and size > detected:
+    if size and detected and size != detected:
         raise GrainMediaError(
-            f"the flash repeats after {detected:#x} bytes, so it is not {size:#x}"
+            f"the flash contents show a {detected:#x}-byte chip, not {size:#x}"
         )
     chosen = size or detected
     assert chosen is not None
@@ -134,9 +139,9 @@ async def _dump_to(
     recovery: GrainMediaRecovery, target: Path, offset: int, length: int, report: Reporter
 ) -> int:
     """Stream to a file beside the target, and move it there when complete."""
-    tmp = target.with_name(target.name + ".partial")
+    tmp = target.with_name(f"{target.name}.{secrets.token_hex(4)}.partial")
     try:
-        with tmp.open("wb") as fh:
+        with tmp.open("xb") as fh:
             written = await recovery.dump(offset, length, fh.write, report.progress)
         tmp.replace(target)
     finally:
@@ -169,21 +174,37 @@ async def dump_flash(
     report.done(f"Dumped {written} bytes to {output_file}", file=output_file, bytes=written)
 
 
+def _reserve_backup(chip: str) -> Path:
+    """Create an empty file under a name no other run has or will get.
+
+    A second attempt must not replace the backup that still holds the factory
+    contents, and neither may a run on another port in the same second.
+    """
+    stem = f"{chip.split(':')[0]}-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+    number = 1
+    while True:
+        path = Path(f"{stem}.bin" if number == 1 else f"{stem}_{number}.bin")
+        try:
+            path.touch(exist_ok=False)
+        except FileExistsError:
+            number += 1
+            continue
+        return path
+
+
 async def _backup_and_write(
     chip: str, recovery: GrainMediaRecovery, segments: list[Segment],
     flash_size: int, report: Reporter,
 ) -> Path:
     check_segments(segments, flash_size)
-    # A name of its own every time: a second attempt must not replace the
-    # backup that still holds the factory contents.
-    backup = Path(f"{chip.split(':')[0]}-backup-{time.strftime('%Y%m%d-%H%M%S')}.bin")
-    number = 1
-    while backup.exists():
-        number += 1
-        backup = backup.with_name(f"{backup.stem.split('_')[0]}_{number}.bin")
+    backup = _reserve_backup(chip)
     report.log(f"Backing up the flash to {backup} (may hold Wi-Fi keys and other secrets)")
-    await recovery.probe_read()
-    await _dump_to(recovery, backup, 0, flash_size, report)
+    try:
+        await recovery.probe_read()
+        await _dump_to(recovery, backup, 0, flash_size, report)
+    except BaseException:
+        backup.unlink(missing_ok=True)  # still the empty reservation
+        raise
     for segment in segments:
         report.log(f"{segment.name}: {segment.offset:#x}..{segment.end:#x}")
     try:

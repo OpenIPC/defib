@@ -13,7 +13,7 @@ from defib.grainmedia.recovery import Segment
 from defib.install.firmware import SQUASHFS_MAGIC, UIMAGE_MAGIC, FirmwareBundle
 from defib.profiles.schema import SoCProfile
 
-#: Stages that need nothing from the firmware archive.
+#: Stages that need the firmware archive.
 FIRMWARE_STAGES = frozenset({"kernel", "rootfs"})
 
 

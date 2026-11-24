@@ -144,16 +144,25 @@ class GrainMediaRecovery:
 
         The updater has no command that returns the JEDEC id. A chip smaller
         than 16 MiB ignores the high address bits, so its start shows up again
-        at its size. A start without variety (an erased chip) proves nothing,
-        and neither does a match of it.
+        at its size. Everything below a candidate size must repeat, not just
+        block 0: a second copy of the boot loader is not the end of the chip.
+        A start without variety (an erased chip) proves nothing.
         """
         start = await self.read(0, p.ERASE_SIZE)
         if len(set(start)) < 16:
             return None
         for size in SIZES:
-            if await self.read(size, p.ERASE_SIZE) == start:
+            if await self._repeats_at(size, start):
                 return size
         return p.MAX_FLASH_SIZE
+
+    async def _repeats_at(self, size: int, start: bytes) -> bool:
+        if await self.read(size, p.ERASE_SIZE) != start:
+            return False
+        for at in range(p.ERASE_SIZE, size, p.ERASE_SIZE):
+            if await self.read(at, p.ERASE_SIZE) != await self.read(size + at, p.ERASE_SIZE):
+                return False
+        return True
 
     async def dump(
         self,
