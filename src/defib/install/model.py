@@ -82,3 +82,5 @@ class InstallRequest:
     tftp_via: str = "auto"
     output: str = "human"
     debug: bool = False
+    usb_path: str = ""
+    usb_wait: float = 30.0

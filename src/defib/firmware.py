@@ -77,6 +77,7 @@ PER_FLASH_TYPE_UBOOT: frozenset[str] = frozenset({
     "gk7202v300", "gk7205v200", "gk7205v300", "gk7605v100",
     "gk7201v200",
     "hi3516cv300", "hi3516ev100",
+    "gm8126",
 }) | CLASSIC_SPLIT_SOCS
 
 # Of those, the SoCs whose NAND keeps the older layout (boot, env, kernel,
@@ -88,7 +89,7 @@ LEGACY_NAND_UBOOT: frozenset[str] = frozenset({
 
 # Of those, the SoCs with no NAND build published: asking for one finds none.
 NOR_ONLY_UBOOT: frozenset[str] = frozenset({
-    "hi3516ev100",
+    "hi3516ev100", "gm8126",
     "hi3516cv100", "hi3516cv200", "hi3518cv100", "hi3518ev100", "hi3519v101",
 })
 

@@ -20,7 +20,8 @@ boot ROM before any OS exists. Two recovery families, selected per chip by the
 - **`usb`** — Rockchip SoCs (`rv1106` today). The boot ROM has *no* UART download
   path at all: recovery is USB-only, via MaskROM vendor control transfers that
   push a DDR blob and a "usbplug" into SRAM, after which the board speaks a
-  USB-MSC-shaped bulk protocol. See `src/defib/rockusb/__init__.py`.
+  USB-MSC-shaped bulk protocol. See `src/defib/rockusb/__init__.py`. Also Grain
+  Media `gm8126`, another protocol (`USB_FAMILY: "grainmedia"`).
 
 Python 3.11+ async codebase (~15k LOC under `src/`) plus a bare-metal ARM32 C
 flash agent (~4k LOC in `agent/`).
@@ -118,6 +119,17 @@ enumeration, MASKROM vs LOADER mode), `loader.py` (RKBOOT containers), `codec.py
 (RK CRC16 + RC4), `recovery.py` (`RockchipRecovery`). Reached through
 `--ddr`/`--usbplug` (or `--loader`) and `--usb-path` on `burn` and `install`;
 the loader blobs are vendor rkbin files the user supplies, not bundled.
+
+### Grain Media USB recovery (`src/defib/grainmedia/`)
+
+GM8126's updater: mass-storage wrappers around vendor `F0 xx` commands that
+read, erase and program SPI NOR directly, with no loader. `protocol.py` (CDBs,
+word order, header checks), `device.py` (pyusb), `recovery.py`
+(`GrainMediaRecovery`), `images.py` (layout), `cli.py` (what `dump-flash`,
+`install` and `restore` call). Dumps and images are in flash order; words are
+swapped at the USB edge only. Page 0 is erased first and programmed last, and
+nothing is written that cannot be read back. Known from static analysis only:
+**not tried on hardware**.
 
 ### Flash agent (`agent/`)
 
@@ -339,7 +351,8 @@ regression (#121).
    - `RECOVERY: "usb"` supplies none of those, and instead needs
      `USB_RECOVERY_IDS` (product ids seen *only* in recovery mode — a booted
      Luckfox shows `2207:0019` and must not match), `LOADER_DDR`,
-     `LOADER_USBPLUG`, `PARTITIONS`. See `rv1106.json`.
+     `LOADER_USBPLUG`, `PARTITIONS`. See `rv1106.json`. With
+     `USB_FAMILY: "grainmedia"` the loaders do not apply; see `gm8126.json`.
    - A file containing only another profile's filename is an alias.
    - **Exception:** chips in the V500 or CV6xx families must *not* get a profile
      JSON. They are listed in frozensets in their protocol class, and a profile

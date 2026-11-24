@@ -52,6 +52,35 @@ defib network -f firmware.bin --nic eth0
 defib burn -c gk7205v200 -f u-boot.bin --output json
 ```
 
+## Grain Media GM8126
+
+**Untested on hardware.** Recovery is over USB, through the updater the SoC
+starts by itself when flash has no valid header (or when the boot straps say
+USB). The camera's USB port must be wired as a device. It takes SPI NOR up to
+16 MiB; nothing is uploaded and no vendor file is needed.
+
+```bash
+pip install 'defib[grainmedia]'
+defib dump-flash -c gm8126 -o backup.bin
+defib install -c gm8126 --firmware openipc.gm8126-nor-lite.tgz --uboot u-boot-gm8126-nor.bin
+defib restore -c gm8126 -i backup.bin
+```
+
+`install` and `restore` first save the whole flash to
+`gm8126-backup-<time>.bin` in the current directory, and refuse to write if
+the updater does not read flash back. The backup may hold Wi-Fi keys. The
+flash header is written last, so an interrupted run leaves a camera that
+enters the updater again. `install` keeps the environment and `rootfs_data`
+unless `--wipe-env` / `--wipe-rootfs-data` is given. An erased chip needs its
+size: `--nor-size 8`, or `--size 8MB` on `dump-flash`. There is no reset
+command: power-cycle the camera at the end. `burn` has no equivalent here.
+
+Dumps are in flash order, as a programmer clip reads them. One read through
+the vendor's U-Boot has every 32-bit word reversed, and `restore` refuses it.
+
+Linux needs root or a udev rule for `1233:5677`; Windows needs the WinUSB
+driver on that device.
+
 ## Novatek
 
 NT98560/561/562/566, NT98321/323 and NT98532/533 get OpenIPC U-Boot started
