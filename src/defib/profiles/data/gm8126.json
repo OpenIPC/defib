@@ -1,0 +1,12 @@
+{
+  "name": "gm8126",
+  "RECOVERY": "usb",
+  "USB_FAMILY": "grainmedia",
+  "USB_RECOVERY_IDS": [22135],
+  "PARTITIONS": {
+    "boot":   {"lba": 0,    "sectors": 512},
+    "env":    {"lba": 512,  "sectors": 128},
+    "kernel": {"lba": 640,  "sectors": 4096},
+    "rootfs": {"lba": 4736, "sectors": 10240}
+  }
+}

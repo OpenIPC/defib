@@ -46,6 +46,14 @@ class SoCProfile(BaseModel):
             "the loader blobs are named by LOADER_* instead."
         ),
     )
+    usb_family: Literal["rockusb", "grainmedia"] = Field(
+        default="rockusb", alias="USB_FAMILY",
+        description=(
+            "USB recovery only. Which protocol the recovery device speaks: "
+            "Rockchip's MaskROM and usbplug, or Grain Media's updater, which "
+            "needs no loader."
+        ),
+    )
     prestep0: list[int] | None = Field(
         default=None, alias="PRESTEP0",
         description="Pre-DDR init bytecode (sent before DDRSTEP0)",
@@ -152,6 +160,16 @@ class SoCProfile(BaseModel):
                 raise ValueError(
                     f"profile '{self.name}' uses UART recovery but is missing "
                     f"{', '.join(missing)}"
+                )
+        elif self.usb_family == "grainmedia":
+            if not self.usb_recovery_ids:
+                raise ValueError(
+                    f"profile '{self.name}' is grainmedia but has no USB_RECOVERY_IDS"
+                )
+            wanted = {"boot", "env", "kernel", "rootfs"}
+            if not wanted <= self.partitions.keys():
+                raise ValueError(
+                    f"profile '{self.name}' needs the partitions {sorted(wanted)}"
                 )
         return self
 

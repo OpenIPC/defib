@@ -126,6 +126,11 @@ def recovery_mode(chip_name: str, profiles_dir: Path | None = None) -> str:
         return "uart"
 
 
+def usb_family(chip_name: str, profiles_dir: Path | None = None) -> str:
+    """The USB recovery protocol of a chip whose ``recovery_mode`` is ``usb``."""
+    return load_profile(chip_name, profiles_dir).usb_family
+
+
 def list_variants(chip_name: str, profiles_dir: Path | None = None) -> list[str]:
     """Return the list of board variants declared for ``chip_name``.
 

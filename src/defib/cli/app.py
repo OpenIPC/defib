@@ -162,6 +162,12 @@ async def _burn_async(
         logging.basicConfig(level=logging.INFO)
 
     if _recovery_mode_or_exit(chip, output) == "usb":
+        if _is_grainmedia(chip):
+            _usb_fail(
+                output,
+                f"{chip} has no RAM boot over USB: its updater only reads and writes flash. "
+                "Use `defib install` or `defib restore`.",
+            )
         await _burn_usb_async(
             chip, ddr, usbplug, loader, power_cycle, output, wait,
             poe_port_override, usb_path,
@@ -834,9 +840,9 @@ def dump_flash_cmd(
     For most chips this drives a U-Boot serial console, so U-Boot must
     already be running (connect first, or use after 'defib burn').
 
-    Chips whose boot ROM only answers on USB (Rockchip) are read directly
-    over USB instead — pass -c along with --ddr/--usbplug, and -p is not
-    consulted. Use --partition to pull a single named region rather than the
+    Chips whose boot ROM only answers on USB (Rockchip, GM8126) are read
+    directly over USB instead — pass -c, along with --ddr/--usbplug on
+    Rockchip, and -p is not consulted. Use --partition to pull a single named region rather than the
     whole device.
     """
     import asyncio
@@ -862,6 +868,14 @@ async def _dump_flash_async(
     console = Console()
 
     if chip and _recovery_mode_or_exit(chip, output) == "usb":
+        if _is_grainmedia(chip):
+            from defib.grainmedia.cli import dump_flash as grainmedia_dump
+
+            await _run_grainmedia(output, grainmedia_dump(
+                chip, output_file, size=size, partition=partition, wait=wait,
+                usb_path=usb_path, power_cycle=power_cycle, output=output,
+            ))
+            return
         await _dump_flash_usb_async(
             chip, output_file, partition, ddr, usbplug, loader,
             wait, usb_path, power_cycle, output,
@@ -2663,6 +2677,8 @@ def install(
              "192.168.1.1 — no host setup, requires DEFIB_POWER_TYPE=rack), "
              "'auto' (pod when power=rack, else host).",
     ),
+    usb_path: str = typer.Option("", "--usb-path", help="GM8126: pin to one physical USB port path (e.g. 1-4.2)"),
+    wait: float = typer.Option(30.0, "--wait", help="GM8126: seconds to wait for the board to enumerate"),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
 ) -> None:
@@ -2692,6 +2708,8 @@ def install(
         tftp_via=tftp_via,
         output=output,
         debug=debug,
+        usb_path=usb_path,
+        usb_wait=wait,
     )
     asyncio.run(run_install(request))
 
@@ -2717,6 +2735,8 @@ def restore(
              "no host setup, requires DEFIB_POWER_TYPE=rack), "
              "'auto' (pod when power=rack, else host).",
     ),
+    usb_path: str = typer.Option("", "--usb-path", help="GM8126: pin to one physical USB port path (e.g. 1-4.2)"),
+    wait: float = typer.Option(30.0, "--wait", help="GM8126: seconds to wait for the board to enumerate"),
     output: str = typer.Option("human", "--output", help="Output mode: human, json"),
     debug: bool = typer.Option(False, "-d", "--debug", help="Enable debug logging"),
 ) -> None:
@@ -2724,6 +2744,9 @@ def restore(
 
     Loads U-Boot to RAM via boot protocol, then uses TFTP to transfer
     partition data and U-Boot commands to write it to flash.
+
+    GM8126 is written over its USB updater instead: the input is one whole-chip
+    dump, and -p and the network options are not consulted.
 
     The input can be a directory of mtdN files (from a previous dump)
     or a single binary file to write to the entire flash.
@@ -2737,6 +2760,7 @@ def restore(
     asyncio.run(_restore_async(
         chip, dump, port, uboot, flash_type, mtdparts, host_ip, device_ip, nic,
         power_cycle, poe_port_override, tftp_via, output, debug,
+        usb_path, wait,
     ))
 
 
@@ -2744,12 +2768,22 @@ async def _restore_async(
     chip: str, dump: str, port: str, uboot_path: str, flash_type: str,
     mtdparts_arg: str, host_ip: str, device_ip: str, nic: str, power_cycle: bool,
     poe_port_override: str, tftp_via: str, output: str, debug: bool,
+    usb_path: str = "", wait: float = 30.0,
 ) -> None:
     import json as json_mod
     import logging
     from pathlib import Path
 
     from rich.console import Console
+
+    if _recovery_mode_or_exit(chip, output) == "usb" and _is_grainmedia(chip):
+        from defib.grainmedia.cli import restore as grainmedia_restore
+
+        await _run_grainmedia(output, grainmedia_restore(
+            chip, dump, wait=wait, usb_path=usb_path, power_cycle=power_cycle,
+            poe_port=poe_port_override, output=output,
+        ))
+        return
 
     from defib.flashdump import get_ram_staging_addr, send_command
     from defib.recovery.events import LogEvent, ProgressEvent
@@ -3466,6 +3500,22 @@ def _recovery_mode_or_exit(chip: str, output: str) -> str:
     except ValueError as e:
         _usb_fail(output, str(e))
         raise AssertionError("unreachable") from e  # pragma: no cover
+
+
+def _is_grainmedia(chip: str) -> bool:
+    from defib.profiles.loader import usb_family
+
+    return usb_family(chip) == "grainmedia"
+
+
+async def _run_grainmedia(output: str, operation: Coroutine[Any, Any, None]) -> None:
+    """Run one GM8126 operation, reporting its failures as the CLI does."""
+    from defib.grainmedia.protocol import GrainMediaError
+
+    try:
+        await operation
+    except (GrainMediaError, ValueError, OSError) as e:
+        _usb_fail(output, str(e))
 
 
 def _usb_progress_printer(output: str) -> Any:

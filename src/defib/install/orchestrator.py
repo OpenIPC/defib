@@ -9,6 +9,7 @@ module.
 
 from __future__ import annotations
 
+import tarfile
 from typing import NoReturn
 
 import typer
@@ -73,7 +74,7 @@ async def run_install(request: InstallRequest) -> None:
         MAX_BLOCKSIZE,
         start_tftp_server,
     )
-    from defib.profiles.loader import recovery_mode
+    from defib.profiles.loader import recovery_mode, usb_family
     from defib.recovery.events import LogEvent, ProgressEvent
     from defib.recovery.session import RecoverySession
     from defib.transport.base import TransportError, TransportTimeout
@@ -178,6 +179,15 @@ async def run_install(request: InstallRequest) -> None:
             mode = recovery_mode(chip)
         except ValueError as exc:
             fail(str(exc))
+        if mode == "usb" and usb_family(chip) == "grainmedia":
+            from defib.grainmedia.cli import install as grainmedia_install
+            from defib.grainmedia.protocol import GrainMediaError
+
+            try:
+                await grainmedia_install(request)
+            except (GrainMediaError, ValueError, OSError, tarfile.TarError) as exc:
+                fail(str(exc))
+            return
         if mode == "usb":
             fail(
                 f"{chip} recovers over USB, and `install` does not support "

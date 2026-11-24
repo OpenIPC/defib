@@ -285,7 +285,7 @@ class TestPerFlashTypeUBoot:
         "hi3516av300", "hi3516cv500", "hi3516dv300",
     )
     NOR_ONLY = ("hi3516ev100", "hi3516cv100", "hi3516cv200", "hi3518cv100",
-                "hi3518ev100", "hi3519v101")
+                "hi3518ev100", "hi3519v101", "gm8126")
     LEGACY_NAND = ("hi3516av100", "hi3516av200", "hi3516dv100", "hi3518ev200")
 
     def test_set_matches_the_published_socs(self):
