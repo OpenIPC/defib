@@ -276,3 +276,20 @@ async def test_chainloaded_stock_uboot_wipe_requires_uboot_stage(monkeypatch, tm
     assert exc_info.value.exit_code == 2
     assert not any(command.startswith("sf erase ") for command in commands)
     assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_nand_install_refused_for_boot_image_socs(monkeypatch, tmp_path):
+    """No NAND layout is wired up for the signed-boot-image SoCs: refuse
+    before touching the device rather than write one their U-Boot cannot boot."""
+    import dataclasses
+
+    run_install, request, commands, _transport = await _prepare_generic_install(
+        monkeypatch, tmp_path
+    )
+
+    for chip in ("hi3519dv500:dmebpro", "hi3516cv610:00g"):
+        with pytest.raises(typer.Exit) as exc_info:
+            await run_install(dataclasses.replace(request(nand=True), chip=chip))
+        assert exc_info.value.exit_code == 2
+    assert commands == []

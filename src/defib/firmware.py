@@ -10,7 +10,8 @@ Two asset families are published, and which one applies depends on the SoC:
   flash type, because each build carries that flash type's partition layout.
 - SoCs booted from a signed boot image (hi3516cv608/cv610, hi3519dv500):
   ``boot-{chip}[-{variant}]-nor.bin`` — a composite image (GSL + DDR tables +
-  U-Boot) that the bootrom expects as a single blob.
+  U-Boot) that the bootrom expects as a single blob. hi3519dv500 also
+  publishes ``boot-{chip}-{variant}-nand.bin``, whose U-Boot drives SPI NAND.
 
 Caches downloads in a platform-appropriate directory to avoid re-downloading.
 """
@@ -27,6 +28,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from defib.protocol.novatek import NOVATEK_SOCS
+from defib.protocol.hisilicon_cv6xx import CV6XX_SOCS
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +162,11 @@ BOOT_IMAGE_VARIANTS: dict[str, tuple[str, ...]] = {
     # hi3516cv613 and hi3516dv500 have no published boot image yet.
 }
 
+# Boot-image SoCs that also publish a NAND build, boot-{chip}-{variant}-nand.bin
+# (OpenIPC/u-boot#184): its U-Boot has nand/ubi and the UBI layout. The others'
+# one image serves either flash for a RAM boot, so --nand still names it.
+BOOT_IMAGE_NAND: frozenset[str] = frozenset({"hi3519dv500"})
+
 # Classic SoCs normally use one universal U-Boot per chip. Some hardware
 # needs a different published U-Boot because its DDR cold-init data or memory
 # geometry is incompatible with the generic image. Device selectors map to the
@@ -262,6 +269,12 @@ def package_board(chip: str) -> str:
     return FIRMWARE_PACKAGE_BOARD.get(name, name)
 
 
+def is_boot_image_soc(chip: str) -> bool:
+    """True for SoCs recovered with a signed boot image (GSL + DDR + U-Boot),
+    the CV6xx-protocol ones, whether or not OpenIPC publishes one for them."""
+    return _strip_variant(chip).lower() in CV6XX_SOCS
+
+
 def supports_nor_split(chip: str) -> bool:
     """True for SoCs whose firmware and NOR U-Boot use the split NOR layout."""
     if _pinned_classic_variant(chip):
@@ -306,11 +319,12 @@ def asset_name(chip: str, flash_type: str | None = None) -> str | None:
 
     if name in BOOT_IMAGE_VARIANTS:
         variants = BOOT_IMAGE_VARIANTS[name]
+        flash = kind if name in BOOT_IMAGE_NAND else "nor"
         if not variants:
             # Only one image published; any variant suffix is not meaningful.
-            return f"boot-{name}-nor.bin"
+            return f"boot-{name}-{flash}.bin"
         if variant in variants:
-            return f"boot-{name}-{variant}-nor.bin"
+            return f"boot-{name}-{variant}-{flash}.bin"
         return None
 
     if name in AVAILABLE_FIRMWARE:
@@ -478,7 +492,12 @@ def get_cached_path(
     base, variant = _split_variant(chip)
     name = CHIP_TO_FIRMWARE.get(base, base)
     candidates: list[str | None] = [asset_name(chip, flash_type)]
-    if not uses_per_flash_type_uboot(chip) and not (
+    # The legacy universal entry is a NOR-era seed; a NAND request for a SoC
+    # that publishes a NAND boot image must not fall back to it.
+    nand_boot_image = (
+        normalize_flash_type(flash_type) == "nand" and name in BOOT_IMAGE_NAND
+    )
+    if not uses_per_flash_type_uboot(chip) and not nand_boot_image and not (
         variant is not None and name in CLASSIC_UBOOT_VARIANTS
     ):
         candidates.append(_legacy_cache_name(chip))

@@ -33,7 +33,7 @@ def burn(
     chip: str = typer.Option(..., "-c", "--chip", help="Chip model name"),
     file: str = typer.Option("", "-f", "--file", help="Firmware file (auto-downloads from OpenIPC if omitted)"),
     port: str = typer.Option("/dev/ttyUSB0", "-p", "--port", help="Serial device (/dev/ttyUSB0), tcp://host:port, rfc2217://host:port, or socket:///path"),
-    nand: bool = typer.Option(False, "--nand", help="Auto-download the NAND U-Boot build (u-boot-<chip>-nand.bin) for SoCs published per flash type; the NOR build is the default"),
+    nand: bool = typer.Option(False, "--nand", help="Auto-download the NAND U-Boot build (u-boot-<chip>-nand.bin, or boot-<chip>-<variant>-nand.bin for hi3519dv500) for SoCs published per flash type; the NOR build is the default"),
     send_break: bool = typer.Option(False, "-b", "--break", help="Send Ctrl-C after upload"),
     terminal: bool = typer.Option(False, "-t", "--terminal", help="Open serial terminal after upload"),
     power_cycle: bool = typer.Option(False, "--power-cycle", help="Auto power-cycle via the controller selected by DEFIB_POWER_TYPE (default routeros, needs DEFIB_POE_* env vars)"),

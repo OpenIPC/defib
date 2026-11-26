@@ -654,3 +654,48 @@ class TestCacheRevalidation:
         monkeypatch.setattr(firmware.urllib.request, "urlopen", broken)
         assert download_v500_donor("gk7205v500") == donor
         assert donor.read_bytes() == self.OLD
+
+
+class TestBootImageNand:
+    """hi3519dv500 publishes boot-<chip>-<variant>-nand.bin (OpenIPC/u-boot#184)."""
+
+    def test_dv500_nand_build(self):
+        assert asset_name("hi3519dv500:dmebpro", "nand") == "boot-hi3519dv500-dmebpro-nand.bin"
+        assert asset_name("hi3519dv500:dmeb", "nand") == "boot-hi3519dv500-dmeb-nand.bin"
+
+    def test_dv500_nor_stays_default(self):
+        assert asset_name("hi3519dv500:dmebpro") == "boot-hi3519dv500-dmebpro-nor.bin"
+        assert asset_name("hi3519dv500:dmebpro", "nor") == "boot-hi3519dv500-dmebpro-nor.bin"
+
+    def test_dv500_still_needs_a_variant(self):
+        assert asset_name("hi3519dv500", "nand") is None
+
+    def test_cv6xx_has_no_nand_build(self):
+        # One image per board serves a RAM boot on either flash.
+        assert asset_name("hi3516cv610:00g", "nand") == "boot-hi3516cv610-00g-nor.bin"
+        assert asset_name("hi3516cv608", "nand") == "boot-hi3516cv608-nor.bin"
+
+    def test_is_boot_image_soc(self):
+        from defib.firmware import is_boot_image_soc
+        for chip in ("hi3519dv500:dmebpro", "hi3516dv500", "hi3516cv610:00g", "hi3516cv613"):
+            assert is_boot_image_soc(chip), chip
+        for chip in ("hi3516ev300", "gk7205v300", "hi3518ev200"):
+            assert not is_boot_image_soc(chip), chip
+
+
+    def test_nand_lookup_ignores_legacy_universal_seed(self, tmp_path, monkeypatch):
+        """A u-boot-hi3519dv500-universal.bin seeded per #112 is a NOR boot
+        image: it still serves NOR, never a --nand request."""
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        # No network: the published NAND asset counts as unchanged.
+        monkeypatch.setattr("defib.firmware._remote_validators", lambda url: None)
+        seeded = get_cache_dir() / "u-boot-hi3519dv500-universal.bin"
+        seeded.write_bytes(b"nor boot image")
+
+        assert get_cached_path("hi3519dv500:dmebpro", "nor") == seeded
+        assert get_cached_path("hi3519dv500:dmebpro", "nand") is None
+
+        nand = get_cache_dir() / "boot-hi3519dv500-dmebpro-nand.bin"
+        nand.write_bytes(b"nand boot image")
+        assert get_cached_path("hi3519dv500:dmebpro", "nand") == nand
