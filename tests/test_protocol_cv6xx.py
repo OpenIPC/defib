@@ -358,10 +358,13 @@ class _SplRefusingUboot(MockTransport):
     every data frame -- what a Hi3519DV500 kit's SPL did with a boot image
     built for another board variant."""
 
-    def __init__(self, nak_first_data: bool = True) -> None:
+    def __init__(self, nak_first_data: bool = True, ack_copy: int = 0) -> None:
         super().__init__(flush_clears_buffer=False)
         self._heads = 0
         self._nak_first_data = nak_first_data
+        # 1-based copy of data frame 1 to ACK instead of NAK (0: none).
+        self._ack_copy = ack_copy
+        self._first_copies = 0
 
     async def write(self, data: bytes) -> None:
         await super().write(data)
@@ -371,14 +374,18 @@ class _SplRefusingUboot(MockTransport):
                 self.enqueue_rx(ACK_BYTE)
         elif self._heads == 3 and data[:1] == b"\xda":
             idx = data[1]
-            if self._nak_first_data or idx > 1:
+            if idx == 1:
+                self._first_copies += 1
+            if idx == 1 and self._first_copies == self._ack_copy:
+                self.enqueue_rx(ACK_BYTE)
+            elif self._nak_first_data or idx > 1:
                 self.enqueue_rx(b"U")
             else:
                 self.enqueue_rx(ACK_BYTE)
 
 
-def _refusing_transport(nak_first_data: bool = True) -> _SplRefusingUboot:
-    transport = _SplRefusingUboot(nak_first_data)
+def _refusing_transport(nak_first_data: bool = True, ack_copy: int = 0) -> _SplRefusingUboot:
+    transport = _SplRefusingUboot(nak_first_data, ack_copy)
     scripted = _transport_through_ddr_table(SPL_TRAINED)
     transport.enqueue_rx(bytes(scripted._rx_buffer))
     return transport
@@ -395,14 +402,44 @@ class TestCV6xxUbootRefused:
 
         assert not result.success
         assert "refused the U-Boot image" in result.error
-        assert "variant" in result.error
-        assert not result.retryable
+        assert "-c <chip>:<variant>" in result.error
+        # A NAK asks for the frame again; it is not proof, so the session
+        # keeps its retry.
+        assert result.retryable
         assert Stage.DDR_TRAINING in result.stages_completed
         assert Stage.UBOOT not in result.stages_completed
         # The header frame went out once and was retransmitted on each NAK.
         heads = [i for i, f in enumerate(transport.tx_log) if f[:4] == b"\xfe\x00\xff\x01"]
         after_uboot_head = transport.tx_log[heads[2] + 1:]
         assert [f[:2] for f in after_uboot_head] == [b"\xda\x01"] * 11
+
+    @pytest.mark.asyncio
+    async def test_an_ack_on_the_last_copy_is_taken(self):
+        """The answer to the final retransmission is read before giving up."""
+        transport = _refusing_transport(nak_first_data=True, ack_copy=11)
+        protocol = HiSiliconCV6xx(ddr_training_wait=1.0, ddr_training_timeout=0.5)
+        result = await protocol.send_firmware(transport, _build_cv6xx_firmware())
+
+        # Frame 1 went through; frame 2 is NAKed throughout, a later-frame
+        # failure, so the verdict is the generic one.
+        assert not result.success
+        assert result.error == "Failed to send U-Boot"
+
+    @pytest.mark.asyncio
+    async def test_flash_agent_upload_points_at_the_f_image(self):
+        """With uboot_override the header comes from the -f composite, so
+        changing -c would not help."""
+        firmware = _build_cv6xx_firmware()
+        transport = _refusing_transport()
+        protocol = HiSiliconCV6xx(ddr_training_wait=1.0, ddr_training_timeout=0.5)
+        override = parse_cv6xx_boot(firmware).uboot_data
+        result = await protocol.send_firmware(
+            transport, firmware, uboot_override=override,
+        )
+
+        assert "refused the U-Boot image" in result.error
+        assert "given with -f" in result.error
+        assert "-c <chip>" not in result.error
 
     @pytest.mark.asyncio
     async def test_a_later_frame_refused_stays_generic(self):

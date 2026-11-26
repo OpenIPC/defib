@@ -455,7 +455,7 @@ class HiSiliconCV6xx(BootProtocol):
         retries = 0
         start = time.monotonic()
 
-        while time.monotonic() - start < timeout and retries < FRAME_RETRIES:
+        while time.monotonic() - start < timeout:
             try:
                 response = await transport.read(1, timeout=timeout)
             except TransportTimeout:
@@ -464,11 +464,16 @@ class HiSiliconCV6xx(BootProtocol):
             if response == ACK_BYTE:
                 return True
             if response == NAK_BYTE:
+                # Every copy sent gets its answer read, the last one too: a
+                # frame is only refused once all 1 + FRAME_RETRIES copies
+                # have been NAKed.
+                if retries >= FRAME_RETRIES:
+                    self._last_frame_refused = True
+                    return False
                 await transport.write(data)
                 retries += 1
                 continue
 
-        self._last_frame_refused = retries >= FRAME_RETRIES
         return False
 
     async def _send_data_to_bootrom(
@@ -681,17 +686,31 @@ class HiSiliconCV6xx(BootProtocol):
                 # OpenIPC's boot-hi3519dv500-dmeb image: GSL, board ID and DDR
                 # training all pass, the SPL ACKs the U-Boot HEAD and NAKs data
                 # frame 1 -- the image header -- every time; the dmebpro image
-                # boots. Not retryable, like a rejected DDR table: the same
-                # file is refused after any power cycle.
+                # boots. A NAK only asks for the frame again, so this stays a
+                # diagnosis, not proof: the result keeps the session's one
+                # retry, and a wrong image is refused the same way again.
+                if uboot_override is not None:
+                    # Flash-agent upload: the header was copied from the
+                    # composite given with -f, so -c cannot change it.
+                    advice = (
+                        "the header it carries comes from the boot image "
+                        "given with -f, which is most likely for another "
+                        "board variant of the chip; pass that variant's "
+                        "boot image instead"
+                    )
+                else:
+                    advice = (
+                        "this boot image is most likely for another board "
+                        "variant of the chip; try another one "
+                        "(-c <chip>:<variant>)"
+                    )
                 return RecoveryResult(
-                    success=False, stages_completed=stages, retryable=False,
+                    success=False, stages_completed=stages,
                     error=(
                         "The SPL refused the U-Boot image: it took the "
                         "upload's HEAD frame, then NAKed the first data frame "
-                        "(the image header) on every retry. This boot image "
-                        "is for another board variant of the chip; try "
-                        "another one (-c <chip>:<variant>). The SPL boots "
-                        "from flash instead."
+                        "(the image header) on every retry. " + advice[0].upper()
+                        + advice[1:] + ". The SPL boots from flash instead."
                     ),
                 )
             return RecoveryResult(
