@@ -49,16 +49,30 @@ Run with -h to get usage info.
 class FakeProc:
     def __init__(self, output: str, returncode: int) -> None:
         self._output = output.encode()
-        self.returncode = returncode
+        self._exit = returncode
+        # None until communicate() finishes, like a real child still running.
+        self.returncode: int | None = None
+        self.killed = False
 
     async def communicate(self) -> tuple[bytes, None]:
+        self.returncode = self._exit
         return self._output, None
 
     def kill(self) -> None:
-        pass
+        self.killed = True
+        self.returncode = -9
 
     async def wait(self) -> int:
+        assert self.returncode is not None
         return self.returncode
+
+
+class HangingProc(FakeProc):
+    """A uhubctl that never finishes on its own."""
+
+    async def communicate(self) -> tuple[bytes, None]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
 
 
 class FakeUhubctl:
@@ -141,6 +155,57 @@ class TestSwitch:
             asyncio.run(_ctl().power_off(""))
 
 
+class TestStuckChild:
+    def _hang(self, monkeypatch: pytest.MonkeyPatch) -> HangingProc:
+        proc = HangingProc("", 0)
+
+        async def spawn(*argv: str, **kwargs: Any) -> FakeProc:
+            return proc
+
+        monkeypatch.setattr(uhubctl_mod.asyncio, "create_subprocess_exec", spawn)
+        return proc
+
+    def test_timeout_kills_child(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        proc = self._hang(monkeypatch)
+        with pytest.raises(PowerControllerError, match="timed out"):
+            asyncio.run(_ctl(timeout=0.05).power_off(""))
+        assert proc.killed
+
+    def test_cancel_kills_child(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        proc = self._hang(monkeypatch)
+
+        async def run() -> None:
+            task = asyncio.create_task(_ctl().power_off(""))
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(run())
+        assert proc.killed
+
+    def test_finished_child_not_killed(self, fake: FakeUhubctl,
+                                       monkeypatch: pytest.MonkeyPatch) -> None:
+        procs: list[FakeProc] = []
+
+        async def spawn(*argv: str, **kwargs: Any) -> FakeProc:
+            p = await fake(*argv, **kwargs)
+            procs.append(p)
+            return p
+
+        monkeypatch.setattr(uhubctl_mod.asyncio, "create_subprocess_exec", spawn)
+        asyncio.run(_ctl().power_off(""))
+        assert not procs[0].killed
+
+    def test_not_executable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def denied(*argv: str, **kwargs: Any) -> FakeProc:
+            raise PermissionError(13, "Permission denied", argv[0])
+
+        monkeypatch.setattr(uhubctl_mod.asyncio, "create_subprocess_exec", denied)
+        with pytest.raises(PowerControllerError, match="cannot run.*Permission denied"):
+            asyncio.run(_ctl().power_off(""))
+
+
 class TestFromEnv:
     @pytest.fixture(autouse=True)
     def _env(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -158,6 +223,13 @@ class TestFromEnv:
         assert ctl._location == "3-2.3"
         assert ctl._port == 3
         assert ctl._command == ["sudo", "uhubctl"]
+
+    def test_unbalanced_quote(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("DEFIB_UHUBCTL_LOCATION", "3-2.3")
+        monkeypatch.setenv("DEFIB_UHUBCTL_PORT", "3")
+        monkeypatch.setenv("DEFIB_UHUBCTL_COMMAND", "sudo 'uhubctl")
+        with pytest.raises(PowerControllerError, match="not a valid command"):
+            power_controller_from_env()
 
     def test_missing_location(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("DEFIB_UHUBCTL_PORT", "3")

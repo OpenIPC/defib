@@ -118,7 +118,15 @@ class UhubctlController(PowerController):
                 f"DEFIB_UHUBCTL_PORT must be 1 or more, got {port}"
             )
         command_env = os.environ.get("DEFIB_UHUBCTL_COMMAND", "").strip()
-        command = shlex.split(command_env) if command_env else None
+        try:
+            command = shlex.split(command_env) if command_env else None
+        except ValueError as e:
+            raise PowerControllerError(
+                f"DEFIB_UHUBCTL_COMMAND is not a valid command line "
+                f"({e}): {command_env!r}"
+            ) from None
+        if command == []:
+            command = None
         return cls(location=location, port=port, command=command)
 
     async def power_off(self, port: str) -> None:
@@ -170,14 +178,22 @@ class UhubctlController(PowerController):
                 f"uhubctl not found ({self._command[0]!r}); install it or set "
                 "DEFIB_UHUBCTL_COMMAND"
             ) from e
+        except OSError as e:
+            raise PowerControllerError(
+                f"cannot run {self._command[0]!r}: {e}"
+            ) from e
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), self._timeout)
         except asyncio.TimeoutError as e:
-            proc.kill()
-            await proc.wait()
             raise PowerControllerError(
                 f"uhubctl timed out after {self._timeout:g} s"
             ) from e
+        finally:
+            # On a timeout or a cancelled caller (Ctrl-C), uhubctl must not
+            # go on switching the port after we have stopped waiting for it.
+            if proc.returncode is None:
+                proc.kill()
+                await asyncio.shield(proc.wait())
         text = out.decode(errors="replace")
         if proc.returncode != 0:
             raise PowerControllerError(
