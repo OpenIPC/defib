@@ -60,6 +60,7 @@ async def run_install(request: InstallRequest) -> None:
 
     from defib.firmware import (
         download_firmware,
+        is_boot_image_soc,
         get_cached_path,
         has_firmware,
         pad_to_size,
@@ -155,6 +156,15 @@ async def run_install(request: InstallRequest) -> None:
         )
     if wipe_rootfs_data and nand:
         fail("--wipe-rootfs-data is only supported for NOR installs", exit_code=2)
+    if nand and is_boot_image_soc(chip):
+        # No NAND layout is wired up for the signed-boot-image SoCs: the
+        # classic one would put the kernel where their NAND U-Boot (UBI
+        # layout) never looks. burn --nand still loads that U-Boot into RAM.
+        fail(
+            f"NAND install is not supported for {chip} yet; "
+            "burn --nand loads its NAND U-Boot into RAM",
+            exit_code=2,
+        )
 
     stage_set = set(stages)
     # u-boot-xmedia SoCs on NAND use the UBI-only layout: no kernel partition,
