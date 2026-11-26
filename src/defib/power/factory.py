@@ -20,6 +20,8 @@ def power_controller_from_env() -> PowerController:
       configured via ``DEFIB_TASMOTA_*``.
     - ``DEFIB_POWER_TYPE=http``: generic relay driven by two GET URLs,
       configured via ``DEFIB_HTTP_POWER_*``.
+    - ``DEFIB_POWER_TYPE=uhubctl``: one port of a USB hub with per-port
+      power switching, configured via ``DEFIB_UHUBCTL_*``.
 
     Raises:
         PowerControllerError: if the type is unknown or required env
@@ -41,7 +43,10 @@ def power_controller_from_env() -> PowerController:
     if kind == "http":
         from defib.power.http import HttpRelayController
         return HttpRelayController.from_env()
+    if kind == "uhubctl":
+        from defib.power.uhubctl import UhubctlController
+        return UhubctlController.from_env()
     raise PowerControllerError(
         f"Unknown DEFIB_POWER_TYPE: {kind!r} "
-        "(expected 'routeros', 'vectis', 'rack', 'tasmota', or 'http')"
+        "(expected 'routeros', 'vectis', 'rack', 'tasmota', 'http', or 'uhubctl')"
     )
