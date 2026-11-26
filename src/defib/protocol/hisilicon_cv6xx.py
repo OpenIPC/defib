@@ -48,6 +48,10 @@ GSL_LOAD_ADDR = 0x04021A00
 DDR_LOAD_ADDR = 0x41000000
 UBOOT_LOAD_ADDR = 0x41000000
 DDR_TRAINING_WAIT = 1.5  # seconds
+# The bootrom and SPL answer a frame with ACK_BYTE, or with NAK_BYTE ("U")
+# to ask for it again. A frame NAKed this many times in a row is refused.
+NAK_BYTE = b"U"
+FRAME_RETRIES = 10
 # How long past DDR_TRAINING_WAIT to keep waiting once the SPL has printed the
 # table header but not yet "DDR size". A board that trains does it within tens
 # of milliseconds of the header (a stock CV610 boot: ~35 ms), so this is slack
@@ -338,6 +342,12 @@ class HiSiliconCV6xx(BootProtocol):
     ) -> None:
         self._board_id: int = 0
         self._cpu_id: int | None = None
+        # Set by _send_frame_wait_ack: True when the frame failed because the
+        # device NAKed every retransmission, False when it went quiet.
+        self._last_frame_refused = False
+        # Set by _send_data_to_bootrom on failure: which frame it was ("head",
+        # "data" or "tail") and, for data frames, its 1-based index.
+        self._last_failed_frame: tuple[str, int] | None = None
         self._ddr_training_wait = ddr_training_wait
         self._ddr_training_timeout = ddr_training_timeout
 
@@ -434,12 +444,18 @@ class HiSiliconCV6xx(BootProtocol):
         data: bytes,
         timeout: float = 4.0,
     ) -> bool:
-        """Send frame and wait for ACK with NAK retransmission."""
+        """Send frame and wait for ACK with NAK retransmission.
+
+        On failure, ``self._last_frame_refused`` says whether the device
+        NAKed every retransmission (it read the frame and does not want it)
+        rather than going quiet.
+        """
+        self._last_frame_refused = False
         await transport.write(data)
         retries = 0
         start = time.monotonic()
 
-        while time.monotonic() - start < timeout and retries < 10:
+        while time.monotonic() - start < timeout:
             try:
                 response = await transport.read(1, timeout=timeout)
             except TransportTimeout:
@@ -447,7 +463,13 @@ class HiSiliconCV6xx(BootProtocol):
 
             if response == ACK_BYTE:
                 return True
-            if response == b"U":
+            if response == NAK_BYTE:
+                # Every copy sent gets its answer read, the last one too: a
+                # frame is only refused once all 1 + FRAME_RETRIES copies
+                # have been NAKed.
+                if retries >= FRAME_RETRIES:
+                    self._last_frame_refused = True
+                    return False
                 await transport.write(data)
                 retries += 1
                 continue
@@ -462,7 +484,11 @@ class HiSiliconCV6xx(BootProtocol):
         stage: Stage,
         on_progress: Callable[[ProgressEvent], None] | None = None,
     ) -> bool:
-        """Send data using V500-style HEAD/DATA/TAIL with per-chunk ACK."""
+        """Send data using V500-style HEAD/DATA/TAIL with per-chunk ACK.
+
+        On failure, ``self._last_failed_frame`` names the frame that failed.
+        """
+        self._last_failed_frame = None
         total = len(data)
 
         # HEAD frame
@@ -472,6 +498,7 @@ class HiSiliconCV6xx(BootProtocol):
         head = append_crc(head)
 
         if not await self._send_frame_wait_ack(transport, head):
+            self._last_failed_frame = ("head", 0)
             return False
 
         # DATA frames
@@ -496,6 +523,7 @@ class HiSiliconCV6xx(BootProtocol):
             ))
 
             if not await self._send_frame_wait_ack(transport, frame):
+                self._last_failed_frame = ("data", idx)
                 return False
 
         # TAIL frame
@@ -506,6 +534,7 @@ class HiSiliconCV6xx(BootProtocol):
         tail = append_crc(tail)
 
         if not await self._send_frame_wait_ack(transport, tail):
+            self._last_failed_frame = ("tail", 0)
             return False
 
         _emit(on_progress, ProgressEvent(
@@ -652,6 +681,38 @@ class HiSiliconCV6xx(BootProtocol):
             transport, uboot_payload, UBOOT_LOAD_ADDR,
             Stage.UBOOT, on_progress,
         ):
+            if self._last_failed_frame == ("data", 1) and self._last_frame_refused:
+                # Seen on a Hi3519DV500 kit (DMEBPRO DDR table in flash) given
+                # OpenIPC's boot-hi3519dv500-dmeb image: GSL, board ID and DDR
+                # training all pass, the SPL ACKs the U-Boot HEAD and NAKs data
+                # frame 1 -- the image header -- every time; the dmebpro image
+                # boots. A NAK only asks for the frame again, so this stays a
+                # diagnosis, not proof: the result keeps the session's one
+                # retry, and a wrong image is refused the same way again.
+                if uboot_override is not None:
+                    # Flash-agent upload: the header was copied from the
+                    # composite given with -f, so -c cannot change it.
+                    advice = (
+                        "the header it carries comes from the boot image "
+                        "given with -f, which is most likely for another "
+                        "board variant of the chip; pass that variant's "
+                        "boot image instead"
+                    )
+                else:
+                    advice = (
+                        "this boot image is most likely for another board "
+                        "variant of the chip; try another one "
+                        "(-c <chip>:<variant>)"
+                    )
+                return RecoveryResult(
+                    success=False, stages_completed=stages,
+                    error=(
+                        "The SPL refused the U-Boot image: it took the "
+                        "upload's HEAD frame, then NAKed the first data frame "
+                        "(the image header) on every retry. " + advice[0].upper()
+                        + advice[1:] + ". The SPL boots from flash instead."
+                    ),
+                )
             return RecoveryResult(
                 success=False, stages_completed=stages,
                 error="Failed to send U-Boot",
