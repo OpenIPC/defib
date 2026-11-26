@@ -492,7 +492,12 @@ def get_cached_path(
     base, variant = _split_variant(chip)
     name = CHIP_TO_FIRMWARE.get(base, base)
     candidates: list[str | None] = [asset_name(chip, flash_type)]
-    if not uses_per_flash_type_uboot(chip) and not (
+    # The legacy universal entry is a NOR-era seed; a NAND request for a SoC
+    # that publishes a NAND boot image must not fall back to it.
+    nand_boot_image = (
+        normalize_flash_type(flash_type) == "nand" and name in BOOT_IMAGE_NAND
+    )
+    if not uses_per_flash_type_uboot(chip) and not nand_boot_image and not (
         variant is not None and name in CLASSIC_UBOOT_VARIANTS
     ):
         candidates.append(_legacy_cache_name(chip))

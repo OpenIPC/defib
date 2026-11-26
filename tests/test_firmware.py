@@ -681,3 +681,21 @@ class TestBootImageNand:
             assert is_boot_image_soc(chip), chip
         for chip in ("hi3516ev300", "gk7205v300", "hi3518ev200"):
             assert not is_boot_image_soc(chip), chip
+
+
+    def test_nand_lookup_ignores_legacy_universal_seed(self, tmp_path, monkeypatch):
+        """A u-boot-hi3519dv500-universal.bin seeded per #112 is a NOR boot
+        image: it still serves NOR, never a --nand request."""
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr("sys.platform", "linux")
+        # No network: the published NAND asset counts as unchanged.
+        monkeypatch.setattr("defib.firmware._remote_validators", lambda url: None)
+        seeded = get_cache_dir() / "u-boot-hi3519dv500-universal.bin"
+        seeded.write_bytes(b"nor boot image")
+
+        assert get_cached_path("hi3519dv500:dmebpro", "nor") == seeded
+        assert get_cached_path("hi3519dv500:dmebpro", "nand") is None
+
+        nand = get_cache_dir() / "boot-hi3519dv500-dmebpro-nand.bin"
+        nand.write_bytes(b"nand boot image")
+        assert get_cached_path("hi3519dv500:dmebpro", "nand") == nand
