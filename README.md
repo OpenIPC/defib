@@ -447,6 +447,31 @@ the camera is still off and re-cycling once if the bootrom does not answer.
 Both are single-outlet controllers: `--poe-port` does not apply, and like
 Vectis they do not work with `defib restore`.
 
+### USB hub port (uhubctl)
+
+For boards powered from a USB port: a hub with per-port power switching
+(`ppps`) can cut VBUS to that one port.  Defib drives
+[uhubctl](https://github.com/mvp/uhubctl), so it needs to be installed and
+allowed to talk to the hub (its udev rule, or run it via sudo).  Find the
+port by listing the hubs with `uhubctl`, then switching candidate ports off
+one at a time (`uhubctl -l 3-2.3 -p 3 -a off`) until the console goes quiet:
+
+```bash
+export DEFIB_POWER_TYPE=uhubctl
+export DEFIB_UHUBCTL_LOCATION=3-2.3        # hub location as `uhubctl` lists it
+export DEFIB_UHUBCTL_PORT=3
+export DEFIB_UHUBCTL_COMMAND="sudo uhubctl"  # optional, default `uhubctl`
+
+defib burn -c hi3519dv500:dmebpro -p /dev/ttyUSB2 --power-cycle -b
+```
+
+A USB 3 hub shows up as two hubs (e.g. `3-2` and `4-2`); either location
+works, and uhubctl switches both.  Each switch is confirmed from uhubctl's
+reported port status, but that is what the hub *says*: a hub that gangs VBUS
+in hardware reports `off` and keeps the board powered, so check once that the
+board really goes dark.  Leave the UART adapter on a different port, or the
+console drops with the power.
+
 The `-t` flag auto-detects the post-boot mode:
 - **Normal U-Boot shell** (e.g. hi3516ev300): a two-way serial terminal — your
   keystrokes go to the board and its output comes back. Ctrl-C exits the
